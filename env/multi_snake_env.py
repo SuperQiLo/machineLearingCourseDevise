@@ -8,10 +8,25 @@
 from __future__ import annotations
 
 import random
+from dataclasses import dataclass, asdict
 from enum import Enum
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Set
 
 import numpy as np
+
+from env.config import EnvConfig
+
+
+@dataclass
+class StepEvent:
+    """记录单条蛇在一步内的关键事件，便于统一计算奖励与日志。"""
+
+    alive: bool = True
+    died: bool = False
+    ate_food: bool = False
+    kills: int = 0
+    killed_by: Optional[int] = None
+    reward: float = 0.0
 
 
 class Action(Enum):
@@ -41,13 +56,30 @@ class MultiSnakeEnv:
         num_snakes: int = 4,
         num_food: int = 6,
         max_steps: int = 1500,
+        *,
+        config: Optional[EnvConfig] = None,
+        seed: Optional[int] = None,
     ) -> None:
-        """配置地图尺寸、蛇/食物数量以及最大步数等基本参数。"""
-        self.width = width
-        self.height = height
-        self.num_snakes = num_snakes
-        self.num_food = num_food
-        self.max_steps = max_steps
+        """配置地图尺寸、蛇/食物数量以及最大步数等基本参数，可通过 `EnvConfig` 覆盖。"""
+
+        cfg = config or EnvConfig(
+            width=width,
+            height=height,
+            num_snakes=num_snakes,
+            num_food=num_food,
+            max_steps=max_steps,
+        )
+
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+
+        self.config = cfg
+        self.width = cfg.width
+        self.height = cfg.height
+        self.num_snakes = cfg.num_snakes
+        self.num_food = cfg.num_food
+        self.max_steps = cfg.max_steps
 
         self.snakes: List[Dict] = []
         self.food: List[Tuple[int, int]] = []
@@ -81,16 +113,14 @@ class MultiSnakeEnv:
 
         spawn_layouts = self._generate_spawn_layouts()
         for i, layout in enumerate(spawn_layouts):
-            body = layout["body"]
             self.snakes.append(
                 {
                     "id": i,
-                    "body": body,
+                    "body": layout["body"],
                     "direction": layout["direction"],
                     "alive": True,
                     "score": 0,
                     "steps_alive": 0,
-                    "last_food_distance": None,
                 }
             )
 
@@ -98,147 +128,194 @@ class MultiSnakeEnv:
         while len(self.food) < self.num_food:
             self._spawn_food()
 
-        # 初始化每条蛇的最近食物距离，方便引导奖励
-        for snake in self.snakes:
-            snake["last_food_distance"] = self._nearest_food_distance(snake["body"][0])
-
         return self._get_observations()
 
     # ------------------------------------------------------------------
     # 核心交互
     # ------------------------------------------------------------------
     def step(self, actions: Sequence[int]) -> Tuple[List[np.ndarray], List[float], List[bool], Dict]:
-        """推进一步模拟。
+        """推进一步模拟，输出新观测、奖励、是否结束以及调试信息。"""
 
-        Args:
-            actions: 每条蛇的相对动作列表 (0=直行,1=左转,2=右转)。
-        Returns:
-            obs, rewards, dones, info
-        """
+        self._ensure_action_length(actions)
+
+        self.steps += 1
+        events = self._init_step_events()
+        next_heads, will_grow = self._plan_next_heads(actions)
+        snakes_to_die, kill_credits = self._detect_collisions(next_heads, will_grow, events)
+        dones = self._apply_movements(next_heads, will_grow, snakes_to_die, events)
+        rewards = self._compute_rewards(events, kill_credits)
+
+        alive_count = sum(1 for snake in self.snakes if snake["alive"])
+        game_over = alive_count <= 1 or self.steps >= self.max_steps
+        if game_over:
+            for i, snake in enumerate(self.snakes):
+                if snake["alive"]:
+                    dones[i] = True
+
+        info = self._build_info(events, alive_count, game_over)
+        return self._get_observations(), rewards, dones, info
+
+    # ------------------------------------------------------------------
+    # Step 子流程
+    # ------------------------------------------------------------------
+    def _ensure_action_length(self, actions: Sequence[int]) -> None:
+        """校验动作数组长度，与蛇数量不符时直接抛错。"""
 
         if len(actions) != self.num_snakes:
             raise ValueError("actions 数组长度必须与蛇数量一致。")
 
-        self.steps += 1
-        rewards = [0.0 for _ in range(self.num_snakes)]
-        dones = [False for _ in range(self.num_snakes)]
-        info: Dict = {}
+    def _init_step_events(self) -> List[StepEvent]:
+        """为每条蛇初始化事件记录，默认继承当前存活状态。"""
+
+        return [StepEvent(alive=snake.get("alive", True)) for snake in self.snakes]
+
+    def _plan_next_heads(self, actions: Sequence[int]) -> Tuple[List[Optional[Tuple[int, int]]], List[bool]]:
+        """根据相对动作计算下一帧蛇头位置，并判断是否会成长。"""
 
         next_heads: List[Optional[Tuple[int, int]]] = [None] * self.num_snakes
-
-        # 1) 根据动作更新方向并计算下一帧的蛇头坐标
-        for i, snake in enumerate(self.snakes):
+        will_grow: List[bool] = [False] * self.num_snakes
+        for idx, snake in enumerate(self.snakes):
             if not snake["alive"]:
                 continue
 
-            action = actions[i]
-            new_dir = self._turn(snake["direction"], action)
+            new_dir = self._turn(snake["direction"], actions[idx])
             snake["direction"] = new_dir
 
             dx, dy = self._dir_delta(new_dir)
             head_x, head_y = snake["body"][0]
-            next_heads[i] = (head_x + dx, head_y + dy)
+            next_head = (head_x + dx, head_y + dy)
+            next_heads[idx] = next_head
+            will_grow[idx] = next_head in self.food
 
-        # 2) 检测墙面、头撞头、头撞身体等致死事件
-        snakes_to_die = set()
+        return next_heads, will_grow
 
-        # 2.1 撞墙
-        for i, head in enumerate(next_heads):
-            if head is None or not self.snakes[i]["alive"]:
+    def _detect_collisions(
+        self,
+        next_heads: Sequence[Optional[Tuple[int, int]]],
+        will_grow: Sequence[bool],
+        events: List[StepEvent],
+    ) -> Tuple[Set[int], Dict[int, Set[int]]]:
+        """检测墙面、头对头与身体碰撞，返回死亡集合与击杀归属。"""
+
+        snakes_to_die: Set[int] = set()
+        kill_credits: Dict[int, Set[int]] = {}
+
+        for idx, head in enumerate(next_heads):
+            if head is None or not self.snakes[idx]["alive"]:
                 continue
             x, y = head
             if x < 0 or x >= self.width or y < 0 or y >= self.height:
-                snakes_to_die.add(i)
-                rewards[i] -= 10
+                snakes_to_die.add(idx)
 
-        # 2.2 头对头
         head_counts: Dict[Tuple[int, int], List[int]] = {}
-        for i, head in enumerate(next_heads):
-            if head is None or not self.snakes[i]["alive"] or i in snakes_to_die:
+        for idx, head in enumerate(next_heads):
+            if head is None or not self.snakes[idx]["alive"]:
                 continue
-            head_counts.setdefault(head, []).append(i)
+            head_counts.setdefault(head, []).append(idx)
 
         for indices in head_counts.values():
             if len(indices) > 1:
-                for idx in indices:
-                    snakes_to_die.add(idx)
-                    rewards[idx] -= 10
+                snakes_to_die.update(indices)
 
-        # 2.3 头撞身体（考虑尾巴是否移动）
-        future_bodies: List[set] = []
-        for i, snake in enumerate(self.snakes):
+        occupied_future: Dict[Tuple[int, int], int] = {}
+        for idx, snake in enumerate(self.snakes):
             if not snake["alive"]:
-                future_bodies.append(set())
                 continue
-
-            will_grow = next_heads[i] in self.food if next_heads[i] else False
             body = snake["body"]
-            # 如果不生长，尾巴会移除，最后一个格可以被占用
-            occupied = body if will_grow else body[:-1]
-            future_bodies.append(set(occupied))
+            body_space = body if will_grow[idx] else body[:-1]
+            for cell in body_space:
+                occupied_future[cell] = idx
 
-        for i, head in enumerate(next_heads):
-            if head is None or not self.snakes[i]["alive"] or i in snakes_to_die:
+        for idx, head in enumerate(next_heads):
+            if head is None or not self.snakes[idx]["alive"]:
                 continue
+            owner = occupied_future.get(head)
+            if owner is None:
+                continue
+            snakes_to_die.add(idx)
+            if owner != idx:
+                killers = kill_credits.setdefault(owner, set())
+                killers.add(idx)
+                events[idx].killed_by = owner
 
-            for j, body in enumerate(future_bodies):
-                if head in body:
-                    snakes_to_die.add(i)
-                    rewards[i] -= 10
-                    if i != j:
-                        rewards[j] += 20  # 击杀奖励
-                    break
+        return snakes_to_die, kill_credits
 
-        # 3) 真正执行移动与奖励塑形
-        for i, snake in enumerate(self.snakes):
+    def _apply_movements(
+        self,
+        next_heads: Sequence[Optional[Tuple[int, int]]],
+        will_grow: Sequence[bool],
+        snakes_to_die: Set[int],
+        events: List[StepEvent],
+    ) -> List[bool]:
+        """执行位移、生长与死亡判定，返回 dones 列表。"""
+
+        dones = [False for _ in range(self.num_snakes)]
+        for idx, snake in enumerate(self.snakes):
             if not snake["alive"]:
-                dones[i] = True
                 continue
 
-            if i in snakes_to_die:
+            if idx in snakes_to_die:
                 snake["alive"] = False
-                dones[i] = True
+                dones[idx] = True
+                events[idx].alive = False
+                events[idx].died = True
                 continue
 
-            new_head = next_heads[i]
-            snake["body"].insert(0, new_head)
-            ate_food = new_head in self.food
+            new_head = next_heads[idx]
+            if new_head is None:
+                snake["alive"] = False
+                dones[idx] = True
+                events[idx].alive = False
+                events[idx].died = True
+                continue
 
-            if ate_food:
-                self.food.remove(new_head)
+            snake["body"].insert(0, new_head)
+            if will_grow[idx]:
+                if new_head in self.food:
+                    self.food.remove(new_head)
                 self._spawn_food()
-                rewards[i] += 10
                 snake["score"] += 1
+                events[idx].ate_food = True
             else:
                 snake["body"].pop()
-                rewards[i] -= 0.01
-
-            # 引导奖励：接近或远离食物
-            prev_dist = snake["last_food_distance"]
-            new_dist = self._nearest_food_distance(new_head)
-            if prev_dist is not None and new_dist is not None:
-                if new_dist < prev_dist:
-                    rewards[i] += 0.1
-                elif new_dist > prev_dist:
-                    rewards[i] -= 0.1
-            snake["last_food_distance"] = new_dist
 
             snake["steps_alive"] += 1
 
-        # 4) 最大步数截断
-        if self.steps >= self.max_steps:
-            for i in range(self.num_snakes):
-                dones[i] = True
+        return dones
 
-        alive_count = sum(1 for snake in self.snakes if snake["alive"])
-        info = {
+    def _compute_rewards(self, events: List[StepEvent], kill_credits: Dict[int, Set[int]]) -> List[float]:
+        """根据事件统计奖励，并写回事件字典。"""
+
+        rewards = [0.0 for _ in range(self.num_snakes)]
+        for owner, victims in kill_credits.items():
+            events[owner].kills += len(victims)
+
+        for idx, event in enumerate(events):
+            reward = 0.0
+            if event.alive and not event.died:
+                reward += 0.05
+                reward -= 0.01
+            if event.ate_food:
+                reward += 10.0
+            if event.kills:
+                reward += 5.0 * event.kills
+            if event.died:
+                reward -= 10.0
+            event.reward = reward
+            rewards[idx] = reward
+
+        return rewards
+
+    def _build_info(self, events: List[StepEvent], alive_count: int, game_over: bool) -> Dict:
+        """组装 info 字典，保持与旧版服务器兼容。"""
+
+        return {
             "steps": self.steps,
             "alive_count": alive_count,
             "scores": [snake["score"] for snake in self.snakes],
-            "game_over": alive_count <= 1 or self.steps >= self.max_steps,
+            "game_over": game_over,
+            "events": [asdict(event) for event in events],
         }
-
-        return self._get_observations(), rewards, dones, info
 
     # ------------------------------------------------------------------
     # 观测与渲染
@@ -333,14 +410,6 @@ class MultiSnakeEnv:
                 self.food.append(pos)
                 break
 
-    def _nearest_food_distance(self, head: Tuple[int, int]) -> Optional[int]:
-        """计算蛇头到最近食物的曼哈顿距离。"""
-
-        if not self.food:
-            return None
-
-        hx, hy = head
-        return min(abs(hx - fx) + abs(hy - fy) for fx, fy in self.food)
 
     # ------------------------------------------------------------------
     # 启动/布置辅助

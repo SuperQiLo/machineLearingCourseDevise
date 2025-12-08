@@ -1,4 +1,4 @@
 numpy
 torch
 pygame
-typer
+PyQt6

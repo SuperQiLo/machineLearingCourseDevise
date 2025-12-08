@@ -1,970 +1,983 @@
-"""局域网客户端，支持联机大厅、AI 推理与本地训练/对练。"""
+"""基于 PyQt6 的云端客户端，内置 AI 代理加载与模型选择。"""
 
 from __future__ import annotations
 
+import importlib
+import inspect
 import json
+import pkgutil
 import socket
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple, Type
 
 import numpy as np
-import pygame
-import torch
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHeaderView,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
-from agent.ppo import PPOAgent
-from agent.train import TrainConfig, train
+from agent.base_agent import BaseAgent
+from agent.config import RainbowConfig
+from agent.rainbow_agent import RainbowAgent
 from env.multi_snake_env import Direction, build_observation_from_snapshot
-from network.constants import COLOR_MAP, COLOR_SEQUENCE
-from network.local_arena import start_local_arena
-from network.utils import direction_to_relative
+from network.utils import normalize_port
+from network.renderer import BattleRenderer
+
+
+MODE_LABELS = {
+    "online": "联机房",
+    "training": "训练房",
+    "ai_duel": "人机演练",
+}
+
+
+ROLE_LABELS = {
+    "human": "人工操作",
+    "ai": "AI 模式",
+    "spectator": "观战",
+}
 
 
 @dataclass
-class PlayerInfo:
-    player_id: int
-    name: str
+class RoomInfo:
+    room_id: str
     mode: str
-    ready: bool
-    slot: Optional[int]
+    owner: str
+    owner_name: str
+    members: int
+    joinable: bool
+    config: Dict
 
 
-@dataclass
-class UIButton:
-    rect: pygame.Rect
-    label: str
-    action: Callable[[], None]
-    enabled: bool = True
-
-    def draw(self, surface: pygame.Surface, font: pygame.font.Font) -> None:
-        base_color = (75, 115, 210) if self.enabled else (60, 60, 75)
-        hover_color = (95, 145, 240)
-        mouse_pos = pygame.mouse.get_pos()
-        fill = hover_color if self.enabled and self.rect.collidepoint(mouse_pos) else base_color
-        pygame.draw.rect(surface, fill, self.rect, border_radius=10)
-        pygame.draw.rect(surface, (20, 20, 35), self.rect, width=2, border_radius=10)
-        text_color = (255, 255, 255) if self.enabled else (150, 150, 150)
-        text = font.render(self.label, True, text_color)
-        surface.blit(text, text.get_rect(center=self.rect.center))
-
-
-_dir_to_relative = direction_to_relative
-
-
-class GameClient:
-    """负责大厅渲染、玩家模式切换、AI 推理与输入。"""
+class CloudClient:
+    """轻量级 TCP 客户端，负责与服务器通信并缓存状态。"""
 
     def __init__(
         self,
-        host: str = "127.0.0.1",
-        port: int = 5555,
-        name: str | None = None,
-        ai_model_hint: str | None = None,
+        host: str,
+        port: int,
+        name: str,
+        *,
+        auto_render_on_join: bool = False,
+        log_handler: Optional[Callable[[str], None]] = None,
     ) -> None:
-        """保存连接参数并初始化 UI、状态机、锁等运行期变量。"""
         self.host = host
         self.port = port
-        self.name = (name or "Player").strip() or "Player"
-        self.ai_model_hint = ai_model_hint.strip() if ai_model_hint else None
-        self.ai_agent: Optional[PPOAgent] = None
-        self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.name = name
+        self.auto_render_on_join = auto_render_on_join
+        self._log_handler = log_handler
 
-        self.cell_size = 30
-        self.grid_width = 30
-        self.grid_height = 30
-        self.grid_pixel_width = self.grid_width * self.cell_size
-        self.grid_pixel_height = self.grid_height * self.cell_size
-
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listener: Optional[threading.Thread] = None
         self.running = False
-        self.phase = "lobby"
-        self.player_id: Optional[int] = None
-        self.host_id: Optional[int] = None
-        self.player_mode = "player"
-        self.ready = False
-        self.slot: Optional[int] = None
-        self.my_color_name: Optional[str] = None
-        self.current_direction: Direction = Direction.RIGHT
 
-        self.lobby_players: List[PlayerInfo] = []
-        self.state_snapshot: Dict | None = None
-        self.last_game_over: Dict | None = None
-        self.tip_message: str = ""
-        self.tip_timer: int = 0
-        self.await_restart_choice = False
-        self.countdown_seconds = 0
-        self.assignment_hint: Optional[str] = None
-        self.assignment_hint_timer = 0
-
-        self.screen: Optional[pygame.Surface] = None
-        self.font: Optional[pygame.font.Font] = None
-        self.small_font: Optional[pygame.font.Font] = None
-        self.clock: Optional[pygame.time.Clock] = None
-        self.current_buttons: List[UIButton] = []
-        self.restart_buttons: List[UIButton] = []
-
+        self.client_id: Optional[str] = None
+        self.rooms: List[RoomInfo] = []
+        self.state_cache: Dict[str, Dict] = {}
+        self.room_states: Dict[str, Dict] = {}
+        self.current_room_id: Optional[str] = None
+        self.current_mode: Optional[str] = None
+        self.current_slot: Optional[int] = None
+        self.room_members: List[Dict] = []
+        self.room_can_start: bool = False
+        self.room_in_progress: bool = False
+        self.room_owner: Optional[str] = None
         self.lock = threading.Lock()
 
-    # ------------------------------------------------------------------
-    # 网络通信
-    # ------------------------------------------------------------------
+    @property
+    def is_connected(self) -> bool:
+        return self.running and self.client_id is not None
+
+    # --------------------------------------------------------------
+    # 基础通信
+    # --------------------------------------------------------------
+    def _log(self, message: str) -> None:
+        if self._log_handler:
+            try:
+                self._log_handler(message)
+                return
+            except Exception:
+                pass
+        print(message)
+
     def connect(self) -> bool:
-        """尝试连接服务器，成功返回 True，失败打印错误。"""
-        try:
-            self.client_socket.connect((self.host, self.port))
-            print(f"Connected to {self.host}:{self.port}")
+        if self.running:
+            self._log("已连接，若需重新连接请先断开。")
             return True
+
+        if self.socket.fileno() == -1:
+            # socket 已关闭时重新创建
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+        try:
+            self.socket.connect((self.host, self.port))
         except OSError as exc:
-            print(f"Connection failed: {exc}")
+            self._log(f"无法连接服务器：{exc}")
             return False
 
-    def send_json(self, payload: Dict) -> None:
-        """向服务器发送一行 JSON，失败时会结束运行循环。"""
+        self.running = True
+        self.listener = threading.Thread(target=self._listen_loop, daemon=True)
+        self.listener.start()
+        self.send({"type": "hello", "name": self.name})
+        self.send({"type": "list_rooms"})
+        return True
+
+    def close(self) -> None:
+        self.running = False
         try:
-            self.client_socket.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            self.socket.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.socket.close()
+        self.client_id = None
+
+    def send(self, payload: Dict) -> None:
+        try:
+            self.socket.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
         except OSError:
             self.running = False
 
-    def receive_data(self) -> None:
-        """后台线程循环接收服务器消息并解析为 JSON。"""
+    def _listen_loop(self) -> None:
         buffer = ""
         while self.running:
             try:
-                data = self.client_socket.recv(4096).decode("utf-8")
+                data = self.socket.recv(4096)
                 if not data:
                     break
-                buffer += data
+                buffer += data.decode("utf-8")
                 while "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
                     if not line:
                         continue
                     try:
-                        msg = json.loads(line)
+                        message = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    self._handle_message(msg)
+                    try:
+                        self._handle_message(message)
+                    except Exception as exc:  # noqa: BLE001
+                        self._log(f"处理消息失败: {exc}")
             except OSError:
                 break
-        print("Disconnected from server")
         self.running = False
+        self._log("连接已断开。")
 
+    # --------------------------------------------------------------
+    # 消息处理
+    # --------------------------------------------------------------
     def _handle_message(self, msg: Dict) -> None:
-        """根据消息类型更新大厅、游戏状态或提示。"""
         mtype = msg.get("type")
         if mtype == "welcome":
-            self.player_id = msg.get("player_id")
-            self.host_id = msg.get("host_id")
-            self.send_json({"type": "join", "name": self.name, "mode": self.player_mode})
-        elif mtype == "lobby":
-            players = [
-                PlayerInfo(
-                    player_id=entry.get("id"),
-                    name=entry.get("name", "Player"),
-                    mode=entry.get("mode", "player"),
-                    ready=entry.get("ready", False),
-                    slot=entry.get("slot"),
+            self.client_id = msg.get("client_id")
+            self._log(f"已连接，分配的 ID 为 {self.client_id}")
+        elif mtype == "rooms":
+            rooms = [
+                RoomInfo(
+                    room_id=entry.get("room_id"),
+                    mode=entry.get("mode", "unknown"),
+                    owner=entry.get("owner", "-"),
+                    owner_name=entry.get("owner_name", "-"),
+                    members=int(entry.get("members", 0)),
+                    joinable=bool(entry.get("joinable", True)),
+                    config=entry.get("config", {}),
                 )
-                for entry in msg.get("players", [])
+                for entry in msg.get("rooms", [])
             ]
             with self.lock:
-                self.lobby_players = players
-                self.phase = msg.get("phase", self.phase)
-                self.host_id = msg.get("host_id", self.host_id)
-                lobby_grid = msg.get("grid_size")
-                if lobby_grid:
-                    self._update_grid_dimensions(int(lobby_grid), int(lobby_grid))
-                for entry in players:
-                    if entry.player_id == self.player_id:
-                        self.player_mode = entry.mode
-                        self.ready = entry.ready
-                        self.slot = entry.slot
+                self.rooms = rooms
+        elif mtype == "room_joined":
+            self.current_room_id = msg.get("room_id")
+            self.current_mode = msg.get("mode")
+            self.current_slot = msg.get("slot")
+            self._log(f"已加入房间 {self.current_room_id}，模式 {self.current_mode}")
+            self._apply_cached_room_state()
+            self.send({"type": "list_rooms"})
+        elif mtype == "room_closed":
+            if msg.get("room_id") == self.current_room_id:
+                self.current_room_id = None
+                self.current_mode = None
+                self.current_slot = None
+            self._log("房间已关闭。")
         elif mtype == "start":
-            self.slot = msg.get("slot")
-            self.player_mode = msg.get("mode", self.player_mode)
-            color = msg.get("color")
-            if color:
-                self.my_color_name = color
-            if self.slot is not None:
-                hint_color = color or self._current_color_name()
-                self.assignment_hint = f"本局你将控制蛇 {self.slot}（颜色 {hint_color}）"
-                self.assignment_hint_timer = 240
+            room_id = msg.get("room_id")
+            if room_id:
+                countdown_val = float(msg.get("countdown", 3.0))
+                with self.lock:
+                    previous = self.state_cache.get(room_id, {})
+                    cached = dict(previous) if isinstance(previous, dict) else {}
+                    cached.update({
+                        "room_id": room_id,
+                        "mode": msg.get("mode") or cached.get("mode") or self.current_mode,
+                        "countdown": countdown_val,
+                        "game_over": False,
+                    })
+                    self.state_cache[room_id] = cached
+                if room_id == self.current_room_id:
+                    self.room_in_progress = True
+                self._log(f"房间 {room_id} 开始倒计时 {countdown_val:.1f}s")
         elif mtype == "state":
-            with self.lock:
-                width = int(msg.get("width", self.grid_width))
-                height = int(msg.get("height", self.grid_height))
-                self._update_grid_dimensions(width, height)
-                phase_value = msg.get("phase", "game")
-                self.phase = phase_value
-                self.state_snapshot = msg
-                if self.slot is not None:
-                    snakes = msg.get("snakes", [])
-                    if 0 <= self.slot < len(snakes):
-                        snake = snakes[self.slot]
-                        dir_name = snake.get("direction")
-                        if dir_name:
-                            try:
-                                self.current_direction = Direction[dir_name]
-                            except KeyError:
-                                pass
-                        self.my_color_name = snake.get("color", self.my_color_name)
-                self.await_restart_choice = False
-                self.restart_buttons = []
-                if phase_value != "countdown":
-                    self.countdown_seconds = 0
-            self._maybe_drive_ai(msg)
-        elif mtype == "game_over":
-            with self.lock:
-                self.last_game_over = msg
-                self.phase = "lobby"
-                self.await_restart_choice = True
-                self.ready = False
-                self.restart_buttons = []
-                self.countdown_seconds = 0
-        elif mtype == "tip":
-            self.tip_message = msg.get("message", "")
-            self.tip_timer = 180
-        elif mtype == "countdown":
-            seconds = int(msg.get("seconds", 0))
-            with self.lock:
-                self.countdown_seconds = max(0, seconds)
-                self.phase = msg.get("phase", self.phase)
+            room_id = msg.get("room_id")
+            if room_id:
+                with self.lock:
+                    self.state_cache[room_id] = msg
+        elif mtype == "room_state":
+            self._cache_room_state(msg)
+        elif mtype == "error":
+            self._log(f"[服务器错误] {msg.get('message')}")
+        elif mtype == "log":
+            notice = msg.get("message")
+            if notice:
+                self._log(notice)
 
-    # ------------------------------------------------------------------
-    # 主循环及输入处理
-    # ------------------------------------------------------------------
-    def run(self) -> None:
-        """启动 Pygame 主循环，处理事件、渲染和退出。"""
-        if not self.connect():
+    def _cache_room_state(self, payload: Dict) -> None:
+        room_id = payload.get("room_id")
+        if not room_id:
             return
-
-        self.running = True
-        threading.Thread(target=self.receive_data, daemon=True).start()
-
-        pygame.init()
-        self.font = self._load_font()
-        self.small_font = self._load_font(18)
-        self._resize_window()
-        pygame.display.set_caption("多蛇博弈 - 联机大厅")
-        self.clock = pygame.time.Clock()
-
-        while self.running:
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    self.running = False
-                elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_ESCAPE:
-                        self.running = False
-                    else:
-                        self._handle_key(event.key)
-                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    self._handle_click(event.pos)
-
-            if not self.screen:
-                continue
-
-            self.screen.fill((18, 20, 28))
-            with self.lock:
-                phase = self.phase
-                state = self.state_snapshot.copy() if self.state_snapshot else None
-                lobby_players = list(self.lobby_players)
-                last_game_over = self.last_game_over
-                tip_message = self.tip_message
-                tip_timer = self.tip_timer
-                countdown_seconds = self.countdown_seconds if self.phase == "countdown" else 0
-                assignment_hint = self.assignment_hint
-                assignment_hint_timer = self.assignment_hint_timer
-                if self.tip_timer > 0:
-                    self.tip_timer -= 1
-                if self.assignment_hint_timer > 0:
-                    self.assignment_hint_timer -= 1
-                else:
-                    self.assignment_hint = None
-
-            if phase == "lobby":
-                self._render_lobby(lobby_players)
-            else:
-                self._render_game(
-                    state,
-                    countdown_seconds=countdown_seconds,
-                    assignment_hint=assignment_hint if assignment_hint_timer > 0 else None,
-                )
-                if last_game_over:
-                    self._render_game_over(last_game_over)
-
-            if tip_message and tip_timer > 0:
-                self._render_tip(tip_message)
-
-            if self.await_restart_choice:
-                self._render_restart_overlay()
-
-            pygame.display.flip()
-            if self.clock:
-                self.clock.tick(30)
-
-        self.client_socket.close()
-        pygame.quit()
-        return
-
-    def _handle_key(self, key: int) -> None:
-        """根据当前阶段处理快捷键：大厅换模式，游戏中控制方向。"""
-        if self.phase == "lobby":
-            if key in (pygame.K_TAB, pygame.K_F1):
-                self._set_mode("player")
-            elif key in (pygame.K_a, pygame.K_F2):
-                self._set_mode("ai")
-            elif key in (pygame.K_o, pygame.K_F3):
-                self._set_mode("observer")
-            elif key == pygame.K_SPACE:
-                self._toggle_ready()
-        else:
-            if self.slot is None or self.player_mode != "player":
+        with self.lock:
+            self.room_states[room_id] = payload
+            if room_id != self.current_room_id:
                 return
-            if key in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT):
-                self._handle_direction_key(key)
+            self.room_members = payload.get("members", [])
+            self.room_can_start = bool(payload.get("can_start", False))
+            self.room_in_progress = bool(payload.get("in_progress", False))
+            self.room_owner = payload.get("owner") or payload.get("owner_id")
 
-    def _handle_click(self, pos: tuple[int, int]) -> None:
-        """响应鼠标左键，触发当前激活按钮或重开按钮。"""
-        targets = self.restart_buttons if self.await_restart_choice else self.current_buttons
-        for button in targets:
-            if button.enabled and button.rect.collidepoint(pos):
-                button.action()
-                break
-
-    def _handle_direction_key(self, key: int) -> None:
-        """将绝对方向键转换为相对动作并发送到服务器。"""
-        key_map = {
-            pygame.K_UP: Direction.UP,
-            pygame.K_DOWN: Direction.DOWN,
-            pygame.K_LEFT: Direction.LEFT,
-            pygame.K_RIGHT: Direction.RIGHT,
-        }
-        desired = key_map.get(key)
-        if desired is None:
+    def _apply_cached_room_state(self) -> None:
+        if not self.current_room_id:
             return
-        current = self.current_direction or desired
-        if (current.value + 2) % 4 == desired.value:
-            return  # 禁止直接调头
-        relative = _dir_to_relative(current, desired)
-        self.send_json({"type": "action", "value": relative})
-        delta = {0: 0, 1: -1, 2: 1}.get(relative, 0)
-        self.current_direction = Direction((current.value + delta) % 4)
+        with self.lock:
+            payload = self.room_states.get(self.current_room_id)
+            if not payload:
+                return
+            self.room_members = payload.get("members", [])
+            self.room_can_start = bool(payload.get("can_start", False))
+            self.room_in_progress = bool(payload.get("in_progress", False))
+            self.room_owner = payload.get("owner") or payload.get("owner_id")
 
-    def _set_mode(self, mode: str) -> None:
-        """切换玩家模式，同时重置准备状态和 AI 模型缓存。"""
-        if self.player_mode == mode:
+    # --------------------------------------------------------------
+    # Renderer/AI 接口
+    # --------------------------------------------------------------
+    def get_state(self, room_id: str) -> Optional[Dict]:
+        with self.lock:
+            return self.state_cache.get(room_id)
+
+    def send_action(self, action: int) -> None:
+        if not self.current_room_id:
             return
-        self.player_mode = mode
-        self.ready = False
-        self.ai_agent = None  # 重新加载模型
-        self.send_json({"type": "mode", "mode": mode})
+        self.send({"type": "action", "value": int(action)})
 
-    # ------------------------------------------------------------------
-    # 渲染
-    # ------------------------------------------------------------------
-    def _render_lobby(self, players: List[PlayerInfo]) -> None:
-        """绘制大厅 UI：玩家列表、提示文本与操作按钮。"""
-        if not self.screen or not self.font or not self.small_font:
+    # --------------------------------------------------------------
+    # 房间管理
+    # --------------------------------------------------------------
+    def set_role(self, role: str) -> None:
+        if not self.current_room_id:
             return
-        screen = self.screen
-        font = self.font
-        small_font = self.small_font
-        self.current_buttons = []
+        self.send({"type": "set_role", "role": role})
 
-        panel = pygame.Surface((screen.get_width() - 80, screen.get_height() - 120), pygame.SRCALPHA)
-        panel.fill((0, 0, 0, 85))
-        screen.blit(panel, (40, 60))
+    def set_ready(self, ready: bool) -> None:
+        if not self.current_room_id:
+            return
+        self.send({"type": "set_ready", "ready": bool(ready)})
 
-        title = font.render("多人联机大厅", True, (255, 255, 255))
-        screen.blit(title, (60, 30))
+    def start_game(self) -> None:
+        if not self.current_room_id:
+            return
+        self.send({"type": "start_game"})
 
-        instructions = [
-            "F1/TAB: 人工模式",
-            "F2/A: AI 模式",
-            "F3/O: 观察模式",
-            "SPACE: 准备/取消",
-            "ENTER: 房主开始 (≥2 且全员准备)",
-            "ESC: 退出客户端",
-        ]
-        for idx, text in enumerate(instructions):
-            surface = small_font.render(text, True, (200, 200, 210))
-            screen.blit(surface, (60, 80 + idx * 22))
+    def leave_room(self) -> None:
+        if not self.current_room_id:
+            return
+        self.send({"type": "leave_room"})
+        self.current_room_id = None
+        self.current_mode = None
+        self.current_slot = None
+        self.room_members = []
+        self.room_can_start = False
+        self.room_in_progress = False
+        self.room_owner = None
 
-        header = small_font.render("玩家 | 模式 | 状态 | 槽位", True, (180, 180, 190))
-        screen.blit(header, (60, 230))
+    def refresh_rooms(self) -> None:
+        self.send({"type": "list_rooms"})
 
-        row_y = 260
-        row_height = 30
-        for p in players:
-            bg_color = (60, 70, 90) if p.player_id == self.player_id else (40, 45, 58)
-            row_surface = pygame.Surface((screen.get_width() - 120, row_height))
-            row_surface.fill(bg_color)
-            screen.blit(row_surface, (60, row_y))
-
-            label = f"{'[房主]' if p.player_id == self.host_id else '      '}  {p.player_id:02d}  {p.name:<12}  {self._mode_label(p.mode):<4}  {'准备' if p.ready else '待命'}  槽位:{p.slot if p.slot is not None else '-'}"
-            color = (120, 220, 150) if p.ready else (220, 220, 220)
-            text_surface = small_font.render(label, True, color)
-            screen.blit(text_surface, (70, row_y + 6))
-            row_y += row_height + 6
-
-        self._render_color_badge(screen, small_font)
-        self._build_lobby_buttons(screen)
-        for button in self.current_buttons:
-            button.draw(screen, small_font)
-
-    def _render_color_badge(self, screen: pygame.Surface, font: pygame.font.Font) -> None:
-        """展示本方蛇颜色与当前模式/模型信息。"""
-        color_name = self._current_color_name()
-        color_rgb = COLOR_MAP.get(color_name, (180, 180, 180))
-        badge_rect = pygame.Rect(60, screen.get_height() - 90, 42, 42)
-        pygame.draw.rect(screen, color_rgb, badge_rect, border_radius=6)
-        pygame.draw.rect(screen, (240, 240, 240), badge_rect, width=2, border_radius=6)
-        label = font.render(f"我的蛇颜色: {color_name}", True, (230, 230, 230))
-        screen.blit(label, (badge_rect.right + 12, badge_rect.y + 8))
-        mode_hint = font.render(f"当前模式: {self._mode_label(self.player_mode)} | 模型: {self.ai_model_hint or '本地启发式'}", True, (200, 200, 210))
-        screen.blit(mode_hint, (60, screen.get_height() - 45))
-
-    def _build_lobby_buttons(self, screen: pygame.Surface) -> None:
-        """根据身份和状态创建模式切换、准备、开局按钮。"""
-        base_x = screen.get_width() - 260
-        y = screen.get_height() - 220
-        btn_w, btn_h = 200, 44
-        spacing = 18
-        buttons: List[UIButton] = []
-
-        buttons.append(
-            UIButton(
-                pygame.Rect(base_x, y, btn_w, btn_h),
-                f"模式: {self._mode_label(self.player_mode)}",
-                self._cycle_mode,
-                True,
-            )
-        )
-        y += btn_h + spacing
-
-        buttons.append(
-            UIButton(
-                pygame.Rect(base_x, y, btn_w, btn_h),
-                "取消准备" if self.ready else "准备就绪",
-                self._toggle_ready,
-                True,
-            )
-        )
-        y += btn_h + spacing
-
-        is_host = self.player_id == self.host_id
-        start_enabled = is_host and self.phase == "lobby" and not self.await_restart_choice
-        start_label = "开始游戏" if is_host else "等待房主"
-        buttons.append(
-            UIButton(
-                pygame.Rect(base_x, y, btn_w, btn_h),
-                start_label,
-                self._request_start,
-                start_enabled,
-            )
+    def create_room(self, mode: str, config: Dict) -> None:
+        self.send(
+            {
+                "type": "create_room",
+                "mode": mode,
+                "config": config,
+            }
         )
 
-        self.current_buttons = buttons
+    def get_members(self) -> List[Dict]:
+        with self.lock:
+            return list(self.room_members)
 
-    def _current_color_name(self) -> str:
-        """返回当前玩家蛇的颜色名称（未分配则回退为占位文本）。"""
-        if self.my_color_name:
-            return self.my_color_name
-        if self.slot is not None and 0 <= self.slot < len(COLOR_SEQUENCE):
-            return COLOR_SEQUENCE[self.slot]
-        return "未分配"
+    def get_self_member(self) -> Optional[Dict]:
+        with self.lock:
+            for member in self.room_members:
+                if member.get("client_id") == self.client_id:
+                    return member
+        return None
 
-    def _cycle_mode(self) -> None:
-        """按 player->ai->observer 顺序依次轮换模式。"""
-        order = ["player", "ai", "observer"]
-        idx = order.index(self.player_mode) if self.player_mode in order else 0
-        next_mode = order[(idx + 1) % len(order)]
-        self._set_mode(next_mode)
+
+# --------------------------------------------------------------
+# Agent discovery helpers
+# --------------------------------------------------------------
+
+def discover_agent_classes() -> List[Tuple[str, Type[BaseAgent]]]:
+    """动态扫描 agent 目录，返回 BaseAgent 子类列表。"""
+
+    classes: List[Tuple[str, Type[BaseAgent]]] = []
+    base_path = Path(__file__).resolve().parent.parent / "agent"
+    for module_info in pkgutil.iter_modules([str(base_path)]):
+        if module_info.name in {"base_agent", "__pycache__"}:
+            continue
+        try:
+            module = importlib.import_module(f"agent.{module_info.name}")
+        except Exception:
+            continue
+        for _, obj in inspect.getmembers(module, inspect.isclass):
+            try:
+                if issubclass(obj, BaseAgent) and obj is not BaseAgent:
+                    classes.append((obj.__name__, obj))
+            except Exception:
+                continue
+    classes.sort(key=lambda x: x[0].lower())
+    return classes
+
+
+def instantiate_agent(agent_cls: Type[BaseAgent], grid_size: int) -> Optional[BaseAgent]:
+    """尽可能自动构造代理实例，优先兼容 RainbowAgent。"""
+
+    try:
+        sig = inspect.signature(agent_cls.__init__)
+        params = list(sig.parameters.values())[1:]  # 跳过 self
+        kwargs: Dict = {}
+        if any(p.name == "config" for p in params):
+            kwargs["config"] = RainbowConfig(grid_size=grid_size)
+        if agent_cls is RainbowAgent and "config" not in kwargs:
+            kwargs["config"] = RainbowConfig(grid_size=grid_size)
+        return agent_cls(**kwargs)
+    except Exception as exc:
+        print(f"无法实例化代理 {agent_cls.__name__}: {exc}")
+        return None
+
+
+# --------------------------------------------------------------
+# PyQt UI
+# --------------------------------------------------------------
+
+
+class ClientWindow(QMainWindow):
+    log_signal = pyqtSignal(str)
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("多蛇云客户端 (PyQt6)")
+        self.setMinimumSize(980, 640)
+
+        self.client: Optional[CloudClient] = None
+        self.agent_classes = discover_agent_classes()
+        self.agent_instance: Optional[BaseAgent] = None
+        self.agent_checkpoint: Optional[Path] = None
+        self.renderer_thread: Optional[threading.Thread] = None
+        self.renderer_running = False
+        self.renderer_blocked = False
+        self.last_room_in_progress = False
+
+        self._build_ui()
+        self.log_signal.connect(self._on_log_message)
+
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self._tick_refresh)
+        self.refresh_timer.start(400)
+
+        self.ai_timer = QTimer(self)
+        self.ai_timer.timeout.connect(self._drive_ai)
+        self.ai_timer.start(120)
+
+    # ------------------------- UI 构建 -------------------------
+    def _build_ui(self) -> None:
+        root = QWidget()
+        layout = QVBoxLayout(root)
+
+        # 连接配置
+        connection_group = QGroupBox("连接")
+        conn_form = QFormLayout(connection_group)
+        self.host_edit = QLineEdit("127.0.0.1")
+        self.port_edit = QLineEdit("5555")
+        self.name_edit = QLineEdit("访客")
+        self.connect_btn = QPushButton("连接")
+        self.disconnect_btn = QPushButton("断开")
+        self.connect_btn.clicked.connect(self._connect)
+        self.disconnect_btn.clicked.connect(self._disconnect)
+        conn_form.addRow("Host", self.host_edit)
+        conn_form.addRow("Port", self.port_edit)
+        conn_form.addRow("昵称", self.name_edit)
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(self.connect_btn)
+        btn_row.addWidget(self.disconnect_btn)
+        conn_form.addRow(btn_row)
+        layout.addWidget(connection_group)
+
+        # 房间列表
+        room_group = QGroupBox("房间")
+        room_layout = QVBoxLayout(room_group)
+        self.room_table = QTableWidget(0, 5)
+        self.room_table.setHorizontalHeaderLabels(["ID", "模式", "房主", "成员", "网格"])
+        self.room_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        room_layout.addWidget(self.room_table)
+        room_btns = QHBoxLayout()
+        self.refresh_btn = QPushButton("刷新")
+        self.join_btn = QPushButton("加入")
+        room_btns.addWidget(self.refresh_btn)
+        room_btns.addWidget(self.join_btn)
+        self.refresh_btn.clicked.connect(self._refresh_rooms)
+        self.join_btn.clicked.connect(self._join_selected)
+        room_layout.addLayout(room_btns)
+
+        create_row = QHBoxLayout()
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["online", "training", "ai_duel"])
+        self.mode_combo.currentTextChanged.connect(self._mode_changed)
+        self.grid_spin = QSpinBox()
+        self.grid_spin.setRange(4, 80)
+        self.grid_spin.setValue(30)
+        self.snakes_spin = QSpinBox()
+        self.snakes_spin.setRange(1, 12)
+        self.snakes_spin.setValue(4)
+        self.food_spin = QSpinBox()
+        self.food_spin.setRange(1, 64)
+        self.food_spin.setValue(6)
+        self.steps_spin = QSpinBox()
+        self.steps_spin.setRange(10, 5000)
+        self.steps_spin.setValue(1500)
+        self.tick_spin = QSpinBox()
+        self.tick_spin.setRange(1, 500)
+        self.tick_spin.setValue(120)
+        self.tick_spin.setSuffix(" ms")
+        self.create_btn = QPushButton("创建房间")
+        self.create_btn.clicked.connect(self._create_room)
+        create_row.addWidget(QLabel("Mode"))
+        create_row.addWidget(self.mode_combo)
+        create_row.addWidget(QLabel("Grid"))
+        create_row.addWidget(self.grid_spin)
+        create_row.addWidget(QLabel("Snakes"))
+        create_row.addWidget(self.snakes_spin)
+        create_row.addWidget(QLabel("Food"))
+        create_row.addWidget(self.food_spin)
+        create_row.addWidget(QLabel("Steps"))
+        create_row.addWidget(self.steps_spin)
+        create_row.addWidget(QLabel("Tick"))
+        create_row.addWidget(self.tick_spin)
+        create_row.addWidget(self.create_btn)
+        room_layout.addLayout(create_row)
+
+        # 训练房扩展参数
+        self.training_extra = QWidget()
+        training_layout = QHBoxLayout(self.training_extra)
+        training_layout.setContentsMargins(0, 0, 0, 0)
+        training_layout.addWidget(QLabel("陪练蛇"))
+        self.sparring_spin = QSpinBox()
+        self.sparring_spin.setRange(1, 8)
+        self.sparring_spin.setValue(3)
+        training_layout.addWidget(self.sparring_spin)
+        room_layout.addWidget(self.training_extra)
+
+        # 人机演练扩展参数
+        self.duel_extra = QWidget()
+        duel_layout = QHBoxLayout(self.duel_extra)
+        duel_layout.setContentsMargins(0, 0, 0, 0)
+        duel_layout.addWidget(QLabel("AI 标签"))
+        self.duel_label_edit = QLineEdit("RainbowAI")
+        duel_layout.addWidget(self.duel_label_edit)
+        duel_layout.addWidget(QLabel("模型"))
+        self.duel_model_edit = QLineEdit()
+        duel_layout.addWidget(self.duel_model_edit)
+        duel_model_btn = QPushButton("选择")
+        duel_model_btn.clicked.connect(self._pick_duel_model)
+        duel_layout.addWidget(duel_model_btn)
+        room_layout.addWidget(self.duel_extra)
+        layout.addWidget(room_group)
+
+        # 玩家列表与操作
+        player_group = QGroupBox("玩家")
+        player_layout = QVBoxLayout(player_group)
+        self.player_table = QTableWidget(0, 5)
+        self.player_table.setHorizontalHeaderLabels(["槽位", "名称", "角色", "准备", "颜色"])
+        self.player_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        player_layout.addWidget(self.player_table)
+
+        player_btns = QHBoxLayout()
+        self.leave_btn = QPushButton("离开")
+        self.ready_btn = QPushButton("准备/取消")
+        self.start_btn = QPushButton("开始游戏")
+        self.render_btn = QPushButton("打开渲染")
+        self.leave_btn.clicked.connect(self._leave_room)
+        self.ready_btn.clicked.connect(self._toggle_ready)
+        self.start_btn.clicked.connect(self._start_game)
+        self.render_btn.clicked.connect(self._open_renderer)
+        player_btns.addWidget(self.leave_btn)
+        player_btns.addWidget(self.ready_btn)
+        player_btns.addWidget(self.start_btn)
+        player_btns.addWidget(self.render_btn)
+        player_layout.addLayout(player_btns)
+        layout.addWidget(player_group)
+
+        # 身份与 AI
+        role_group = QGroupBox("身份/代理")
+        role_layout = QHBoxLayout(role_group)
+        self.role_combo = QComboBox()
+        self.role_combo.addItems(["human", "ai", "spectator"])
+        self.role_combo.currentTextChanged.connect(self._role_changed)
+        role_layout.addWidget(QLabel("角色"))
+        role_layout.addWidget(self.role_combo)
+
+        self.agent_combo = QComboBox()
+        self.agent_combo.addItems([name for name, _ in self.agent_classes] or ["<未发现代理>"])
+        self.model_path_label = QLabel("未选择模型")
+        load_model_btn = QPushButton("加载模型")
+        load_model_btn.clicked.connect(self._load_model)
+        role_layout.addWidget(QLabel("代理"))
+        role_layout.addWidget(self.agent_combo)
+        role_layout.addWidget(load_model_btn)
+        role_layout.addWidget(self.model_path_label)
+        layout.addWidget(role_group)
+
+        # 日志
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        layout.addWidget(self.log_view, stretch=1)
+
+        self.status_label = QLabel("未连接")
+        layout.addWidget(self.status_label)
+
+        self._update_connection_buttons(False, False)
+        self._update_room_buttons(False, False, False)
+
+        self.setCentralWidget(root)
+        self._mode_changed(self.mode_combo.currentText())
+
+    def _update_connection_buttons(self, connected: bool, in_room: bool) -> None:
+        self.connect_btn.setEnabled(not connected)
+        self.disconnect_btn.setEnabled(connected)
+        self.refresh_btn.setEnabled(connected)
+        self.join_btn.setEnabled(connected and not in_room)
+        self.create_btn.setEnabled(connected and not in_room)
+
+    def _update_room_buttons(self, enabled: bool, can_start: bool, is_owner: bool) -> None:
+        for btn in (self.leave_btn, self.ready_btn, self.render_btn):
+            btn.setEnabled(enabled)
+        self.start_btn.setEnabled(enabled and can_start and is_owner)
+
+    # ------------------------- 事件 -------------------------
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._disconnect()
+        super().closeEvent(event)
+
+    def _connect(self) -> None:
+        host = self.host_edit.text().strip() or "127.0.0.1"
+        port = normalize_port(self.port_edit.text().strip(), default=5555)
+        name = self.name_edit.text().strip() or "访客"
+
+        if self.client and self.client.running:
+            QMessageBox.information(self, "已连接", "当前已连接，如需重新连接请先断开。")
+            return
+
+        if self.client:
+            self.client.close()
+
+        self.client = CloudClient(host=host, port=port, name=name, log_handler=self._append_log)
+        if self.client.connect():
+            self._append_log("连接成功，正在获取房间列表…")
+            self.status_label.setText(f"已连接 {host}:{port}")
+            self._update_connection_buttons(True, False)
+            self._update_room_buttons(False, False, False)
+        else:
+            QMessageBox.warning(self, "连接失败", "无法连接到服务器")
+
+    def _disconnect(self) -> None:
+        if self.client:
+            self.client.close()
+            self.client = None
+        self.status_label.setText("未连接")
+        self._append_log("已断开连接")
+        self.room_table.setRowCount(0)
+        self.player_table.setRowCount(0)
+        self._update_connection_buttons(False, False)
+        self._update_room_buttons(False, False, False)
+        self.renderer_blocked = False
+        self.last_room_in_progress = False
+
+    def _append_log(self, message: str) -> None:
+        text = str(message)
+        if threading.current_thread() is threading.main_thread():
+            self._on_log_message(text)
+        else:
+            self.log_signal.emit(text)
+
+    def _on_log_message(self, message: str) -> None:
+        if not hasattr(self, "log_view") or self.log_view is None:
+            print(message)
+            return
+        self.log_view.append(message)
+
+    def _refresh_rooms(self) -> None:
+        if self.client:
+            self.client.refresh_rooms()
+
+    def _join_selected(self) -> None:
+        if not self.client:
+            QMessageBox.information(self, "提示", "请先连接服务器。")
+            return
+        row = self.room_table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "提示", "请先选择房间。")
+            return
+        room_id_item = self.room_table.item(row, 0)
+        if not room_id_item:
+            return
+        self.client.send({"type": "join_room", "room_id": room_id_item.text()})
+
+    def _leave_room(self) -> None:
+        connected = bool(self.client and self.client.running)
+        if self.client:
+            self.client.leave_room()
+        self.renderer_blocked = False
+        self.last_room_in_progress = False
+        self._update_room_buttons(False, False, False)
+        self._update_connection_buttons(connected, False)
 
     def _toggle_ready(self) -> None:
-        """切换本人的准备状态并同步给服务器。"""
-        self.ready = not self.ready
-        self.send_json({"type": "ready", "ready": self.ready})
-
-    def _request_start(self) -> None:
-        """房主点击“开始游戏”时发送 start_request。"""
-        if self.player_id != self.host_id:
+        if not self.client:
+            QMessageBox.information(self, "提示", "请先连接服务器。")
             return
-        self.send_json({"type": "start_request"})
-
-    def _render_game(
-        self,
-        state: Optional[Dict],
-        *,
-        countdown_seconds: int = 0,
-        assignment_hint: Optional[str] = None,
-    ) -> None:
-        """渲染对局中的网格、蛇、统计信息与提示。"""
-        if not self.screen or not self.font or not self.small_font:
+        member = self.client.get_self_member()
+        if not member:
+            QMessageBox.information(self, "提示", "请先加入房间。")
             return
-        screen = self.screen
-        font = self.font
-        small_font = self.small_font
-        self.current_buttons = []
-
-        if not state:
-            waiting = font.render("等待服务器状态...", True, (255, 255, 255))
-            screen.blit(waiting, (60, 40))
-            if assignment_hint:
-                self._render_assignment_hint(assignment_hint)
-            if countdown_seconds:
-                self._render_countdown_overlay(countdown_seconds)
+        if member.get("role") == "spectator":
+            QMessageBox.information(self, "提示", "观战模式无需准备。")
             return
+        new_state = not member.get("ready", False)
+        self.client.set_ready(new_state)
 
-        grid_surface = pygame.Surface((self.grid_pixel_width, self.grid_pixel_height))
-        grid_surface.fill((12, 14, 20))
-        self._draw_grid(grid_surface)
-        self._draw_food(grid_surface, state.get("food", []))
-        self._draw_snakes(grid_surface, state.get("snakes", []))
-        screen.blit(grid_surface, (60, 40))
-
-        info_panel = pygame.Surface((260, self.grid_pixel_height), pygame.SRCALPHA)
-        info_panel.fill((0, 0, 0, 120))
-        screen.blit(info_panel, (self.grid_pixel_width + 100, 40))
-
-        stats = [
-            f"步数: {state.get('steps', 0)}",
-            f"存活: {state.get('alive_count', 0)}",
-            f"地图: {self.grid_width}x{self.grid_height}",
-        ]
-        for idx, line in enumerate(stats):
-            surface = small_font.render(line, True, (240, 240, 240))
-            screen.blit(surface, (self.grid_pixel_width + 120, 60 + idx * 26))
-
-        scores = state.get("scores", [])
-        for idx, score in enumerate(scores):
-            text = small_font.render(f"蛇 {idx}: {score}", True, (200, 200, 200))
-            screen.blit(text, (self.grid_pixel_width + 120, 160 + idx * 24))
-
-        hint = small_font.render("方向键控制蛇，空格回到大厅面板。", True, (220, 220, 230))
-        screen.blit(hint, (60, self.grid_pixel_height + 60))
-        self._render_color_badge(screen, small_font)
-
-        if assignment_hint:
-            self._render_assignment_hint(assignment_hint)
-        if countdown_seconds:
-            self._render_countdown_overlay(countdown_seconds)
-
-    def _render_game_over(self, summary: Dict) -> None:
-        """在屏幕底部展示上一局的得分概览。"""
-        if not self.screen or not self.font:
+    def _start_game(self) -> None:
+        if not self.client:
+            QMessageBox.information(self, "提示", "请先连接服务器。")
             return
-        overlay = pygame.Surface((self.screen.get_width(), 140), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 160))
-        self.screen.blit(overlay, (0, self.screen.get_height() - 160))
-
-        title = self.font.render("本局结束", True, (255, 230, 160))
-        self.screen.blit(title, (80, self.screen.get_height() - 150))
-        for idx, score in enumerate(summary.get("scores", [])):
-            text = self.font.render(f"蛇 {idx}: {score}", True, (220, 220, 220))
-            self.screen.blit(text, (80, self.screen.get_height() - 110 + idx * 26))
-
-    def _render_assignment_hint(self, message: str) -> None:
-        """在屏幕底部展示当前槽位提示。"""
-        if not self.screen or not self.small_font:
+        if not self.client.current_room_id:
+            QMessageBox.information(self, "提示", "请先加入房间。")
             return
-        panel = pygame.Surface((self.screen.get_width(), 50), pygame.SRCALPHA)
-        panel.fill((15, 15, 20, 200))
-        self.screen.blit(panel, (0, self.screen.get_height() - 70))
-        text = self.small_font.render(message, True, (255, 235, 200))
-        self.screen.blit(
-            text,
-            (self.screen.get_width() // 2 - text.get_width() // 2, self.screen.get_height() - 60),
-        )
-
-    def _render_countdown_overlay(self, seconds: int) -> None:
-        """在联机对战开始前渲染倒计时。"""
-        if not self.screen or not self.font:
+        if not self.client.room_can_start:
+            playable = [m for m in self.client.room_members if m.get("role") != "spectator"]
+            playable_non_owner = [m for m in playable if not m.get("is_owner")]
+            not_ready = [m.get("name", "?") for m in playable_non_owner if not m.get("ready", False)]
+            msg = "仍有玩家未准备。"
+            if not_ready:
+                msg += " 未准备: " + ", ".join(not_ready)
+            if len(playable) < 2:
+                msg = "至少需要两名参战玩家才能开始。"
+            QMessageBox.information(self, "无法开始", msg)
             return
-        overlay = pygame.Surface(self.screen.get_size(), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 120))
-        self.screen.blit(overlay, (0, 0))
-        label = self.font.render(str(seconds), True, (255, 245, 200))
-        self.screen.blit(
-            label,
-            (self.screen.get_width() // 2 - label.get_width() // 2, self.screen.get_height() // 2 - 70),
-        )
-        sub = self.small_font.render("倒计时结束后自动开局", True, (235, 235, 235))
-        self.screen.blit(
-            sub,
-            (self.screen.get_width() // 2 - sub.get_width() // 2, self.screen.get_height() // 2),
-        )
-
-    def _render_restart_overlay(self) -> None:
-        """当等待玩家决定下一局时，绘制按钮覆盖层。"""
-        if not self.screen or not self.font or not self.small_font:
+        if self.client.room_owner and self.client.client_id != self.client.room_owner:
+            QMessageBox.information(self, "提示", "只有房主可以开始游戏。")
             return
-        width, height = self.screen.get_size()
-        panel = pygame.Surface((width, 220), pygame.SRCALPHA)
-        panel.fill((10, 10, 10, 210))
-        self.screen.blit(panel, (0, height // 2 - 110))
-
-        title = self.font.render("本局结束，要继续挑战吗？", True, (255, 230, 180))
-        self.screen.blit(title, (width // 2 - title.get_width() // 2, height // 2 - 80))
-        subtitle = self.small_font.render("选择“继续作战”会自动准备下一局，或退出客户端休息。", True, (220, 220, 230))
-        self.screen.blit(subtitle, (width // 2 - subtitle.get_width() // 2, height // 2 - 40))
-
-        btn_w, btn_h = 180, 50
-        spacing = 30
-        start_x = width // 2 - btn_w - spacing // 2
-        y = height // 2 + 10
-        buttons = [
-            UIButton(pygame.Rect(start_x, y, btn_w, btn_h), "继续作战", lambda: self._choose_restart(True), True),
-            UIButton(
-                pygame.Rect(start_x + btn_w + spacing, y, btn_w, btn_h),
-                "休息一下",
-                lambda: self._choose_restart(False),
-                True,
-            ),
-            UIButton(
-                pygame.Rect(width // 2 - btn_w // 2, y + btn_h + spacing, btn_w, btn_h),
-                "退出游戏",
-                self._quit_client,
-                True,
-            ),
-        ]
-        self.restart_buttons = buttons
-        for button in buttons:
-            button.draw(self.screen, self.small_font)
-
-    def _choose_restart(self, ready: bool) -> None:
-        """处理重开按钮：设置 ready 状态并通知服务器。"""
-        self.await_restart_choice = False
-        self.restart_buttons = []
-        self.ready = ready
-        self.send_json({"type": "ready", "ready": ready})
-
-    def _quit_client(self) -> None:
-        """退出按钮回调，停止主循环并关闭窗口。"""
-        self.await_restart_choice = False
-        self.running = False
-
-    def _render_tip(self, message: str) -> None:
-        """在顶部显示短暂提示条，如条件不足、切换模式提醒。"""
-        if not self.screen or not self.small_font:
-            return
-        panel = pygame.Surface((self.screen.get_width(), 40), pygame.SRCALPHA)
-        panel.fill((20, 20, 20, 180))
-        self.screen.blit(panel, (0, 0))
-        surface = self.small_font.render(message, True, (255, 200, 120))
-        self.screen.blit(surface, (40, 10))
-
-    def _draw_grid(self, surface: pygame.Surface) -> None:
-        """绘制棋盘格线，辅助观察位置。"""
-        for x in range(0, self.grid_pixel_width, self.cell_size):
-            pygame.draw.line(surface, (40, 40, 45), (x, 0), (x, self.grid_pixel_height))
-        for y in range(0, self.grid_pixel_height, self.cell_size):
-            pygame.draw.line(surface, (40, 40, 45), (0, y), (self.grid_pixel_width, y))
-
-    def _draw_food(self, surface: pygame.Surface, foods: List[List[int]]) -> None:
-        """根据 food 列表绘制红色食物块。"""
-        for fx, fy in foods:
-            rect = pygame.Rect(fx * self.cell_size, fy * self.cell_size, self.cell_size, self.cell_size)
-            pygame.draw.rect(surface, (250, 120, 120), rect)
-
-    def _draw_snakes(self, surface: pygame.Surface, snakes: List[Dict]) -> None:
-        """遍历蛇列表，按颜色绘制身体与蛇头高亮。"""
-        for snake in snakes:
-            if not snake.get("alive", False):
-                continue
-            color = COLOR_MAP.get(snake.get("color", "green"), (0, 200, 0))
-            for idx, (bx, by) in enumerate(snake.get("body", [])):
-                rect = pygame.Rect(bx * self.cell_size, by * self.cell_size, self.cell_size, self.cell_size)
-                pygame.draw.rect(surface, color, rect)
-                pygame.draw.rect(surface, (0, 0, 0), rect, 1)
-                if idx == 0:
-                    pygame.draw.rect(surface, (255, 255, 255), rect, 2)
-
-    # ------------------------------------------------------------------
-    # AI 推理与尺寸管理
-    # ------------------------------------------------------------------
-    def _update_grid_dimensions(self, width: int, height: int) -> None:
-        """当服务器广播的地图尺寸变化时，更新像素尺寸并重建窗口。"""
-        width = max(6, width)
-        height = max(6, height)
-        if width == self.grid_width and height == self.grid_height:
-            return
-        self.grid_width = width
-        self.grid_height = height
-        self.grid_pixel_width = self.grid_width * self.cell_size
-        self.grid_pixel_height = self.grid_height * self.cell_size
-        self.ai_agent = None  # 网格变化后需重建模型
-        self._resize_window()
-
-    def _resize_window(self) -> None:
-        """根据当前网格像素宽高调节显示窗口大小。"""
-        if not pygame.get_init():
-            return
-        display_width = max(self.grid_pixel_width + 320, 1024)
-        display_height = max(self.grid_pixel_height + 120, 640)
-        self.screen = pygame.display.set_mode((display_width, display_height))
-
-    def _maybe_drive_ai(self, state: Dict) -> None:
-        """在 AI 模式下，根据最新状态预测动作并发送。"""
-        if self.phase != "game" or self.player_mode != "ai" or self.slot is None:
-            return
-        action = self._predict_action(state)
-        if action is not None:
-            self.send_json({"type": "action", "value": int(action)})
-
-    def _predict_action(self, state: Dict) -> Optional[int]:
-        """生成 AI 动作：优先使用加载的模型，否则回退启发式策略。"""
-        snakes = state.get("snakes", [])
-        if self.slot is None or self.slot >= len(snakes):
-            return None
-
-        width = int(state.get("width", self.grid_width))
-        height = int(state.get("height", self.grid_height))
-
-        obs = build_observation_from_snapshot(
-            width=width,
-            height=height,
-            snakes=snakes,
-            food=state.get("food", []),
-            slot=self.slot,
-        )
-
-        if self.ai_model_hint:
-            if not self._ensure_ai_agent(width):
-                return self._heuristic_action(state)
-            return self.ai_agent.predict(obs) if self.ai_agent else 0
-        return self._heuristic_action(state)
-
-    def _heuristic_action(self, state: Dict) -> int:
-        """简单启发式：沿着最近食物方向移动。"""
-        snakes = state.get("snakes", [])
-        foods = state.get("food", [])
-        if self.slot is None or self.slot >= len(snakes) or not foods:
-            return 0
-        snake = snakes[self.slot]
-        if not snake.get("alive", False):
-            return 0
-        head_x, head_y = snake.get("body", [[0, 0]])[0]
-        target = min(foods, key=lambda pos: abs(pos[0] - head_x) + abs(pos[1] - head_y))
-        dx = target[0] - head_x
-        dy = target[1] - head_y
-        dir_name = snake.get("direction", "RIGHT")
+        self._append_log("发送开始游戏请求…")
         try:
-            current_dir = Direction[dir_name]
-        except KeyError:
-            current_dir = Direction.RIGHT
-
-        desired = current_dir
-        if abs(dx) > abs(dy):
-            desired = Direction.RIGHT if dx > 0 else Direction.LEFT
-        elif dy != 0:
-            desired = Direction.DOWN if dy > 0 else Direction.UP
-        return _dir_to_relative(current_dir, desired)
-
-    def _ensure_ai_agent(self, grid_size: int) -> bool:
-        """确保已成功加载 AI 模型，若缺失或出错则回退。"""
-        if not self.ai_model_hint:
-            return False
-        if self.ai_agent is not None:
-            return True
-        model_path = Path(self.ai_model_hint)
-        if not model_path.exists():
-            print(f"[Client] 模型不存在：{model_path}")
-            self.ai_model_hint = None
-            return False
-        try:
-            agent = PPOAgent(input_channels=3, grid_size=grid_size, action_dim=3)
-            state_dict = torch.load(model_path, map_location="cpu")
-            agent.policy.load_state_dict(state_dict)
-            agent.policy.eval()
-            self.ai_agent = agent
-            print(f"[Client] 成功加载模型 {model_path}")
-            return True
+            self.client.start_game()
         except Exception as exc:  # noqa: BLE001
-            print(f"[Client] 加载模型失败: {exc}")
-            self.ai_model_hint = None
-            return False
+            self._append_log(f"开始游戏发送失败: {exc}")
+            QMessageBox.warning(self, "发送失败", f"无法发送开始指令: {exc}")
 
-    def _load_font(self, size: int = 22) -> pygame.font.Font:
-        """加载中文字体，失败时回退到 Arial。"""
+    def _create_room(self) -> None:
+        if not self.client:
+            QMessageBox.information(self, "提示", "请先连接服务器。")
+            return
+        if not self.client.running:
+            QMessageBox.warning(self, "未连接", "连接已断开，请重新连接后再创建房间。")
+            return
+        tick_seconds = max(0.02, self.tick_spin.value() / 1000.0)
+        mode = self.mode_combo.currentText()
+        config: Dict = {
+            "grid_size": self.grid_spin.value(),
+            "num_food": self.food_spin.value(),
+            "max_steps": self.steps_spin.value(),
+            "tick_rate": tick_seconds,
+        }
+        if mode == "online":
+            config["num_snakes"] = self.snakes_spin.value()
+        elif mode == "training":
+            config["sparring_bots"] = self.sparring_spin.value()
+        elif mode == "ai_duel":
+            label = self.duel_label_edit.text().strip() or "RainbowAI"
+            config["agent_label"] = label
+            model_path = self.duel_model_edit.text().strip()
+            if model_path:
+                config["model_path"] = model_path
         try:
-            return pygame.font.SysFont("simhei", size)
-        except Exception:  # noqa: BLE001
-            return pygame.font.SysFont("arial", size)
+            self.client.create_room(mode=mode, config=config)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "创建失败", f"创建房间时出错: {exc}")
+            self._append_log(f"创建房间失败: {exc}")
 
-    @staticmethod
-    def _mode_label(mode: str) -> str:
-        """将内部模式标识映射为中文标签。"""
-        return {"player": "人工", "ai": "AI", "observer": "观察"}.get(mode, mode)
+    def _role_changed(self, role: str) -> None:
+        if self.client and role:
+            self.client.set_role(role)
 
+    def _mode_changed(self, mode: str) -> None:
+        is_online = mode == "online"
+        is_training = mode == "training"
+        is_duel = mode == "ai_duel"
+        self.snakes_spin.setEnabled(is_online)
+        self.training_extra.setVisible(is_training)
+        self.duel_extra.setVisible(is_duel)
 
-def start_network_client(host: str = "127.0.0.1", port: int = 5555, name: str = "Player", ai_model: Optional[str] = None) -> None:
-    """命令式入口：根据参数实例化并运行 GameClient。"""
-    GameClient(host=host, port=port, name=name, ai_model_hint=ai_model).run()
+    def _pick_duel_model(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择 AI 模型文件", str(Path("agent/checkpoints")), "PyTorch (*.pth *.pt);;All Files (*.*)")
+        if file_path:
+            self.duel_model_edit.setText(file_path)
 
+    def _load_model(self) -> None:
+        if not self.agent_classes:
+            QMessageBox.information(self, "提示", "未发现可用代理")
+            return
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择模型文件", str(Path("agent/checkpoints")), "*.pth;*.pt;*.*")
+        if not file_path:
+            return
+        self.agent_checkpoint = Path(file_path)
+        self.model_path_label.setText(self.agent_checkpoint.name)
 
-def start_local_training(config: Optional[TrainConfig] = None) -> None:
-    """触发 PPO 训练，如未传配置则使用默认参数。"""
-    cfg = config or TrainConfig()
-    train(cfg)
+        # 实例化代理
+        agent_name = self.agent_combo.currentText()
+        agent_cls = next((cls for name, cls in self.agent_classes if name == agent_name), None)
+        if not agent_cls:
+            QMessageBox.warning(self, "加载失败", "未找到所选代理类")
+            return
 
+        grid_guess = self.grid_spin.value()
+        state = self.client.get_state(self.client.current_room_id) if self.client and self.client.current_room_id else None
+        if state:
+            grid_guess = int(state.get("grid", grid_guess))
 
-def launch_client_gui() -> None:
-    """启动三选项卡 GUI，统一入口管理训练/对练/联机。"""
-    import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
+        agent = instantiate_agent(agent_cls, grid_guess)
+        if not agent:
+            QMessageBox.warning(self, "加载失败", "无法实例化代理类")
+            return
 
-    speed_presets = {
-        "慢速学习 (0.18s/步)": {"sim_interval": 0.18, "fps": 24},
-        "标准流畅 (0.12s/步)": {"sim_interval": 0.12, "fps": 30},
-        "快速挑战 (0.08s/步)": {"sim_interval": 0.08, "fps": 45},
-    }
-
-    root = tk.Tk()
-    root.title("多蛇客户端控制台")
-    root.geometry("520x480")
-    root.configure(bg="#0f111a")
-
-    style = ttk.Style()
-    style.theme_use("default")
-    style.configure("TNotebook", background="#0f111a", borderwidth=0)
-    style.configure("TNotebook.Tab", padding=[12, 6], font=("Microsoft YaHei", 11))
-    style.map("TNotebook.Tab", background=[("selected", "#1f2435")], foreground=[("selected", "#ffffff")])
-
-    notebook = ttk.Notebook(root)
-    notebook.pack(fill="both", expand=True, padx=16, pady=16)
-
-    def labeled_entry(parent, text, default=""):
-        """创建带标签的输入框，返回可读写的 StringVar。"""
-        frame = tk.Frame(parent, bg="#181b2a")
-        frame.pack(fill="x", pady=6)
-        tk.Label(frame, text=text, fg="white", bg="#181b2a", anchor="w").pack(anchor="w")
-        var = tk.StringVar(value=default)
-        entry = tk.Entry(frame, textvariable=var, bg="#243046", fg="white", insertbackground="white", relief="flat")
-        entry.pack(fill="x", pady=2)
-        return var
-
-    # 训练 Tab
-    train_tab = tk.Frame(notebook, bg="#181b2a")
-    notebook.add(train_tab, text="模型训练")
-    tk.Label(train_tab, text="配置 PPO 训练参数，点击开始后将在当前窗口输出日志。", bg="#181b2a", fg="#cfd8ff").pack(pady=8, anchor="w", padx=8)
-    train_grid = labeled_entry(train_tab, "网格大小", "30")
-    train_snakes = labeled_entry(train_tab, "蛇数量", "4")
-    train_eps = labeled_entry(train_tab, "训练轮数", "2000")
-    train_device = labeled_entry(train_tab, "训练设备 (auto/cpu/cuda:0)", "auto")
-
-    def launch_training() -> None:
-        """读取训练参数并启动 PPO 训练流程。"""
         try:
-            cfg = TrainConfig(
-                grid_size=int(train_grid.get() or 30),
-                num_snakes=int(train_snakes.get() or 4),
-                max_episodes=int(train_eps.get() or 2000),
-                device=(train_device.get().strip() or "auto"),
+            agent.load(self.agent_checkpoint)
+        except Exception as exc:
+            QMessageBox.warning(self, "加载失败", f"模型载入失败: {exc}")
+            return
+
+        self.agent_instance = agent
+        self._append_log(f"已加载代理 {agent_name} @ {self.agent_checkpoint.name}")
+
+    # ------------------------- 定时任务 -------------------------
+    def _tick_refresh(self) -> None:
+        try:
+            client = self.client
+            connected = bool(client and client.running)
+            in_room = bool(connected and client and client.current_room_id)
+            self._update_connection_buttons(connected, in_room)
+
+            if not client:
+                self.status_label.setText("未连接")
+                self.room_table.setRowCount(0)
+                self.player_table.setRowCount(0)
+                self._update_room_buttons(False, False, False)
+                self.last_room_in_progress = False
+                return
+
+            if not connected:
+                self.status_label.setText("连接已断开")
+                self.room_table.setRowCount(0)
+                self.player_table.setRowCount(0)
+                self._update_room_buttons(False, False, False)
+                self.last_room_in_progress = False
+                return
+
+            rooms = list(client.rooms)
+            self.room_table.setRowCount(len(rooms))
+            for row, room in enumerate(rooms):
+                self._set_center_item(self.room_table, row, 0, room.room_id)
+                self._set_center_item(self.room_table, row, 1, MODE_LABELS.get(room.mode, room.mode))
+                self._set_center_item(self.room_table, row, 2, room.owner_name)
+                self._set_center_item(self.room_table, row, 3, str(room.members))
+                self._set_center_item(self.room_table, row, 4, str(room.config.get("grid_size", 30)))
+
+            if client.current_room_id:
+                in_progress = bool(client.room_in_progress)
+                if in_progress and not self.last_room_in_progress:
+                    self.renderer_blocked = False
+                self.last_room_in_progress = in_progress
+                self.status_label.setText(
+                    f"房间 {client.current_room_id} | 槽位 {client.current_slot} | 准备: {client.room_can_start} | 进行中: {client.room_in_progress}"
+                )
+                self._update_player_table()
+                self._maybe_launch_renderer()
+            else:
+                self.status_label.setText("未加入房间")
+                self.player_table.setRowCount(0)
+                self.last_room_in_progress = False
+
+            room_controls_enabled = bool(client.current_room_id)
+            can_start = bool(client.room_can_start) if room_controls_enabled else False
+            is_owner = bool(client.room_owner and client.client_id == client.room_owner) if room_controls_enabled else False
+            self._update_room_buttons(room_controls_enabled, can_start, is_owner)
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"刷新界面时出错: {exc}")
+
+    def _drive_ai(self) -> None:
+        try:
+            if not self.client or not self.agent_instance:
+                return
+            if self.role_combo.currentText() != "ai":
+                return
+            if not self.client.current_room_id or self.client.current_slot is None:
+                return
+            if not self.client.room_in_progress:
+                return
+            state = self.client.get_state(self.client.current_room_id)
+            if not state:
+                return
+
+            try:
+                obs = self._state_to_observation(state, self.client.current_slot)
+            except Exception as exc:
+                self._append_log(f"构造观测失败: {exc}")
+                return
+
+            action = int(self.agent_instance.act(obs, epsilon=0.0))
+            self.client.send_action(action)
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"AI 驱动出错: {exc}")
+
+    def _maybe_launch_renderer(self) -> None:
+        if self.renderer_running:
+            return
+        if not self.client or not self.client.current_room_id:
+            return
+        if not self.client.room_in_progress:
+            return
+        if self.renderer_blocked:
+            return
+        # find role and slot
+        role = self.role_combo.currentText() if hasattr(self, "role_combo") else "human"
+        member = self.client.get_self_member()
+        if member:
+            role = member.get("role", role)
+        slot = self.client.current_slot
+        if slot is None and member is not None:
+            try:
+                slot = int(member.get("slot")) if member.get("slot") is not None else None
+            except (TypeError, ValueError):
+                slot = None
+
+        def _run() -> None:
+            self.renderer_running = True
+            try:
+                renderer = BattleRenderer(self.client, self.client.current_room_id or "", slot, role=role)
+                renderer.run()
+            except Exception as exc:  # noqa: BLE001
+                self._append_log(f"渲染器启动失败: {exc}")
+            finally:
+                self.renderer_running = False
+                self.renderer_blocked = True
+                self.renderer_thread = None
+
+        self.renderer_thread = threading.Thread(target=_run, daemon=True)
+        self.renderer_thread.start()
+
+    def _open_renderer(self) -> None:
+        if not self.client or not self.client.current_room_id:
+            QMessageBox.information(self, "提示", "请先加入房间。")
+            return
+        if self.renderer_running:
+            QMessageBox.information(self, "提示", "渲染窗口已打开。")
+            return
+        self.renderer_blocked = False
+        self._maybe_launch_renderer()
+
+    # ------------------------- 工具 -------------------------
+    def _set_center_item(self, table: QTableWidget, row: int, col: int, text: str) -> None:
+        item = QTableWidgetItem(text)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        table.setItem(row, col, item)
+
+    def _update_player_table(self) -> None:
+        members = list(self.client.room_members)
+        self.player_table.setRowCount(len(members))
+        for row, member in enumerate(members):
+            slot = member.get("slot", row)
+            name = member.get("name") or member.get("client_id", "?")
+            role = member.get("role", "?")
+            ready = "是" if member.get("ready", False) else "否"
+            color_raw = member.get("color", "-")
+            color = str(color_raw)
+            if member.get("is_owner"):
+                color = f"{color_raw} (房主)"
+            self._set_center_item(self.player_table, row, 0, str(slot))
+            self._set_center_item(self.player_table, row, 1, str(name))
+            self._set_center_item(self.player_table, row, 2, str(role))
+            self._set_center_item(self.player_table, row, 3, ready)
+            self._set_center_item(self.player_table, row, 4, str(color))
+
+    def _state_to_observation(self, state: Dict, slot: int) -> np.ndarray:
+        grid = int(state.get("grid", 30))
+        snakes_raw = state.get("snakes", [])
+        snakes_snapshot = []
+        for idx, snake in enumerate(snakes_raw):
+            direction_name = snake.get("direction", "RIGHT")
+            try:
+                direction = Direction[direction_name]
+            except KeyError:
+                direction = Direction.RIGHT
+            body = [tuple(seg) if not isinstance(seg, tuple) else seg for seg in snake.get("body", [])]
+            snakes_snapshot.append(
+                {
+                    "id": idx,
+                    "body": body,
+                    "direction": direction,
+                    "alive": snake.get("alive", True),
+                }
             )
-        except ValueError:
-            messagebox.showerror("错误", "训练参数必须为数字")
-            return
-        root.destroy()
-        start_local_training(cfg)
 
-    tk.Button(train_tab, text="开始训练", command=launch_training, bg="#3a7bd5", fg="white", relief="flat").pack(pady=16, fill="x", padx=8)
-
-    # 本地对练 Tab
-    arena_tab = tk.Frame(notebook, bg="#181b2a")
-    notebook.add(arena_tab, text="本地对练")
-    tk.Label(
-        arena_tab,
-        text="填写参数后点击“启动本地对练”，进入 Pygame 窗口，用方向键操控指定蛇。",
-        bg="#181b2a",
-        fg="#cfd8ff",
-        wraplength=460,
-        justify="left",
-    ).pack(pady=8, anchor="w", padx=8)
-    arena_grid = labeled_entry(arena_tab, "地图大小", "30")
-    arena_snakes = labeled_entry(arena_tab, "蛇数量", "4")
-    arena_model = labeled_entry(arena_tab, "AI 模型路径 (可选)")
-    arena_device = labeled_entry(arena_tab, "AI 推理设备 (auto/cpu/cuda:0)", "auto")
-    human_var = tk.BooleanVar(value=True)
-    tk.Checkbutton(
-        arena_tab,
-        text="人工操控第一条蛇",
-        variable=human_var,
-        bg="#181b2a",
-        fg="white",
-        selectcolor="#243046",
-        activebackground="#181b2a",
-    ).pack(anchor="w", padx=8, pady=6)
-
-    tk.Label(arena_tab, text="速度/流畅度预设", bg="#181b2a", fg="#cfd8ff").pack(anchor="w", padx=8, pady=(4, 0))
-    speed_var = tk.StringVar(value="标准流畅 (0.12s/步)")
-    speed_menu = tk.OptionMenu(arena_tab, speed_var, *speed_presets.keys())
-    speed_menu.configure(bg="#2b3248", fg="white", activebackground="#3a425e", highlightthickness=0)
-    speed_menu.pack(anchor="w", padx=8, pady=4)
-
-    def browse_arena_model() -> None:
-        """选择本地对练所需的模型文件。"""
-        path = filedialog.askopenfilename(title="选择模型", filetypes=[("PyTorch Model", "*.pth"), ("所有文件", "*")])
-        if path:
-            arena_model.set(path)
-
-    tk.Button(arena_tab, text="浏览模型", command=browse_arena_model, bg="#2b3248", fg="white", relief="flat").pack(pady=4, padx=8, anchor="e")
-
-    def launch_arena() -> None:
-        """校验本地对练参数并开启 Pygame 对练窗口。"""
-        try:
-            grid = int(arena_grid.get() or 30)
-            snakes = int(arena_snakes.get() or 4)
-        except ValueError:
-            messagebox.showerror("错误", "地图与蛇数量必须为整数")
-            return
-        model = arena_model.get().strip() or None
-        preset = speed_presets.get(speed_var.get(), speed_presets["标准流畅 (0.12s/步)"])
-        root.destroy()
-        start_local_arena(
-            grid_size=grid,
-            num_snakes=snakes,
-            human_player=human_var.get(),
-            model_path=model,
-            target_fps=int(preset["fps"]),
-            sim_interval=float(preset["sim_interval"]),
-            device=arena_device.get().strip() or "auto",
+        food = [tuple(f) if not isinstance(f, tuple) else f for f in state.get("food", [])]
+        return build_observation_from_snapshot(
+            width=grid,
+            height=grid,
+            snakes=snakes_snapshot,
+            food=food,
+            slot=slot,
         )
 
-    tk.Button(arena_tab, text="启动本地对练", command=launch_arena, bg="#3a7bd5", fg="white", relief="flat").pack(pady=16, fill="x", padx=8)
 
-    # 联机 Tab
-    client_tab = tk.Frame(notebook, bg="#181b2a")
-    notebook.add(client_tab, text="联机大厅")
-    tk.Label(client_tab, text="填写服务器参数后进入大厅，支持人工/AI/观察模式切换。", bg="#181b2a", fg="#cfd8ff").pack(pady=8, anchor="w", padx=8)
-    host_var = labeled_entry(client_tab, "服务器 IP", "127.0.0.1")
-    port_var = labeled_entry(client_tab, "端口", "5555")
-    name_var = labeled_entry(client_tab, "昵称", "Player")
-    model_var = labeled_entry(client_tab, "AI 模型路径 (可选)")
-
-    def browse_client_model() -> None:
-        """为联机 AI 模式挑选本地模型文件。"""
-        path = filedialog.askopenfilename(title="选择模型", filetypes=[("PyTorch Model", "*.pth"), ("所有文件", "*")])
-        if path:
-            model_var.set(path)
-
-    tk.Button(client_tab, text="浏览模型", command=browse_client_model, bg="#2b3248", fg="white", relief="flat").pack(pady=4, padx=8, anchor="e")
-
-    def launch_client() -> None:
-        """读取服务器参数并启动 Pygame 联机客户端。"""
-        try:
-            port = int(port_var.get() or 5555)
-        except ValueError:
-            messagebox.showerror("错误", "端口必须是数字")
-            return
-        ai_path = model_var.get().strip() or None
-        root.destroy()
-        start_network_client(host=host_var.get() or "127.0.0.1", port=port, name=name_var.get() or "Player", ai_model=ai_path)
-
-    tk.Button(client_tab, text="启动联机客户端", command=launch_client, bg="#3a7bd5", fg="white", relief="flat").pack(pady=16, fill="x", padx=8)
-
-    tk.Button(root, text="退出控制台", command=root.destroy, bg="#2b3248", fg="white", relief="flat").pack(pady=4, fill="x", padx=16)
-    root.mainloop()
+def main() -> None:
+    app = QApplication([])
+    window = ClientWindow()
+    window.show()
+    app.exec()
 
 
 if __name__ == "__main__":
-    launch_client_gui()
+    main()

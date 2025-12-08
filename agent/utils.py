@@ -1,4 +1,4 @@
-"""Shared helpers for training/inference utilities."""
+"""训练/推理阶段复用的公共工具函数。"""
 
 from __future__ import annotations
 
@@ -8,17 +8,17 @@ import torch
 
 
 def resolve_device(preference: Optional[str] = None) -> torch.device:
-    """Resolve a human-readable device string into a torch.device instance.
+    """根据用户偏好自动推断可用的 torch.device。
 
     Args:
-        preference: "auto", "cpu", "cuda", or "cuda:0" style string. Defaults to "auto".
+        preference: "auto"/"cpu"/"cuda"/"cuda:0" 等字符串，默认为 "auto"。
 
     Returns:
-        torch.device: A validated torch device.
+        torch.device: 可以直接用于模型与张量的设备对象。
 
     Raises:
-        ValueError: If the device string cannot be parsed.
-        RuntimeError: If CUDA was explicitly requested but unavailable.
+        ValueError: 当输入字符串无法解析为合法设备时抛出。
+        RuntimeError: 当用户显式请求 CUDA 但当前环境不可用时抛出。
     """
 
     pref = (preference or "auto").strip()
