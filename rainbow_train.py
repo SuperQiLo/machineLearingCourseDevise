@@ -5,8 +5,8 @@ from __future__ import annotations
 import time
 from typing import Dict
 
-from agent.config import RainbowConfig
-from agent.trainer import RainbowTrainer
+from agent.rainbow_config import RainbowConfig
+from agent.rainbow_trainer import RainbowTrainer
 
 
 def train() -> None:

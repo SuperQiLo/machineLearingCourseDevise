@@ -8,7 +8,22 @@ from typing import Dict, Optional, Protocol, Any
 import pygame
 
 from env.multi_snake_env import Direction
-from network.constants import COLOR_MAP
+COLOR_MAP = {
+    "green": (0, 200, 0),
+    "blue": (50, 120, 255),
+    "red": (255, 70, 70),
+    "yellow": (255, 200, 0),
+    "purple": (180, 70, 255),
+    "orange": (255, 150, 60),
+    "teal": (60, 200, 200),
+    "pink": (255, 105, 180),
+    "lime": (180, 255, 80),
+    "cyan": (80, 220, 255),
+    "magenta": (255, 80, 200),
+    "silver": (200, 200, 210),
+    "gold": (255, 215, 0),
+}
+ROLE_NAMES = {"human": "手操", "ai": "AI", "spectator": "观战"}
 from network.utils import direction_to_relative
 
 
@@ -127,10 +142,7 @@ class BattleRenderer:
                 name = entry.get("owner_name")
                 if name:
                     return name
-                slot = entry.get("slot")
-                if slot is not None:
-                    return f"槽位 {slot}"
-            return f"蛇 {idx}"
+            return f"玩家 {idx}"
         for snake in snakes:
             if not snake.get("alive", True):
                 continue
@@ -147,22 +159,30 @@ class BattleRenderer:
         info_panel.fill((18, 20, 28))
         screen.blit(info_panel, (surface.get_width() + 80, 40))
 
-        role_label = {"human": "手操", "ai": "AI", "spectator": "观战"}.get(self.role, self.role)
         lines = [
-            f"房间: {self.room_id}",
-            f"模式: {state.get('mode', 'unknown')}",
-            f"角色: {role_label}",
-            f"槽位: {self.slot if self.slot is not None else '观察'}",
+            f"房间号: {self.room_id}",
             f"步数: {state.get('steps', 0)}",
         ]
         for idx, text in enumerate(lines):
             label = font.render(text, True, (230, 230, 235))
             screen.blit(label, (surface.get_width() + 90, 60 + idx * 28))
 
-        for idx, score in enumerate(state.get("scores", [])):
-            label_text = snake_label(idx)
-            text = font.render(f"{label_text}: {score}", True, (200, 200, 210))
-            screen.blit(text, (surface.get_width() + 90, 200 + idx * 24))
+        scores = state.get("scores") or []
+        score_y = 120
+        for idx, snake in enumerate(snakes):
+            owner_id = snake.get("owner_id")
+            owner_name = snake.get("owner_name")
+            if not owner_id and not owner_name:
+                continue
+            role_text = snake.get("role")
+            role_label = ROLE_NAMES.get(role_text, role_text) if role_text else None
+            display_name = owner_name or owner_id or f"玩家 {idx}"
+            if role_label:
+                display_name = f"{display_name}-{role_label}"
+            score_val = scores[idx] if idx < len(scores) else snake.get("score", 0)
+            text = font.render(f"{display_name}: {score_val:.1f}", True, (200, 200, 210))
+            screen.blit(text, (surface.get_width() + 90, score_y))
+            score_y += 26
 
         if self.slot is not None and self.slot < len(snakes):
             player_snake = snakes[self.slot]
@@ -187,7 +207,7 @@ class BattleRenderer:
             screen.blit(g_label, (surface.get_width() // 2 - 20, surface.get_height() // 2 - 10))
 
         now = time.time()
-        countdown_needed = state.get("mode") == "online"
+        countdown_needed = True
         countdown_value = state.get("countdown")
         countdown_in_progress = False
 

@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from agent.base_agent import BaseAgent
-from agent.config import RainbowConfig
+from agent.rainbow_config import RainbowConfig
 from agent.rainbow_model import RainbowBackbone
 from agent.replay_buffer import TransitionBatch
 from agent.utils import resolve_device
@@ -65,7 +65,11 @@ class RainbowAgent(BaseAgent):
     def load(self, checkpoint: Path) -> None:
         """从给定路径加载参数到在线/目标网络。"""
 
-        state_dict = torch.load(checkpoint, map_location=self.device)
+        kwargs = {"map_location": self.device}
+        try:
+            state_dict = torch.load(checkpoint, weights_only=True, **kwargs)  # type: ignore[arg-type]
+        except TypeError:
+            state_dict = torch.load(checkpoint, **kwargs)
         self.online_net.load_state_dict(state_dict)
         self.target_net.load_state_dict(state_dict)
 
@@ -147,9 +151,9 @@ class RainbowAgent(BaseAgent):
         torch.nn.utils.clip_grad_norm_(self.online_net.parameters(), 10.0)
         self.optimizer.step()
 
-        td_errors = torch.abs(torch.sum((proj_dist - action_dist), dim=1))
+        td_errors = torch.abs(torch.sum((proj_dist - action_dist), dim=1)).detach()
 
-        return loss.item(), td_errors.detach().cpu().numpy()
+        return loss.item(), td_errors
 
     def sync_target(self) -> None:
         """将在线网络的权重复制到目标网络。"""

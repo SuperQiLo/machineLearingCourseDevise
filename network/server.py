@@ -6,18 +6,15 @@ import asyncio
 import json
 import secrets
 from dataclasses import dataclass
-from enum import Enum
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Sequence
 
 from env.config import EnvConfig
 from env.multi_snake_env import Direction, MultiSnakeEnv
 from network.utils import direction_to_relative
 
-
-class RoomMode(Enum):
-    ONLINE = "online"
-    TRAINING = "training"
-    AI_DUEL = "ai_duel"
+EVENT_REWARD_FOOD = 20.0
+EVENT_REWARD_KILL = 100.0
+EVENT_REWARD_DEATH = 0.0
 
 
 @dataclass
@@ -27,12 +24,9 @@ class RoomConfig:
     num_food: int = 6
     max_steps: int = 1500
     tick_rate: float = 0.12
-    sparring_bots: int = 0
-    agent_label: str = ""
-    model_path: Optional[str] = None
 
     @classmethod
-    def from_request(cls, mode: RoomMode, raw: dict) -> "RoomConfig":
+    def from_request(cls, raw: dict) -> "RoomConfig":
         def _int(name: str, default: int, minimum: int = 1) -> int:
             try:
                 value = int(raw.get(name, default))
@@ -45,33 +39,6 @@ class RoomConfig:
         num_food = _int("num_food", 6, minimum=1)
         max_steps = _int("max_steps", 1500, minimum=100)
         tick_rate: float = float(raw.get("tick_rate", 0.12))
-
-        if mode == RoomMode.TRAINING:
-            sparring_bots = _int("sparring_bots", 3, minimum=1)
-            total_snakes = sparring_bots + 1
-            return cls(
-                grid_size=grid_size,
-                num_snakes=total_snakes,
-                num_food=num_food,
-                max_steps=max_steps,
-                tick_rate=tick_rate,
-                sparring_bots=sparring_bots,
-            )
-
-        if mode == RoomMode.AI_DUEL:
-            label = str(raw.get("agent_label") or "RainbowAI")
-            model_path = raw.get("model_path") or None
-            return cls(
-                grid_size=grid_size,
-                num_snakes=2,
-                num_food=max(2, num_food),
-                max_steps=max_steps,
-                tick_rate=tick_rate,
-                agent_label=label,
-                model_path=model_path,
-            )
-
-        # ONLINE 默认保持请求参数
         return cls(
             grid_size=grid_size,
             num_snakes=requested_snakes,
@@ -88,12 +55,6 @@ class RoomConfig:
             "max_steps": self.max_steps,
             "tick_rate": self.tick_rate,
         }
-        if self.sparring_bots:
-            payload["sparring_bots"] = self.sparring_bots
-        if self.agent_label:
-            payload["agent_label"] = self.agent_label
-        if self.model_path:
-            payload["model_path"] = self.model_path
         return payload
 
 
@@ -121,10 +82,9 @@ class ClientSession:
 class BaseRoom:
     """公共房间基类，负责成员管理与广播。"""
 
-    def __init__(self, server: "CloudGameServer", mode: RoomMode, owner_id: str, config: RoomConfig) -> None:
+    def __init__(self, server: "CloudGameServer", owner_id: str, config: RoomConfig) -> None:
         self.server = server
         self.room_id = secrets.token_hex(4)
-        self.mode = mode
         self.owner_id = owner_id
         self.config = config
         self.members: List[str] = [owner_id]
@@ -137,7 +97,6 @@ class BaseRoom:
             owner_name = owner_session.name
         return {
             "room_id": self.room_id,
-            "mode": self.mode.value,
             "owner": self.owner_id,
             "owner_name": owner_name,
             "members": len(self.members),
@@ -149,7 +108,16 @@ class BaseRoom:
         if client_id not in self.members:
             self.members.append(client_id)
 
+    async def before_remove_member(self, client_id: str) -> Optional[dict]:
+        return {}
+
+    async def after_remove_member(
+        self, client_id: str, *, owner_changed: bool, room_closed: bool, context: Optional[dict] = None
+    ) -> None:
+        return
+
     async def remove_member(self, client_id: str) -> None:
+        context = await self.before_remove_member(client_id)
         owner_changed = False
         if client_id in self.members:
             self.members.remove(client_id)
@@ -159,11 +127,15 @@ class BaseRoom:
                     owner_changed = True
                 else:
                     self.owner_id = None
+        room_closed = False
         if not self.members:
             await self.close()
-            return
-        if owner_changed:
+            room_closed = True
+        elif owner_changed:
             await self.server.broadcast_rooms()
+        if room_closed:
+            return
+        await self.after_remove_member(client_id, owner_changed=owner_changed, room_closed=room_closed, context=context)
 
     async def close(self) -> None:
         self.active = False
@@ -185,10 +157,10 @@ class BaseRoom:
 
 
 class BattleRoom(BaseRoom):
-    """统一处理 AI 对练与联机对战，两者只在槽位与成员约束上不同。"""
+    """统一处理云对战房间。"""
 
-    def __init__(self, server: "CloudGameServer", owner_id: str, mode: RoomMode, config: RoomConfig) -> None:
-        super().__init__(server, mode, owner_id, config)
+    def __init__(self, server: "CloudGameServer", owner_id: str, config: RoomConfig) -> None:
+        super().__init__(server, owner_id, config)
         self.grid_size = config.grid_size
         self.num_snakes = config.num_snakes
         self.tick_rate = config.tick_rate
@@ -203,22 +175,16 @@ class BattleRoom(BaseRoom):
         self.countdown_until: Optional[float] = None
         self.pending_reset = False
         self.active_slots: List[int] = []
-        owner_role = "human"
-        self.server_bots: Set[int] = set()
-        if self.mode is RoomMode.TRAINING:
-            owner_role = "spectator"
-            self.server_bots = set(range(1, self.num_snakes))
-            if self.slots:
-                self.slots[0] = None
+        self.score_board: List[float] = [0.0 for _ in range(self.num_snakes)]
         self.member_states: Dict[str, dict] = {
-            owner_id: {"role": owner_role, "ready": False},
+            owner_id: {"role": "human", "ready": False},
         }
 
     def _assign_slot(self, client_id: str) -> Optional[int]:
         if client_id in self.slots:
             return self.slots.index(client_id)
         for idx, owner in enumerate(self.slots):
-            if owner is None and not self._slot_is_server_bot(idx):
+            if owner is None:
                 self.slots[idx] = client_id
                 return idx
         return None
@@ -235,7 +201,7 @@ class BattleRoom(BaseRoom):
         self.countdown_until = loop.time() + 3.0
         await self.broadcast_room_state()
         await self.broadcast({"type": "log", "message": "倒计时开始，3 秒后开局"})
-        await self.broadcast({"type": "start", "room_id": self.room_id, "mode": self.mode.value, "countdown": 3.0})
+        await self.broadcast({"type": "start", "room_id": self.room_id, "countdown": 3.0})
         if self.loop_task:
             return
 
@@ -254,13 +220,15 @@ class BattleRoom(BaseRoom):
                     self.countdown_until = None
 
                 actions = self._gather_actions()
-                self.observations, rewards, dones, info = self.env.step(actions)
-                await self._broadcast_state(rewards=rewards, info=info)
+                self.observations, _, dones, info = self.env.step(actions)
+                self._apply_events(info.get("events"))
+                await self._broadcast_state(info=info)
                 if info["game_over"]:
                     self.pending_reset = True
                     self.in_progress = False
                     self.countdown_until = None
                     await self.broadcast({"type": "log", "message": "对局结束，等待房主再次开始"})
+                    await self._announce_mvp()
                     await self.broadcast_room_state()
                     await asyncio.sleep(0.5)
                     continue
@@ -273,12 +241,6 @@ class BattleRoom(BaseRoom):
         actions: List[int] = []
         for slot in range(self.num_snakes):
             owner_id = self.slots[slot]
-            if self._slot_is_server_bot(slot):
-                if slot < len(self.env.snakes) and self.env.snakes[slot]["alive"]:
-                    actions.append(self._heuristic_action(slot))
-                else:
-                    actions.append(0)
-                continue
             if owner_id is None:
                 actions.append(0)
                 continue
@@ -295,6 +257,7 @@ class BattleRoom(BaseRoom):
         self.observations = self.env.reset()
         self.pending_reset = False
         self.active_slots = []
+        self.score_board = [0.0 for _ in range(self.num_snakes)]
         ready_snapshot = {
             client_id: state.get("ready", False)
             for client_id, state in self.member_states.items()
@@ -303,9 +266,7 @@ class BattleRoom(BaseRoom):
         for idx, snake in enumerate(self.env.snakes):
             owner_id = self.slots[idx]
             state = self.member_states.get(owner_id) if owner_id else None
-            if self._slot_is_server_bot(idx):
-                ready_or_owner = True
-            elif owner_id and state and self._role_requires_slot(state["role"]):
+            if owner_id and state and self._role_requires_slot(state["role"]):
                 ready_or_owner = ready_snapshot.get(owner_id, False) or owner_id == self.owner_id
             else:
                 ready_or_owner = False
@@ -325,13 +286,18 @@ class BattleRoom(BaseRoom):
             if self._role_requires_slot(state["role"]):
                 state["ready"] = False
 
-    async def _broadcast_state(self, *, rewards: Optional[List[float]] = None, info: Optional[dict] = None, countdown_remaining: Optional[float] = None) -> None:
-        rewards = rewards or [0.0 for _ in range(self.num_snakes)]
-        info = info or {"steps": self.env.steps, "scores": [s["score"] for s in self.env.snakes], "game_over": False, "alive_count": sum(1 for s in self.env.snakes if s["alive"])}
+    async def _broadcast_state(self, *, info: Optional[dict] = None, countdown_remaining: Optional[float] = None) -> None:
+        info = info or {
+            "steps": self.env.steps,
+            "scores": [s["score"] for s in self.env.snakes],
+            "game_over": False,
+            "alive_count": sum(1 for s in self.env.snakes if s["alive"]),
+        }
         snakes_payload = []
         for idx, snake in enumerate(self.env.snakes):
             owner_id = self.slots[idx] if idx < len(self.slots) else None
             owner_session = self.server.clients.get(owner_id) if owner_id else None
+            owner_state = self.member_states.get(owner_id) if owner_id else None
             snakes_payload.append(
                 {
                     "slot": idx,
@@ -340,21 +306,19 @@ class BattleRoom(BaseRoom):
                     "color": self.get_slot_color(idx, client_id=owner_id) if idx < len(self.slots) else self.env.colors[idx % len(self.env.colors)],
                     "score": snake["score"],
                     "direction": snake["direction"].name,
-                    "last_reward": (rewards[idx] if idx < len(rewards) else 0.0),
                     "owner_id": owner_id,
                     "owner_name": owner_session.name if owner_session else None,
+                    "role": owner_state.get("role") if owner_state else None,
                 }
             )
 
         payload = {
             "type": "state",
             "room_id": self.room_id,
-            "mode": self.mode.value,
             "snakes": snakes_payload,
             "food": list(self.env.food),
             "steps": info.get("steps", self.env.steps),
-            "scores": info.get("scores", [s["score"] for s in self.env.snakes]),
-            "rewards": rewards,
+            "scores": list(self.score_board),
             "grid": self.grid_size,
             "alive_count": info.get("alive_count", sum(1 for s in self.env.snakes if s["alive"])),
             "game_over": info.get("game_over", False),
@@ -363,20 +327,49 @@ class BattleRoom(BaseRoom):
             payload["countdown"] = max(0.0, countdown_remaining)
         await self.broadcast(payload)
 
-    def _heuristic_action(self, slot: int) -> int:
+    def _apply_events(self, events: Optional[Sequence[Dict]]) -> None:
+        if not events:
+            return
+        for idx, event in enumerate(events):
+            if idx >= len(self.score_board):
+                break
+            if event.get("ate_food"):
+                self.score_board[idx] += EVENT_REWARD_FOOD
+            kills = int(event.get("kills", 0) or 0)
+            if kills:
+                self.score_board[idx] += EVENT_REWARD_KILL * kills
+            if event.get("died"):
+                self.score_board[idx] += EVENT_REWARD_DEATH
+
+    def _forfeit_slot(self, slot: int) -> bool:
+        if slot < 0 or slot >= len(self.env.snakes):
+            return False
         snake = self.env.snakes[slot]
-        if not snake["alive"] or not self.env.food:
-            return 0
-        head_x, head_y = snake["body"][0]
-        target = min(self.env.food, key=lambda pos: abs(pos[0] - head_x) + abs(pos[1] - head_y))
-        dx = target[0] - head_x
-        dy = target[1] - head_y
-        desired_dir = snake["direction"]
-        if abs(dx) > abs(dy):
-            desired_dir = Direction.RIGHT if dx > 0 else Direction.LEFT
-        elif dy != 0:
-            desired_dir = Direction.DOWN if dy > 0 else Direction.UP
-        return direction_to_relative(snake["direction"], desired_dir)
+        if not snake.get("alive", False):
+            return False
+        snake["alive"] = False
+        snake["body"] = []
+        snake["steps_alive"] = snake.get("steps_alive", 0)
+        if slot in self.active_slots:
+            self.active_slots.remove(slot)
+        if slot < len(self.score_board):
+            self.score_board[slot] += EVENT_REWARD_DEATH
+        return True
+
+    async def _announce_mvp(self) -> None:
+        if not self.score_board:
+            return
+        best_idx = max(range(len(self.score_board)), key=lambda i: self.score_board[i])
+        best_score = self.score_board[best_idx]
+        owner_id = self.slots[best_idx]
+        owner_session = self.server.clients.get(owner_id) if owner_id else None
+        owner_name = owner_session.name if owner_session else f"槽位 {best_idx}"
+        await self.broadcast(
+            {
+                "type": "log",
+                "message": f"本局 MVP: {owner_name} 得分 {best_score:.1f}",
+            }
+        )
 
     def get_slot_color(self, slot: int, *, client_id: Optional[str] = None) -> str:
         if client_id is not None and client_id == self.owner_id:
@@ -387,12 +380,7 @@ class BattleRoom(BaseRoom):
 
     async def add_member(self, client_id: str) -> Optional[int]:
         await super().add_member(client_id)
-        default_role = "human"
-        if self.mode is RoomMode.TRAINING:
-            default_role = "ai"
-        elif self.mode is RoomMode.AI_DUEL and client_id != self.owner_id:
-            default_role = "ai"
-        self.member_states.setdefault(client_id, {"role": default_role, "ready": False})
+        self.member_states.setdefault(client_id, {"role": "human", "ready": False})
         slot = self._assign_slot(client_id)
         if slot is not None:
             return slot
@@ -400,14 +388,53 @@ class BattleRoom(BaseRoom):
         self.member_states[client_id]["role"] = "spectator"
         return None
 
-    async def remove_member(self, client_id: str) -> None:
+    async def before_remove_member(self, client_id: str) -> dict:
+        departed_slots: List[int] = []
         for slot in range(self.num_snakes):
             if self.slots[slot] == client_id:
                 self.slots[slot] = None
+                departed_slots.append(slot)
+
+        session = self.server.clients.get(client_id)
+        display_name = session.name if session else client_id
+
+        forfeited = False
+        if self.in_progress and departed_slots:
+            for slot in departed_slots:
+                forfeited |= self._forfeit_slot(slot)
+
         self.member_states.pop(client_id, None)
-        await super().remove_member(client_id)
-        if not self.active:
+        return {
+            "departed_slots": departed_slots,
+            "display_name": display_name,
+            "forfeited": forfeited,
+        }
+
+    async def after_remove_member(
+        self, client_id: str, *, owner_changed: bool, room_closed: bool, context: Optional[dict] = None
+    ) -> None:
+        if room_closed:
             return
+        context = context or {}
+        forfeited = bool(context.get("forfeited"))
+        display_name = context.get("display_name", client_id)
+        if forfeited:
+            alive_now = sum(1 for snake in self.env.snakes if snake["alive"])
+            await self.broadcast(
+                {
+                    "type": "log",
+                    "message": f"玩家 {display_name} 退出/断线，判定阵亡",
+                }
+            )
+            await self._broadcast_state(
+                info={
+                    "steps": self.env.steps,
+                    "scores": [snake["score"] for snake in self.env.snakes],
+                    "alive_count": alive_now,
+                    "game_over": False,
+                }
+            )
+
         await self.broadcast_room_state()
 
     def get_player_slot(self, client_id: str) -> Optional[int]:
@@ -419,9 +446,6 @@ class BattleRoom(BaseRoom):
     def _role_requires_slot(self, role: str) -> bool:
         return role in {"human", "ai"}
 
-    def _slot_is_server_bot(self, slot: int) -> bool:
-        return slot in self.server_bots
-
     async def set_member_role(self, client_id: str, role: str) -> bool:
         role = role.lower()
         if role not in {"human", "ai", "spectator"}:
@@ -429,6 +453,8 @@ class BattleRoom(BaseRoom):
         state = self.member_states.get(client_id)
         if not state:
             return False
+        forfeited = False
+        previous_slot = self.get_player_slot(client_id)
         if self._role_requires_slot(role):
             slot = self.get_player_slot(client_id)
             if slot is None:
@@ -437,12 +463,22 @@ class BattleRoom(BaseRoom):
                 return False
         else:
             # spectator: 释放槽位
-            for idx, owner in enumerate(self.slots):
-                if owner == client_id:
-                    self.slots[idx] = None
+            if previous_slot is not None:
+                self.slots[previous_slot] = None
+                if self.in_progress:
+                    forfeited = self._forfeit_slot(previous_slot)
         state["role"] = role
         state["ready"] = False
         await self.broadcast_room_state()
+        if forfeited:
+            await self._broadcast_state(
+                info={
+                    "steps": self.env.steps,
+                    "scores": [snake["score"] for snake in self.env.snakes],
+                    "alive_count": sum(1 for snake in self.env.snakes if snake["alive"]),
+                    "game_over": False,
+                }
+            )
         return True
 
     async def set_member_ready(self, client_id: str, ready: bool) -> bool:
@@ -457,10 +493,6 @@ class BattleRoom(BaseRoom):
 
     def can_start(self) -> bool:
         playable = [(cid, state) for cid, state in self.member_states.items() if self._role_requires_slot(state["role"])]
-        if self.mode is RoomMode.TRAINING:
-            if not playable:
-                return False
-            return any(state["ready"] for _, state in playable)
         if len(playable) < 2:
             return False
         others_ready = all(state["ready"] for cid, state in playable if cid != self.owner_id)
@@ -470,7 +502,6 @@ class BattleRoom(BaseRoom):
         payload = {
             "type": "room_state",
             "room_id": self.room_id,
-            "mode": self.mode.value,
             "in_progress": self.in_progress,
             "can_start": self.can_start(),
             "owner_id": self.owner_id,
@@ -491,20 +522,6 @@ class BattleRoom(BaseRoom):
                     "slot": slot,
                     "color": self.get_slot_color(slot, client_id=client_id) if slot is not None else None,
                     "is_owner": client_id == self.owner_id,
-                }
-            )
-        for slot in range(self.num_snakes):
-            if not self._slot_is_server_bot(slot):
-                continue
-            payload["members"].append(
-                {
-                    "client_id": f"bot-{slot}",
-                    "name": f"SparringBot #{slot}",
-                    "role": "bot",
-                    "ready": True,
-                    "slot": slot,
-                    "color": self.get_slot_color(slot),
-                    "is_owner": False,
                 }
             )
         await self.broadcast(payload)
@@ -579,19 +596,14 @@ class CloudGameServer:
         if session.room_id:
             await self.send(session, {"type": "error", "message": "请先离开当前房间后再创建新房间"})
             return
-        try:
-            mode = RoomMode(payload.get("mode", "online"))
-        except ValueError:
-            await self.send(session, {"type": "error", "message": "未知的房间模式"})
-            return
         raw_config = payload.get("config", {}) or {}
         try:
-            room_config = RoomConfig.from_request(mode, raw_config)
+            room_config = RoomConfig.from_request(raw_config)
         except ValueError as exc:
             await self.send(session, {"type": "error", "message": str(exc)})
             return
 
-        room = BattleRoom(self, session.client_id, mode, room_config)
+        room = BattleRoom(self, session.client_id, room_config)
         self.rooms[room.room_id] = room
         session.room_id = room.room_id
         slot = room.get_player_slot(session.client_id)
@@ -600,7 +612,6 @@ class CloudGameServer:
             {
                 "type": "room_joined",
                 "room_id": room.room_id,
-                "mode": room.mode.value,
                 "slot": slot,
             },
         )
@@ -623,7 +634,6 @@ class CloudGameServer:
             {
                 "type": "room_joined",
                 "room_id": room.room_id,
-                "mode": room.mode.value,
                 "slot": slot if slot is not None else assigned_slot,
             },
         )

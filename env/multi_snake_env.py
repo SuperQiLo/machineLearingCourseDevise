@@ -26,7 +26,6 @@ class StepEvent:
     ate_food: bool = False
     kills: int = 0
     killed_by: Optional[int] = None
-    reward: float = 0.0
 
 
 class Action(Enum):
@@ -142,8 +141,10 @@ class MultiSnakeEnv:
         events = self._init_step_events()
         next_heads, will_grow = self._plan_next_heads(actions)
         snakes_to_die, kill_credits = self._detect_collisions(next_heads, will_grow, events)
+        for owner, victims in kill_credits.items():
+            events[owner].kills += len(victims)
         dones = self._apply_movements(next_heads, will_grow, snakes_to_die, events)
-        rewards = self._compute_rewards(events, kill_credits)
+        rewards = [0.0 for _ in range(self.num_snakes)]
 
         alive_count = sum(1 for snake in self.snakes if snake["alive"])
         game_over = alive_count <= 1 or self.steps >= self.max_steps
@@ -282,29 +283,6 @@ class MultiSnakeEnv:
             snake["steps_alive"] += 1
 
         return dones
-
-    def _compute_rewards(self, events: List[StepEvent], kill_credits: Dict[int, Set[int]]) -> List[float]:
-        """根据事件统计奖励，并写回事件字典。"""
-
-        rewards = [0.0 for _ in range(self.num_snakes)]
-        for owner, victims in kill_credits.items():
-            events[owner].kills += len(victims)
-
-        for idx, event in enumerate(events):
-            reward = 0.0
-            if event.alive and not event.died:
-                reward += 0.05
-                reward -= 0.01
-            if event.ate_food:
-                reward += 10.0
-            if event.kills:
-                reward += 5.0 * event.kills
-            if event.died:
-                reward -= 10.0
-            event.reward = reward
-            rewards[idx] = reward
-
-        return rewards
 
     def _build_info(self, events: List[StepEvent], alive_count: int, game_over: bool) -> Dict:
         """组装 info 字典，保持与旧版服务器兼容。"""

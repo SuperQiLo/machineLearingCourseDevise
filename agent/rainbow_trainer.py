@@ -8,7 +8,7 @@ from typing import Callable, Dict, List, Optional
 
 import numpy as np
 
-from agent.config import RainbowConfig
+from agent.rainbow_config import RainbowConfig
 from agent.rainbow_agent import RainbowAgent
 from agent.replay_buffer import PrioritizedReplayBuffer
 from agent.utils import resolve_device
@@ -58,9 +58,8 @@ class RainbowTrainer:
                     continue
                 actions.append(self.agent.act(observations[idx], epsilon))
 
-            next_obs, rewards, dones, info = self.env.step(actions)
-            if info.get("events"):
-                rewards = [event.get("reward", 0.0) for event in info["events"]]
+            next_obs, _, dones, info = self.env.step(actions)
+            rewards = self._derive_rewards(info.get("events"))
 
             for idx, alive in enumerate(alive_flags):
                 if not alive:
@@ -101,7 +100,8 @@ class RainbowTrainer:
             if frame % self.cfg.save_interval == 0:
                 self.agent.save(self.cfg.checkpoint_path())
 
-            if all(dones):
+            episode_done = all(dones) or info.get("game_over") or info.get("alive_count", 0) <= 0
+            if episode_done:
                 avg_score = float(np.mean(episode_scores))
                 if avg_score > self.best_score:
                     self.best_score = avg_score
@@ -124,3 +124,23 @@ class RainbowTrainer:
         final_path = self.cfg.checkpoint_path().with_name("rainbow_snake_final.pth")
         self.agent.save(final_path)
         return final_path
+
+    def _derive_rewards(self, events: Optional[List[Dict]]) -> List[float]:
+        rewards = [0.0 for _ in range(self.cfg.num_snakes)]
+        if not events:
+            return rewards
+        for idx, event in enumerate(events):
+            if idx >= len(rewards):
+                break
+            value = 0.0
+            if event.get("alive"):
+                value += self.cfg.reward_survive
+            if event.get("ate_food"):
+                value += self.cfg.reward_food
+            kills = int(event.get("kills", 0) or 0)
+            if kills:
+                value += self.cfg.reward_kill * kills
+            if event.get("died"):
+                value += self.cfg.reward_death
+            rewards[idx] = value
+        return rewards

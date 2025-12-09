@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHeaderView,
     QHBoxLayout,
@@ -27,6 +28,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -36,18 +38,11 @@ from PyQt6.QtWidgets import (
 )
 
 from agent.base_agent import BaseAgent
-from agent.config import RainbowConfig
+from agent.rainbow_config import RainbowConfig
 from agent.rainbow_agent import RainbowAgent
 from env.multi_snake_env import Direction, build_observation_from_snapshot
 from network.utils import normalize_port
 from network.renderer import BattleRenderer
-
-
-MODE_LABELS = {
-    "online": "联机房",
-    "training": "训练房",
-    "ai_duel": "人机演练",
-}
 
 
 ROLE_LABELS = {
@@ -60,7 +55,6 @@ ROLE_LABELS = {
 @dataclass
 class RoomInfo:
     room_id: str
-    mode: str
     owner: str
     owner_name: str
     members: int
@@ -95,7 +89,6 @@ class CloudClient:
         self.state_cache: Dict[str, Dict] = {}
         self.room_states: Dict[str, Dict] = {}
         self.current_room_id: Optional[str] = None
-        self.current_mode: Optional[str] = None
         self.current_slot: Optional[int] = None
         self.room_members: List[Dict] = []
         self.room_can_start: bool = False
@@ -193,7 +186,6 @@ class CloudClient:
             rooms = [
                 RoomInfo(
                     room_id=entry.get("room_id"),
-                    mode=entry.get("mode", "unknown"),
                     owner=entry.get("owner", "-"),
                     owner_name=entry.get("owner_name", "-"),
                     members=int(entry.get("members", 0)),
@@ -206,15 +198,13 @@ class CloudClient:
                 self.rooms = rooms
         elif mtype == "room_joined":
             self.current_room_id = msg.get("room_id")
-            self.current_mode = msg.get("mode")
             self.current_slot = msg.get("slot")
-            self._log(f"已加入房间 {self.current_room_id}，模式 {self.current_mode}")
+            self._log(f"已加入房间 {self.current_room_id}")
             self._apply_cached_room_state()
             self.send({"type": "list_rooms"})
         elif mtype == "room_closed":
             if msg.get("room_id") == self.current_room_id:
                 self.current_room_id = None
-                self.current_mode = None
                 self.current_slot = None
             self._log("房间已关闭。")
         elif mtype == "start":
@@ -226,7 +216,6 @@ class CloudClient:
                     cached = dict(previous) if isinstance(previous, dict) else {}
                     cached.update({
                         "room_id": room_id,
-                        "mode": msg.get("mode") or cached.get("mode") or self.current_mode,
                         "countdown": countdown_val,
                         "game_over": False,
                     })
@@ -308,7 +297,6 @@ class CloudClient:
             return
         self.send({"type": "leave_room"})
         self.current_room_id = None
-        self.current_mode = None
         self.current_slot = None
         self.room_members = []
         self.room_can_start = False
@@ -318,11 +306,10 @@ class CloudClient:
     def refresh_rooms(self) -> None:
         self.send({"type": "list_rooms"})
 
-    def create_room(self, mode: str, config: Dict) -> None:
+    def create_room(self, config: Dict) -> None:
         self.send(
             {
                 "type": "create_room",
-                "mode": mode,
                 "config": config,
             }
         )
@@ -361,8 +348,14 @@ def discover_agent_classes() -> List[Tuple[str, Type[BaseAgent]]]:
                     classes.append((obj.__name__, obj))
             except Exception:
                 continue
-    classes.sort(key=lambda x: x[0].lower())
-    return classes
+    unique: Dict[str, Tuple[str, Type[BaseAgent]]] = {}
+    for name, cls in classes:
+        key = name.lower()
+        if key in unique:
+            continue
+        unique[key] = (name, cls)
+    sorted_classes = sorted(unique.values(), key=lambda x: x[0].lower())
+    return sorted_classes
 
 
 def instantiate_agent(agent_cls: Type[BaseAgent], grid_size: int) -> Optional[BaseAgent]:
@@ -398,6 +391,7 @@ class ClientWindow(QMainWindow):
         self.agent_classes = discover_agent_classes()
         self.agent_instance: Optional[BaseAgent] = None
         self.agent_checkpoint: Optional[Path] = None
+        self.current_role: str = "human"
         self.renderer_thread: Optional[threading.Thread] = None
         self.renderer_running = False
         self.renderer_blocked = False
@@ -440,24 +434,31 @@ class ClientWindow(QMainWindow):
 
         # 房间列表
         room_group = QGroupBox("房间")
-        room_layout = QVBoxLayout(room_group)
-        self.room_table = QTableWidget(0, 5)
-        self.room_table.setHorizontalHeaderLabels(["ID", "模式", "房主", "成员", "网格"])
+        room_layout = QHBoxLayout(room_group)
+
+        table_column = QVBoxLayout()
+        self.room_table = QTableWidget(0, 4)
+        self.room_table.setHorizontalHeaderLabels(["ID", "房主", "成员", "网格"])
         self.room_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        room_layout.addWidget(self.room_table)
+        table_column.addWidget(self.room_table)
         room_btns = QHBoxLayout()
+        room_btns.addStretch(1)
         self.refresh_btn = QPushButton("刷新")
         self.join_btn = QPushButton("加入")
         room_btns.addWidget(self.refresh_btn)
         room_btns.addWidget(self.join_btn)
         self.refresh_btn.clicked.connect(self._refresh_rooms)
         self.join_btn.clicked.connect(self._join_selected)
-        room_layout.addLayout(room_btns)
+        table_column.addLayout(room_btns)
 
-        create_row = QHBoxLayout()
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["online", "training", "ai_duel"])
-        self.mode_combo.currentTextChanged.connect(self._mode_changed)
+        create_panel = QGroupBox("房间参数")
+        create_panel.setMaximumWidth(360)
+        create_panel_layout = QVBoxLayout(create_panel)
+        create_form = QFormLayout()
+        create_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        create_form.setFormAlignment(Qt.AlignmentFlag.AlignLeft)
+        create_form.setHorizontalSpacing(12)
+        create_form.setVerticalSpacing(10)
         self.grid_spin = QSpinBox()
         self.grid_spin.setRange(4, 80)
         self.grid_spin.setValue(30)
@@ -476,46 +477,29 @@ class ClientWindow(QMainWindow):
         self.tick_spin.setSuffix(" ms")
         self.create_btn = QPushButton("创建房间")
         self.create_btn.clicked.connect(self._create_room)
-        create_row.addWidget(QLabel("Mode"))
-        create_row.addWidget(self.mode_combo)
-        create_row.addWidget(QLabel("Grid"))
-        create_row.addWidget(self.grid_spin)
-        create_row.addWidget(QLabel("Snakes"))
-        create_row.addWidget(self.snakes_spin)
-        create_row.addWidget(QLabel("Food"))
-        create_row.addWidget(self.food_spin)
-        create_row.addWidget(QLabel("Steps"))
-        create_row.addWidget(self.steps_spin)
-        create_row.addWidget(QLabel("Tick"))
-        create_row.addWidget(self.tick_spin)
-        create_row.addWidget(self.create_btn)
-        room_layout.addLayout(create_row)
+        controls = [
+            ("网格", self.grid_spin),
+            ("蛇数", self.snakes_spin),
+            ("食物", self.food_spin),
+            ("步数", self.steps_spin),
+            ("Tick", self.tick_spin),
+        ]
+        for label_text, widget in controls:
+            widget.setFixedHeight(34)
+            create_form.addRow(label_text, widget)
+        create_panel_layout.addLayout(create_form)
+        self.create_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.create_btn.setFixedWidth(100)
+        self.create_btn.setMinimumHeight(36)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.create_btn)
+        btn_row.addStretch(1)
+        create_panel_layout.addSpacing(16)
+        create_panel_layout.addLayout(btn_row)
 
-        # 训练房扩展参数
-        self.training_extra = QWidget()
-        training_layout = QHBoxLayout(self.training_extra)
-        training_layout.setContentsMargins(0, 0, 0, 0)
-        training_layout.addWidget(QLabel("陪练蛇"))
-        self.sparring_spin = QSpinBox()
-        self.sparring_spin.setRange(1, 8)
-        self.sparring_spin.setValue(3)
-        training_layout.addWidget(self.sparring_spin)
-        room_layout.addWidget(self.training_extra)
-
-        # 人机演练扩展参数
-        self.duel_extra = QWidget()
-        duel_layout = QHBoxLayout(self.duel_extra)
-        duel_layout.setContentsMargins(0, 0, 0, 0)
-        duel_layout.addWidget(QLabel("AI 标签"))
-        self.duel_label_edit = QLineEdit("RainbowAI")
-        duel_layout.addWidget(self.duel_label_edit)
-        duel_layout.addWidget(QLabel("模型"))
-        self.duel_model_edit = QLineEdit()
-        duel_layout.addWidget(self.duel_model_edit)
-        duel_model_btn = QPushButton("选择")
-        duel_model_btn.clicked.connect(self._pick_duel_model)
-        duel_layout.addWidget(duel_model_btn)
-        room_layout.addWidget(self.duel_extra)
+        room_layout.addLayout(table_column, stretch=3)
+        room_layout.addWidget(create_panel, stretch=1, alignment=Qt.AlignmentFlag.AlignTop)
         layout.addWidget(room_group)
 
         # 玩家列表与操作
@@ -530,15 +514,12 @@ class ClientWindow(QMainWindow):
         self.leave_btn = QPushButton("离开")
         self.ready_btn = QPushButton("准备/取消")
         self.start_btn = QPushButton("开始游戏")
-        self.render_btn = QPushButton("打开渲染")
         self.leave_btn.clicked.connect(self._leave_room)
         self.ready_btn.clicked.connect(self._toggle_ready)
         self.start_btn.clicked.connect(self._start_game)
-        self.render_btn.clicked.connect(self._open_renderer)
         player_btns.addWidget(self.leave_btn)
         player_btns.addWidget(self.ready_btn)
         player_btns.addWidget(self.start_btn)
-        player_btns.addWidget(self.render_btn)
         player_layout.addLayout(player_btns)
         layout.addWidget(player_group)
 
@@ -574,7 +555,6 @@ class ClientWindow(QMainWindow):
         self._update_room_buttons(False, False, False)
 
         self.setCentralWidget(root)
-        self._mode_changed(self.mode_combo.currentText())
 
     def _update_connection_buttons(self, connected: bool, in_room: bool) -> None:
         self.connect_btn.setEnabled(not connected)
@@ -584,7 +564,7 @@ class ClientWindow(QMainWindow):
         self.create_btn.setEnabled(connected and not in_room)
 
     def _update_room_buttons(self, enabled: bool, can_start: bool, is_owner: bool) -> None:
-        for btn in (self.leave_btn, self.ready_btn, self.render_btn):
+        for btn in (self.leave_btn, self.ready_btn):
             btn.setEnabled(enabled)
         self.start_btn.setEnabled(enabled and can_start and is_owner)
 
@@ -677,6 +657,9 @@ class ClientWindow(QMainWindow):
         if member.get("role") == "spectator":
             QMessageBox.information(self, "提示", "观战模式无需准备。")
             return
+        if member.get("role") == "ai" and self.agent_instance is None:
+            QMessageBox.information(self, "提示", "AI 模式需先加载模型才能准备。")
+            return
         new_state = not member.get("ready", False)
         self.client.set_ready(new_state)
 
@@ -716,51 +699,36 @@ class ClientWindow(QMainWindow):
             QMessageBox.warning(self, "未连接", "连接已断开，请重新连接后再创建房间。")
             return
         tick_seconds = max(0.02, self.tick_spin.value() / 1000.0)
-        mode = self.mode_combo.currentText()
         config: Dict = {
             "grid_size": self.grid_spin.value(),
             "num_food": self.food_spin.value(),
             "max_steps": self.steps_spin.value(),
             "tick_rate": tick_seconds,
         }
-        if mode == "online":
-            config["num_snakes"] = self.snakes_spin.value()
-        elif mode == "training":
-            config["sparring_bots"] = self.sparring_spin.value()
-        elif mode == "ai_duel":
-            label = self.duel_label_edit.text().strip() or "RainbowAI"
-            config["agent_label"] = label
-            model_path = self.duel_model_edit.text().strip()
-            if model_path:
-                config["model_path"] = model_path
+        config["num_snakes"] = self.snakes_spin.value()
         try:
-            self.client.create_room(mode=mode, config=config)
+            self.client.create_room(config=config)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "创建失败", f"创建房间时出错: {exc}")
             self._append_log(f"创建房间失败: {exc}")
 
     def _role_changed(self, role: str) -> None:
+        if role == "ai" and self.agent_instance is None:
+            QMessageBox.information(self, "提示", "请先加载 AI 模型后再切换到 AI 角色。")
+            if hasattr(self, "role_combo"):
+                self.role_combo.blockSignals(True)
+                self.role_combo.setCurrentText(self.current_role)
+                self.role_combo.blockSignals(False)
+            return
+        self.current_role = role or self.current_role
         if self.client and role:
             self.client.set_role(role)
-
-    def _mode_changed(self, mode: str) -> None:
-        is_online = mode == "online"
-        is_training = mode == "training"
-        is_duel = mode == "ai_duel"
-        self.snakes_spin.setEnabled(is_online)
-        self.training_extra.setVisible(is_training)
-        self.duel_extra.setVisible(is_duel)
-
-    def _pick_duel_model(self) -> None:
-        file_path, _ = QFileDialog.getOpenFileName(self, "选择 AI 模型文件", str(Path("agent/checkpoints")), "PyTorch (*.pth *.pt);;All Files (*.*)")
-        if file_path:
-            self.duel_model_edit.setText(file_path)
 
     def _load_model(self) -> None:
         if not self.agent_classes:
             QMessageBox.information(self, "提示", "未发现可用代理")
             return
-        file_path, _ = QFileDialog.getOpenFileName(self, "选择模型文件", str(Path("agent/checkpoints")), "*.pth;*.pt;*.*")
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择模型文件", str(Path("../agent/checkpoints")), "*.pth;*.pt;*.*")
         if not file_path:
             return
         self.agent_checkpoint = Path(file_path)
@@ -820,10 +788,9 @@ class ClientWindow(QMainWindow):
             self.room_table.setRowCount(len(rooms))
             for row, room in enumerate(rooms):
                 self._set_center_item(self.room_table, row, 0, room.room_id)
-                self._set_center_item(self.room_table, row, 1, MODE_LABELS.get(room.mode, room.mode))
-                self._set_center_item(self.room_table, row, 2, room.owner_name)
-                self._set_center_item(self.room_table, row, 3, str(room.members))
-                self._set_center_item(self.room_table, row, 4, str(room.config.get("grid_size", 30)))
+                self._set_center_item(self.room_table, row, 1, room.owner_name)
+                self._set_center_item(self.room_table, row, 2, str(room.members))
+                self._set_center_item(self.room_table, row, 3, str(room.config.get("grid_size", 30)))
 
             if client.current_room_id:
                 in_progress = bool(client.room_in_progress)
@@ -892,6 +859,7 @@ class ClientWindow(QMainWindow):
                 slot = int(member.get("slot")) if member.get("slot") is not None else None
             except (TypeError, ValueError):
                 slot = None
+        role_at_launch = role
 
         def _run() -> None:
             self.renderer_running = True
@@ -904,19 +872,26 @@ class ClientWindow(QMainWindow):
                 self.renderer_running = False
                 self.renderer_blocked = True
                 self.renderer_thread = None
+                client = self.client
+                if not client or not client.current_room_id:
+                    return
+                if role_at_launch not in {"human", "ai"}:
+                    return
+                try:
+                    in_progress = bool(client.room_in_progress)
+                except Exception:
+                    in_progress = False
+                target_role = "spectator" if in_progress else role_at_launch
+                if target_role == self.current_role:
+                    return
+                try:
+                    client.set_role(target_role)
+                    self.current_role = target_role
+                except Exception:
+                    pass
 
         self.renderer_thread = threading.Thread(target=_run, daemon=True)
         self.renderer_thread.start()
-
-    def _open_renderer(self) -> None:
-        if not self.client or not self.client.current_room_id:
-            QMessageBox.information(self, "提示", "请先加入房间。")
-            return
-        if self.renderer_running:
-            QMessageBox.information(self, "提示", "渲染窗口已打开。")
-            return
-        self.renderer_blocked = False
-        self._maybe_launch_renderer()
 
     # ------------------------- 工具 -------------------------
     def _set_center_item(self, table: QTableWidget, row: int, col: int, text: str) -> None:

@@ -107,10 +107,14 @@ class PrioritizedReplayBuffer:
 
         return indices, batch, torch.as_tensor(weights, dtype=torch.float32)
 
-    def update_priorities(self, indices: Sequence[int], priorities: torch.Tensor, eps: float = 1e-3) -> None:
+    def update_priorities(self, indices: Sequence[int], priorities: Sequence[float] | torch.Tensor, eps: float = 1e-3) -> None:
         """训练完毕后回写 TD-Error，用于提升下一次采样质量。"""
 
-        values = priorities.detach().cpu().numpy() + eps
+        if isinstance(priorities, torch.Tensor):
+            values = priorities.detach().cpu().numpy()
+        else:
+            values = np.asarray(priorities, dtype=np.float32)
+        values = values + eps
         for idx, priority in zip(indices, values):
             self.priorities[idx] = priority
 
