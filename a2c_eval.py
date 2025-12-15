@@ -1,4 +1,4 @@
-"""本地对战/演示用的 Rainbow 评估脚本。"""
+"""本地对战/演示用的 A2C 评估脚本。"""
 
 from __future__ import annotations
 
@@ -9,14 +9,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
-from agent.rainbow_config import RainbowConfig
-from agent.rainbow_agent import RainbowAgent
+from agent.a2c_agent import A2CAgent
+from agent.a2c_config import A2CConfig
 from env.multi_snake_env import MultiSnakeEnv
 from network.renderer import BattleRenderer, GameClientProtocol
-
-EVENT_REWARD_FOOD = 20.0
-EVENT_REWARD_KILL = 100.0
-EVENT_REWARD_DEATH = 0.0
 
 
 @dataclass
@@ -30,23 +26,36 @@ class EvalConfig:
     tick_rate: float
     human_slot: Optional[int]
     ai_slots: Sequence[int]
-    epsilon: float
     device: str
 
 
 def parse_args() -> EvalConfig:
-    """解析命令行参数并返回 `EvalConfig`。"""
-
-    parser = argparse.ArgumentParser(description="Rainbow 智能体本地评估")
-    parser.add_argument("--model", type=Path, default=Path("agent/checkpoints/rainbow_snake_final.pth"), help="模型路径，默认使用 final 检查点")
-    parser.add_argument("--grid-size", type=int, default=30, help="棋盘边长 (默认 30)")
+    parser = argparse.ArgumentParser(description="A2C 智能体本地评估")
+    parser.add_argument(
+        "--model",
+        type=Path,
+        default=Path("agent/checkpoints/a2c_snake_final.pth"),
+        help="模型路径，默认使用 final 检查点",
+    )
+    parser.add_argument("--grid-size", type=int, default=30, help="棋盘边长")
     parser.add_argument("--num-snakes", type=int, default=2, help="场上蛇数量，至少 2 条")
-    parser.add_argument("--num-food", type=int, default=8, help="食物数量，默认 4")
-    parser.add_argument("--tick", type=float, default=0.12, help="环境步进间隔（秒），默认 0.12s")
-    parser.add_argument("--human-slot", type=int, default=0, help="手动控制的槽位编号，设为负数或配合 --spectator 切换为纯观战")
-    parser.add_argument("--ai-slot", dest="ai_slots", type=int, action="append", default=None, help="指定 AI 占用的槽位，可多次填写；缺省使用槽位 1")
-    parser.add_argument("--epsilon", type=float, default=0.0, help="评估时的 epsilon 值")
-    parser.add_argument("--device", default="auto", help="推理设备，auto/CPU/CUDA:n")
+    parser.add_argument("--num-food", type=int, default=8, help="食物数量")
+    parser.add_argument("--tick", type=float, default=0.12, help="环境步进间隔（秒）")
+    parser.add_argument(
+        "--human-slot",
+        type=int,
+        default=0,
+        help="手动控制的槽位编号；配合 --spectator 或填负数切换为纯观战",
+    )
+    parser.add_argument(
+        "--ai-slot",
+        dest="ai_slots",
+        type=int,
+        action="append",
+        default=None,
+        help="指定 AI 占用的槽位，可多次填写；缺省使用槽位 1",
+    )
+    parser.add_argument("--device", default="auto", help="推理设备，auto/cpu/cuda:n")
     parser.add_argument("--spectator", action="store_true", default=False, help="以观战身份启动渲染，不占用蛇槽位")
     parser.add_argument("--no-ai", action="store_true", default=False, help="禁用 AI 控制，仅保留手动或观战")
 
@@ -72,11 +81,10 @@ def parse_args() -> EvalConfig:
         model_path=args.model,
         grid_size=args.grid_size,
         num_snakes=args.num_snakes,
-        num_food=max(1, args.num_food),
-        tick_rate=max(0.02, args.tick),
+        num_food=max(1, int(args.num_food)),
+        tick_rate=max(0.02, float(args.tick)),
         human_slot=human_slot,
         ai_slots=ai_slots,
-        epsilon=max(0.0, args.epsilon),
         device=args.device,
     )
 
@@ -84,12 +92,7 @@ def parse_args() -> EvalConfig:
 class LocalGameAdapter(GameClientProtocol):
     """将本地环境包装成 Renderer 可消费的客户端协议。"""
 
-    def __init__(
-        self,
-        env: MultiSnakeEnv,
-        config: EvalConfig,
-        agent: Optional[RainbowAgent],
-    ) -> None:
+    def __init__(self, env: MultiSnakeEnv, config: EvalConfig, agent: Optional[A2CAgent]) -> None:
         self.env = env
         self.cfg = config
         self.agent = agent if config.ai_slots else None
@@ -99,6 +102,17 @@ class LocalGameAdapter(GameClientProtocol):
         self.pending_human_action = 0
         self.last_obs: List = self.env.reset()
         self.scores: List[float] = [0.0 for _ in range(self.env.num_snakes)]
+        if agent is not None:
+            self.reward_food = float(agent.cfg.reward_food)
+            self.reward_kill = float(agent.cfg.reward_kill)
+            self.reward_death = float(agent.cfg.reward_death)
+            self.reward_survive = float(agent.cfg.reward_survive)
+        else:
+            defaults = A2CConfig(grid_size=config.grid_size, num_snakes=config.num_snakes)
+            self.reward_food = float(defaults.reward_food)
+            self.reward_kill = float(defaults.reward_kill)
+            self.reward_death = float(defaults.reward_death)
+            self.reward_survive = float(defaults.reward_survive)
         self.countdown_until = time.time() + 3.0
         self.state_cache = self._build_state({}, countdown=self._countdown_remaining())
         self.done = False
@@ -142,12 +156,14 @@ class LocalGameAdapter(GameClientProtocol):
         self.pending_human_action = 0
 
         if self.agent:
+            self.agent.net.eval()
             for slot in self.ai_slots:
                 if slot >= len(self.last_obs):
                     continue
                 if not self.env.snakes[slot]["alive"]:
                     continue
-                actions[slot] = self.agent.act(self.last_obs[slot], epsilon=self.cfg.epsilon)
+                # 评估：取 argmax
+                actions[slot] = self.agent.act(self.last_obs[slot], epsilon=0.0)
 
         observations, _, dones, info = self.env.step(actions)
         self.last_obs = observations
@@ -192,7 +208,7 @@ class LocalGameAdapter(GameClientProtocol):
         if self.human_slot is not None and slot == self.human_slot:
             return "Player"
         if slot in self.ai_slots:
-            return "RainbowAI"
+            return "A2CAI"
         return f"Bot-{slot}"
 
     def _countdown_remaining(self) -> Optional[float]:
@@ -204,23 +220,31 @@ class LocalGameAdapter(GameClientProtocol):
     def _apply_events(self, events: Optional[Sequence[Dict]]) -> None:
         if not events:
             return
+
+        # 与训练保持一致：用塑形奖励累计到 scores
+        # 注意：scores 仅用于渲染面板展示，不影响环境逻辑。
         for idx, event in enumerate(events):
             if idx >= len(self.scores):
                 break
+            value = 0.0
+            if event.get("alive"):
+                value += self.reward_survive
             if event.get("ate_food"):
-                self.scores[idx] += EVENT_REWARD_FOOD
+                value += self.reward_food
             kills = int(event.get("kills", 0) or 0)
             if kills:
-                self.scores[idx] += EVENT_REWARD_KILL * kills
+                value += self.reward_kill * kills
             if event.get("died"):
-                self.scores[idx] += EVENT_REWARD_DEATH
+                value += self.reward_death
+            self.scores[idx] += value
 
 
-def build_agent(eval_cfg: EvalConfig, rainbow_cfg: RainbowConfig) -> Optional[RainbowAgent]:
+def build_agent(eval_cfg: EvalConfig) -> Optional[A2CAgent]:
     if not eval_cfg.ai_slots:
         return None
 
-    agent = RainbowAgent(rainbow_cfg)
+    a2c_cfg = A2CConfig(grid_size=eval_cfg.grid_size, num_snakes=eval_cfg.num_snakes, device=eval_cfg.device)
+    agent = A2CAgent(a2c_cfg)
     if eval_cfg.model_path.exists():
         print(f"加载模型: {eval_cfg.model_path}")
         agent.load(eval_cfg.model_path)
@@ -234,11 +258,10 @@ def eval_game() -> None:
     print("=== 本地评估配置 ===")
     print(f"Grid: {cfg.grid_size}x{cfg.grid_size} | Snakes: {cfg.num_snakes} | Food: {cfg.num_food}")
     print(f"Human slot: {cfg.human_slot if cfg.human_slot is not None else 'Spectator'} | AI slots: {list(cfg.ai_slots)}")
-    print(f"Tick: {cfg.tick_rate:.3f}s | Epsilon: {cfg.epsilon}")
+    print(f"Tick: {cfg.tick_rate:.3f}s")
 
-    rainbow_cfg = RainbowConfig(grid_size=cfg.grid_size, num_snakes=cfg.num_snakes, device=cfg.device)
     env = MultiSnakeEnv(width=cfg.grid_size, height=cfg.grid_size, num_snakes=cfg.num_snakes, num_food=cfg.num_food)
-    agent = build_agent(cfg, rainbow_cfg)
+    agent = build_agent(cfg)
     adapter = LocalGameAdapter(env, cfg, agent)
 
     loop_thread = threading.Thread(target=adapter.run_loop, daemon=True)

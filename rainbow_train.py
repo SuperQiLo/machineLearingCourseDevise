@@ -16,30 +16,36 @@ def train() -> None:
     config = RainbowConfig(
         grid_size=30,
         num_snakes=4,
-        total_frames=200_000,
-        warmup_frames=5_000,
-        batch_size=64,
-        lr=5e-4,
-        replay_capacity=200_000,
+        total_frames=5_000_000,
+        warmup_frames=50_000,
+        batch_size=256,
+        lr=1e-4,
+        replay_capacity=1_000_000,
         train_interval=1,
-        update_target_interval=1_000,
-        log_interval=1_000,
-        save_interval=25_000,
+        update_target_interval=5_000,
+        log_interval=5_000,
+        save_interval=50_000,
         
         # 探索策略
         epsilon_start=1.0,
         epsilon_final=0.05,
-        epsilon_decay=120_000,
+        epsilon_decay=2_000_000,
 
         # 模型保存名称 (saved to agent/checkpoints/)
         checkpoint_name="rainbow_snake_latest.pth",
+        trainer_checkpoint_name="rainbow_snake_latest_train.pth",
+        resume=True,
+
+        # A6000 训练建议显式指定
+        device="cuda:0",
+
+        # 奖励塑形（环境 reward=0，Trainer 依赖 events 计算）
+        reward_food=50.0,
+        reward_kill=150.0,
+        reward_death=-80.0,
+        reward_survive=-0.005,
         
-        # 奖励配置 (由 Trainer/Env 内部处理, 或后续扩展)
-        # 目前 Env 默认无奖励，RainbowTrainer 需要修改以传入自定义奖励函数
-        # 但为了保持简单，我们先使用 Trainer 的默认逻辑，
-        # 注意: 用户之前删除了 Env 的奖励代码，所以我们需要在 Trainer 里实现奖励计算，
-        # 或者在 Config 里增加 Reward 并在 Trainer Loop 里计算。
-        # 由于 Env 已经变成了纯逻辑 不返回奖励，RainbowTrainer 需要适配。
+      
     )
 
     print("=== 开始 Rainbow Snake 训练 ===")
@@ -50,6 +56,7 @@ def train() -> None:
         print(f"[Frame {int(info['frame'])}] "
               f"Ep={int(info['episode'])}, "
               f"AvgScore={info['avg_score']:.2f}, "
+              f"Loss={info.get('loss', 0.0):.4f}, "
               f"Eps={info['epsilon']:.3f}, "
               f"Alive={int(info['alive'])}")
 

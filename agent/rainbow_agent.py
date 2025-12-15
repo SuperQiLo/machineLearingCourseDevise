@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from agent.base_agent import BaseAgent
 from agent.rainbow_config import RainbowConfig
 from agent.rainbow_model import RainbowBackbone
-from agent.replay_buffer import TransitionBatch
+from agent.rainbow_replay_buffer import TransitionBatch
 from agent.utils import resolve_device
 
 

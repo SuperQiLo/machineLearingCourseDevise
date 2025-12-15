@@ -7,10 +7,11 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 import numpy as np
+import torch
 
 from agent.rainbow_config import RainbowConfig
 from agent.rainbow_agent import RainbowAgent
-from agent.replay_buffer import PrioritizedReplayBuffer
+from agent.rainbow_replay_buffer import PrioritizedReplayBuffer
 from agent.utils import resolve_device
 from env.multi_snake_env import MultiSnakeEnv
 
@@ -48,6 +49,14 @@ class RainbowTrainer:
         frame = 0
         episode = 1
         epsilon = self.cfg.epsilon_start
+        last_loss = 0.0
+
+        if self.cfg.resume:
+            loaded = self._try_load_training_checkpoint()
+            if loaded is not None:
+                frame, episode, epsilon, self.best_score, last_loss = loaded
+                observations = self.env.reset()
+                episode_scores.fill(0.0)
 
         while frame < self.cfg.total_frames:
             alive_flags = [snake["alive"] for snake in self.env.snakes]
@@ -81,6 +90,7 @@ class RainbowTrainer:
             ):
                 indices, batch, weights = self.replay.sample(self.cfg.batch_size)
                 loss, td_errors = self.agent.train_step(batch, weights)
+                last_loss = float(loss)
                 self.replay.update_priorities(indices, td_errors)
 
             if frame % self.cfg.update_target_interval == 0:
@@ -92,6 +102,7 @@ class RainbowTrainer:
                         "frame": frame,
                         "episode": episode,
                         "avg_score": float(np.mean(episode_scores)),
+                        "loss": float(last_loss),
                         "epsilon": epsilon,
                         "alive": info.get("alive_count", self.cfg.num_snakes),
                     }
@@ -99,6 +110,7 @@ class RainbowTrainer:
 
             if frame % self.cfg.save_interval == 0:
                 self.agent.save(self.cfg.checkpoint_path())
+                self._save_training_checkpoint(frame, episode, epsilon, last_loss)
 
             episode_done = all(dones) or info.get("game_over") or info.get("alive_count", 0) <= 0
             if episode_done:
@@ -112,6 +124,7 @@ class RainbowTrainer:
                             "frame": frame,
                             "episode": episode,
                             "avg_score": avg_score,
+                            "loss": float(last_loss),
                             "epsilon": epsilon,
                             "alive": info.get("alive_count", self.cfg.num_snakes),
                             "steps": info.get("steps", 0),
@@ -123,7 +136,53 @@ class RainbowTrainer:
 
         final_path = self.cfg.checkpoint_path().with_name("rainbow_snake_final.pth")
         self.agent.save(final_path)
+        self._save_training_checkpoint(frame, episode, epsilon, last_loss)
         return final_path
+
+    def _save_training_checkpoint(self, frame: int, episode: int, epsilon: float, last_loss: float) -> None:
+        path = self.cfg.trainer_checkpoint_path()
+        payload = {
+            "frame": int(frame),
+            "episode": int(episode),
+            "epsilon": float(epsilon),
+            "best_score": float(self.best_score),
+            "last_loss": float(last_loss),
+            "online_state": self.agent.online_net.state_dict(),
+            "target_state": self.agent.target_net.state_dict(),
+            "optimizer_state": self.agent.optimizer.state_dict(),
+            "replay_state": self.replay.state_dict(),
+        }
+        torch.save(payload, path)
+
+    def _try_load_training_checkpoint(self) -> Optional[tuple[int, int, float, float, float]]:
+        path = self.cfg.trainer_checkpoint_path()
+        if not path.exists():
+            return None
+
+        kwargs = {"map_location": self.device}
+        try:
+            payload = torch.load(path, weights_only=False, **kwargs)  # type: ignore[arg-type]
+        except TypeError:
+            payload = torch.load(path, **kwargs)
+
+        if not isinstance(payload, dict):
+            return None
+
+        self.agent.online_net.load_state_dict(payload.get("online_state", {}))
+        self.agent.target_net.load_state_dict(payload.get("target_state", {}))
+        opt_state = payload.get("optimizer_state")
+        if opt_state:
+            self.agent.optimizer.load_state_dict(opt_state)
+        replay_state = payload.get("replay_state")
+        if isinstance(replay_state, dict):
+            self.replay.load_state_dict(replay_state)
+
+        frame = int(payload.get("frame", 0))
+        episode = int(payload.get("episode", 1))
+        epsilon = float(payload.get("epsilon", self.cfg.epsilon_start))
+        best_score = float(payload.get("best_score", self.best_score))
+        last_loss = float(payload.get("last_loss", 0.0))
+        return frame, episode, epsilon, best_score, last_loss
 
     def _derive_rewards(self, events: Optional[List[Dict]]) -> List[float]:
         rewards = [0.0 for _ in range(self.cfg.num_snakes)]

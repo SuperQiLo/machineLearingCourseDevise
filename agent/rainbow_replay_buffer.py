@@ -118,6 +118,45 @@ class PrioritizedReplayBuffer:
         for idx, priority in zip(indices, values):
             self.priorities[idx] = priority
 
+    def state_dict(self) -> Dict:
+        """导出经验池状态，用于断点续训持久化。"""
+
+        return {
+            "capacity": self.capacity,
+            "alpha": self.alpha,
+            "beta_start": self.beta_start,
+            "beta": float(self.beta),
+            "beta_increment": float(self.beta_increment),
+            "multi_step": self.multi_step,
+            "gamma": float(self.gamma),
+            "buffer": self.buffer,
+            "pos": int(self.pos),
+            "priorities": self.priorities,
+            "n_step_buffer": list(self.n_step_buffer),
+        }
+
+    def load_state_dict(self, state: Dict) -> None:
+        """从 state_dict 恢复经验池状态。"""
+
+        self.capacity = int(state.get("capacity", self.capacity))
+        self.alpha = float(state.get("alpha", self.alpha))
+        self.beta_start = float(state.get("beta_start", self.beta_start))
+        self.beta = float(state.get("beta", self.beta))
+        self.beta_increment = float(state.get("beta_increment", self.beta_increment))
+        self.multi_step = int(state.get("multi_step", self.multi_step))
+        self.gamma = float(state.get("gamma", self.gamma))
+
+        self.buffer = list(state.get("buffer", []))
+        self.pos = int(state.get("pos", 0))
+        priorities = state.get("priorities")
+        if isinstance(priorities, np.ndarray):
+            self.priorities = priorities.astype(np.float32, copy=False)
+        else:
+            self.priorities = np.asarray(priorities, dtype=np.float32)
+
+        n_step = state.get("n_step_buffer", [])
+        self.n_step_buffer = deque(n_step, maxlen=self.multi_step)
+
     # ------------------------------------------------------------------
     # 内部辅助
     # ------------------------------------------------------------------
