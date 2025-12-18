@@ -14,10 +14,6 @@ from agent.rainbow_agent import RainbowAgent
 from env.multi_snake_env import MultiSnakeEnv
 from network.renderer import BattleRenderer, GameClientProtocol
 
-EVENT_REWARD_FOOD = 20.0
-EVENT_REWARD_KILL = 100.0
-EVENT_REWARD_DEATH = 0.0
-
 
 @dataclass
 class EvalConfig:
@@ -149,9 +145,11 @@ class LocalGameAdapter(GameClientProtocol):
                     continue
                 actions[slot] = self.agent.act(self.last_obs[slot], epsilon=self.cfg.epsilon)
 
-        observations, _, dones, info = self.env.step(actions)
+        observations, rewards, dones, info = self.env.step(actions)
         self.last_obs = observations
-        self._apply_events(info.get("events"))
+        for i, r in enumerate(rewards):
+            if i < len(self.scores):
+                self.scores[i] += float(r)
         if all(dones) or info.get("game_over"):
             self.done = True
 
@@ -201,19 +199,7 @@ class LocalGameAdapter(GameClientProtocol):
         remaining = self.countdown_until - time.time()
         return remaining if remaining > 0 else None
 
-    def _apply_events(self, events: Optional[Sequence[Dict]]) -> None:
-        if not events:
-            return
-        for idx, event in enumerate(events):
-            if idx >= len(self.scores):
-                break
-            if event.get("ate_food"):
-                self.scores[idx] += EVENT_REWARD_FOOD
-            kills = int(event.get("kills", 0) or 0)
-            if kills:
-                self.scores[idx] += EVENT_REWARD_KILL * kills
-            if event.get("died"):
-                self.scores[idx] += EVENT_REWARD_DEATH
+
 
 
 def build_agent(eval_cfg: EvalConfig, rainbow_cfg: RainbowConfig) -> Optional[RainbowAgent]:

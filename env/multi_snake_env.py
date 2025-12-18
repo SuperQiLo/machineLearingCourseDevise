@@ -1,8 +1,12 @@
 """多蛇对战环境定义。
 
-该模块实现了一个支持 *任意数量* 蛇同场竞技的网格世界环境，
-提供了基于网格的全局观测、相对动作空间以及奖励塑形策略，
-可用于强化学习训练、局域网服务器或本地检验。
+目标：提供“可训练、可复现、接口稳定”的多智能体蛇环境。
+
+关键设计点：
+- 环境直接返回 reward（不要在 trainer 里二次拼接），避免不一致与隐性 bug
+- reward 默认采用 step penalty + 食物奖励 + 死亡惩罚 + 击杀奖励 + 距离塑形
+    其中 step penalty 用于消除“原地转圈拿存活奖励”的局部最优
+- 观测采用轻量 6 通道网格，便于卷积网络学习，且每步构造开销小
 """
 
 from __future__ import annotations
@@ -83,7 +87,7 @@ class MultiSnakeEnv:
         self.snakes: List[Dict] = []
         self.food: List[Tuple[int, int]] = []
         self.steps = 0
-        self.grid_shape = (width, height)
+        self.grid_shape = (self.width, self.height)
 
         # 渲染辅助颜色
         self.colors = [
@@ -104,8 +108,12 @@ class MultiSnakeEnv:
     # ------------------------------------------------------------------
     # 环境生命周期
     # ------------------------------------------------------------------
-    def reset(self) -> List[np.ndarray]:
+    def reset(self, *, seed: Optional[int] = None) -> List[np.ndarray]:
         """重置环境并返回所有蛇的初始观测。"""
+
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
 
         self.snakes = []
         self.steps = 0
@@ -133,18 +141,24 @@ class MultiSnakeEnv:
     # 核心交互
     # ------------------------------------------------------------------
     def step(self, actions: Sequence[int]) -> Tuple[List[np.ndarray], List[float], List[bool], Dict]:
-        """推进一步模拟，输出新观测、奖励、是否结束以及调试信息。"""
+        """推进一步模拟，输出 (obs, rewards, dones, info)。"""
 
         self._ensure_action_length(actions)
 
         self.steps += 1
+
+        prev_heads = [snake["body"][0] if snake.get("alive", True) and snake.get("body") else None for snake in self.snakes]
+        prev_food = list(self.food)
+
         events = self._init_step_events()
         next_heads, will_grow = self._plan_next_heads(actions)
         snakes_to_die, kill_credits = self._detect_collisions(next_heads, will_grow, events)
         for owner, victims in kill_credits.items():
             events[owner].kills += len(victims)
         dones = self._apply_movements(next_heads, will_grow, snakes_to_die, events)
-        rewards = [0.0 for _ in range(self.num_snakes)]
+
+        curr_heads = [snake["body"][0] if snake.get("alive", True) and snake.get("body") else None for snake in self.snakes]
+        rewards = self._compute_rewards(events, prev_heads, curr_heads, prev_food)
 
         alive_count = sum(1 for snake in self.snakes if snake["alive"])
         game_over = alive_count <= 1 or self.steps >= self.max_steps
@@ -155,6 +169,43 @@ class MultiSnakeEnv:
 
         info = self._build_info(events, alive_count, game_over)
         return self._get_observations(), rewards, dones, info
+
+    def _compute_rewards(
+        self,
+        events: Sequence[StepEvent],
+        prev_heads: Sequence[Optional[Tuple[int, int]]],
+        curr_heads: Sequence[Optional[Tuple[int, int]]],
+        prev_food: Sequence[Tuple[int, int]],
+    ) -> List[float]:
+        cfg = self.config
+        rewards = [0.0 for _ in range(self.num_snakes)]
+
+        for i, event in enumerate(events):
+            if not event.alive and not event.died:
+                rewards[i] = 0.0
+                continue
+
+            r = float(cfg.step_penalty)
+
+            if event.ate_food:
+                r += float(cfg.food_reward)
+            if event.kills:
+                r += float(cfg.kill_reward) * float(event.kills)
+            if event.died:
+                r += float(cfg.death_penalty)
+
+            # 距离塑形：让“靠近最近食物”有微弱增益，减少稀疏性
+            if cfg.distance_shaping_scale != 0.0 and prev_food:
+                ph = prev_heads[i] if i < len(prev_heads) else None
+                ch = curr_heads[i] if i < len(curr_heads) else None
+                if ph is not None and ch is not None and event.alive:
+                    prev_d = min(abs(ph[0] - fx) + abs(ph[1] - fy) for fx, fy in prev_food)
+                    curr_d = min(abs(ch[0] - fx) + abs(ch[1] - fy) for fx, fy in self.food) if self.food else prev_d
+                    r += float(cfg.distance_shaping_scale) * float(prev_d - curr_d)
+
+            rewards[i] = float(r)
+
+        return rewards
 
     # ------------------------------------------------------------------
     # Step 子流程
@@ -299,25 +350,18 @@ class MultiSnakeEnv:
     # 观测与渲染
     # ------------------------------------------------------------------
     def _get_observations(self) -> List[np.ndarray]:
-        """返回所有蛇的三通道网格观测。"""
+        """返回所有蛇的 6 通道网格观测。"""
 
-        obs_list: List[np.ndarray] = []
-        food_grid = np.zeros(self.grid_shape, dtype=np.float32)
-        for fx, fy in self.food:
-            food_grid[fx, fy] = 1.0
-
-        for i in range(self.num_snakes):
-            obs_list.append(
-                build_observation_from_snapshot(
-                    width=self.width,
-                    height=self.height,
-                    snakes=self.snakes,
-                    food=self.food,
-                    slot=i,
-                )
+        return [
+            build_observation_from_snapshot(
+                width=self.width,
+                height=self.height,
+                snakes=self.snakes,
+                food=self.food,
+                slot=i,
             )
-
-        return obs_list
+            for i in range(self.num_snakes)
+        ]
 
     def render_text(self) -> None:
         """简易字符渲染，方便调试。"""
@@ -443,32 +487,68 @@ def build_observation_from_snapshot(
     food: Sequence[Tuple[int, int]],
     slot: int,
 ) -> np.ndarray:
-    """根据状态快照构造单条蛇的 3 通道观测。"""
+    """根据状态快照构造单条蛇的 10 通道观测（轻量，可训练）。
 
+    通道说明:
+    - 0: 自己头
+    - 1: 自己身体(不含头)
+    - 2: 敌方头
+    - 3: 敌方身体(不含头)
+    - 4: 食物
+    - 5: 墙（边界格子为 1）
+    - 6~9: 自身朝向 one-hot（UP/RIGHT/DOWN/LEFT），在“蛇头格子”置 1
+    """
+
+    num_channels = 10
+
+    obs = np.zeros((num_channels, width, height), dtype=np.float32)
     if slot >= len(snakes) or slot < 0:
-        return np.zeros((3, width, height), dtype=np.float32)
-
-    food_grid = np.zeros((width, height), dtype=np.float32)
-    for fx, fy in food:
-        if 0 <= fx < width and 0 <= fy < height:
-            food_grid[fx, fy] = 1.0
+        return obs
 
     snake = snakes[slot]
     if not snake.get("alive", True):
-        return np.zeros((3, width, height), dtype=np.float32)
+        return obs
 
-    self_grid = np.zeros((width, height), dtype=np.float32)
-    enemies_grid = np.zeros((width, height), dtype=np.float32)
+    body = snake.get("body", [])
+    if body:
+        hx, hy = body[0]
+        if 0 <= hx < width and 0 <= hy < height:
+            obs[0, hx, hy] = 1.0
 
-    for idx, (bx, by) in enumerate(snake.get("body", [])):
-        if 0 <= bx < width and 0 <= by < height:
-            self_grid[bx, by] = 2.0 if idx == 0 else 1.0
+            # 朝向编码（相对动作必须知道当前朝向，否则会学成固定转圈）
+            direction = snake.get("direction", Direction.UP)
+            if isinstance(direction, Direction):
+                dir_index = int(direction.value) % 4
+            else:
+                try:
+                    dir_index = int(direction) % 4
+                except Exception:
+                    dir_index = 0
+            obs[6 + dir_index, hx, hy] = 1.0
+        for bx, by in body[1:]:
+            if 0 <= bx < width and 0 <= by < height:
+                obs[1, bx, by] = 1.0
 
     for idx, other in enumerate(snakes):
         if idx == slot or not other.get("alive", True):
             continue
-        for seg, (bx, by) in enumerate(other.get("body", [])):
+        other_body = other.get("body", [])
+        if not other_body:
+            continue
+        ohx, ohy = other_body[0]
+        if 0 <= ohx < width and 0 <= ohy < height:
+            obs[2, ohx, ohy] = 1.0
+        for bx, by in other_body[1:]:
             if 0 <= bx < width and 0 <= by < height:
-                enemies_grid[bx, by] = 2.0 if seg == 0 else 1.0
+                obs[3, bx, by] = 1.0
 
-    return np.stack([self_grid, enemies_grid, food_grid], axis=0)
+    for fx, fy in food:
+        if 0 <= fx < width and 0 <= fy < height:
+            obs[4, fx, fy] = 1.0
+
+    obs[5, 0, :] = 1.0
+    obs[5, width - 1, :] = 1.0
+    obs[5, :, 0] = 1.0
+    obs[5, :, height - 1] = 1.0
+
+    return obs

@@ -1,4 +1,4 @@
-"""Rainbow 算法使用的卷积骨干与 NoisyLinear 模块。"""
+"""Rainbow 算法使用的卷积骨干与 NoisyLinear 模块 (增强版)。"""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from typing import Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class NoisyLinear(nn.Module):
@@ -65,12 +66,42 @@ class NoisyLinear(nn.Module):
         return nn.functional.linear(x, weight, bias)
 
 
+class ResidualBlock(nn.Module):
+    """残差块，加速深层网络训练。"""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += residual
+        return F.relu(out)
+
+
+class SpatialAttention(nn.Module):
+    """空间注意力模块。"""
+
+    def __init__(self, in_channels: int) -> None:
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        attention = torch.sigmoid(self.conv(x))
+        return x * attention
+
+
 class RainbowBackbone(nn.Module):
-    """面向网格观测的卷积骨干网络，输出 dueling 结构的 (A, V) 表示。"""
+    """增强版卷积骨干网络，输出 dueling 结构的 (A, V) 表示。"""
 
     def __init__(
         self,
-        input_channels: int = 3,
+        input_channels: int = 6,  # 增强的观测通道数
         grid_size: int = 30,
         action_dim: int = 3,
         atom_size: int = 51,
@@ -79,41 +110,102 @@ class RainbowBackbone(nn.Module):
         self.action_dim = action_dim
         self.atom_size = atom_size
 
-        # 采样网格大小以自动推导展平维度，避免手算
+        # 采样网格大小以自动推导展平维度
         dummy = torch.zeros(1, input_channels, grid_size, grid_size)
 
-        self.encoder = nn.Sequential(
+        # 增强的编码器
+        self.stem = nn.Sequential(
             nn.Conv2d(input_channels, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
         )
 
-        with torch.no_grad():
-            encoded = self.encoder(dummy)
-            flat_dim = int(encoded.numel())
+        self.res_blocks1 = nn.Sequential(
+            ResidualBlock(64),
+            ResidualBlock(64),
+        )
 
+        self.down1 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+
+        self.res_blocks2 = nn.Sequential(
+            ResidualBlock(128),
+            ResidualBlock(128),
+        )
+
+        self.attention = SpatialAttention(128)
+
+        self.down2 = nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
+
+        self.res_blocks3 = ResidualBlock(256)
+
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+
+        # 空间特征池化：固定输出尺寸，避免 grid_size 变化导致展平维度变化
+        self.spatial_pool = nn.AdaptiveAvgPool2d((4, 4))
+
+        with torch.no_grad():
+            x = self.stem(dummy)
+            x = self.res_blocks1(x)
+            x = self.down1(x)
+            x = self.res_blocks2(x)
+            x = self.attention(x)
+            x = self.down2(x)
+            x = self.res_blocks3(x)
+            spatial_features = self.spatial_pool(x).view(x.size(0), -1)
+            spatial_dim = spatial_features.shape[1]
+            global_features = self.global_pool(x).view(x.size(0), -1)
+            global_dim = global_features.shape[1]
+            flat_dim = spatial_dim + global_dim
+
+        # Dueling头 - 使用NoisyLinear
         self.advantage_head = nn.Sequential(
             NoisyLinear(flat_dim, 512),
             nn.ReLU(inplace=True),
-            NoisyLinear(512, action_dim * atom_size),
+            NoisyLinear(512, 256),
+            nn.ReLU(inplace=True),
+            NoisyLinear(256, action_dim * atom_size),
         )
 
         self.value_head = nn.Sequential(
             NoisyLinear(flat_dim, 512),
             nn.ReLU(inplace=True),
-            NoisyLinear(512, atom_size),
+            NoisyLinear(512, 256),
+            nn.ReLU(inplace=True),
+            NoisyLinear(256, atom_size),
         )
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """初始化卷积层权重。"""
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.orthogonal_(module.weight, gain=1.0)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """返回优势项与价值项的原始 logits，供上层组装分布。"""
 
-        features = self.encoder(x)
-        features = features.view(features.size(0), -1)
+        x = self.stem(x)
+        x = self.res_blocks1(x)
+        x = self.down1(x)
+        x = self.res_blocks2(x)
+        x = self.attention(x)
+        x = self.down2(x)
+        x = self.res_blocks3(x)
+
+        spatial_features = self.spatial_pool(x).view(x.size(0), -1)
+        global_features = self.global_pool(x).view(x.size(0), -1)
+        features = torch.cat([spatial_features, global_features], dim=-1)
 
         advantage = self.advantage_head(features)
         advantage = advantage.view(-1, self.action_dim, self.atom_size)

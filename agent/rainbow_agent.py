@@ -1,4 +1,4 @@
-"""Rainbow DQN 推理/训练用的智能体实现。"""
+"""Rainbow DQN 推理/训练用的智能体实现 (增强版)。"""
 
 from __future__ import annotations
 
@@ -28,20 +28,25 @@ class RainbowAgent(BaseAgent):
         self.action_dim = 3
 
         self.online_net = RainbowBackbone(
-            input_channels=3,
+            input_channels=int(getattr(config, "obs_channels", 10)),
             grid_size=config.grid_size,
             action_dim=self.action_dim,
             atom_size=config.atom_size,
         ).to(self.device)
         self.target_net = RainbowBackbone(
-            input_channels=3,
+            input_channels=int(getattr(config, "obs_channels", 10)),
             grid_size=config.grid_size,
             action_dim=self.action_dim,
             atom_size=config.atom_size,
         ).to(self.device)
         self.target_net.load_state_dict(self.online_net.state_dict())
 
-        self.optimizer = torch.optim.Adam(self.online_net.parameters(), lr=config.lr, eps=1.5e-4)
+        self.optimizer = torch.optim.AdamW(
+            self.online_net.parameters(), 
+            lr=config.lr, 
+            eps=1.5e-4,
+            weight_decay=1e-5
+        )
         self.support = torch.linspace(config.v_min, config.v_max, config.atom_size, device=self.device)
         self.delta_z = (config.v_max - config.v_min) / (config.atom_size - 1)
 

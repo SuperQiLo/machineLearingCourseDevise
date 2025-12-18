@@ -13,11 +13,15 @@ def train() -> None:
     # -------------------------------------------------------------------------
     # 训练参数配置
     # -------------------------------------------------------------------------
+    # 建议先用小图 + 2 蛇跑通，再逐步加难度。
     config = RainbowConfig(
-        grid_size=30,
-        num_snakes=4,
-        total_frames=5_000_000,
-        warmup_frames=50_000,
+        grid_size=14,
+        num_snakes=2,
+        num_envs=8,
+        num_food=3,
+        max_steps=300,
+        total_frames=2_000_000,
+        warmup_frames=20_000,
         batch_size=256,
         lr=1e-4,
         replay_capacity=1_000_000,
@@ -29,7 +33,7 @@ def train() -> None:
         # 探索策略
         epsilon_start=1.0,
         epsilon_final=0.05,
-        epsilon_decay=2_000_000,
+        epsilon_decay=1_000_000,
 
         # 模型保存名称 (saved to agent/checkpoints/)
         checkpoint_name="rainbow_snake_latest.pth",
@@ -39,13 +43,13 @@ def train() -> None:
         # A6000 训练建议显式指定
         device="cuda:0",
 
-        # 奖励塑形（环境 reward=0，Trainer 依赖 events 计算）
-        reward_food=50.0,
-        reward_kill=150.0,
-        reward_death=-80.0,
-        reward_survive=-0.005,
-        
-      
+        # 环境 reward（直接由 env 返回）
+        step_penalty=-0.01,
+        food_reward=1.0,
+        death_penalty=-1.0,
+        kill_reward=0.5,
+        distance_shaping_scale=0.01,
+
     )
 
     print("=== 开始 Rainbow Snake 训练 ===")

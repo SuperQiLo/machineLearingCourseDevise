@@ -52,11 +52,11 @@ def parse_args() -> EvalConfig:
         dest="ai_slots",
         type=int,
         action="append",
-        default=None,
+        default=[0,1],
         help="指定 AI 占用的槽位，可多次填写；缺省使用槽位 1",
     )
     parser.add_argument("--device", default="auto", help="推理设备，auto/cpu/cuda:n")
-    parser.add_argument("--spectator", action="store_true", default=False, help="以观战身份启动渲染，不占用蛇槽位")
+    parser.add_argument("--spectator", action="store_true", default=True, help="以观战身份启动渲染，不占用蛇槽位")
     parser.add_argument("--no-ai", action="store_true", default=False, help="禁用 AI 控制，仅保留手动或观战")
 
     args = parser.parse_args()
@@ -102,17 +102,6 @@ class LocalGameAdapter(GameClientProtocol):
         self.pending_human_action = 0
         self.last_obs: List = self.env.reset()
         self.scores: List[float] = [0.0 for _ in range(self.env.num_snakes)]
-        if agent is not None:
-            self.reward_food = float(agent.cfg.reward_food)
-            self.reward_kill = float(agent.cfg.reward_kill)
-            self.reward_death = float(agent.cfg.reward_death)
-            self.reward_survive = float(agent.cfg.reward_survive)
-        else:
-            defaults = A2CConfig(grid_size=config.grid_size, num_snakes=config.num_snakes)
-            self.reward_food = float(defaults.reward_food)
-            self.reward_kill = float(defaults.reward_kill)
-            self.reward_death = float(defaults.reward_death)
-            self.reward_survive = float(defaults.reward_survive)
         self.countdown_until = time.time() + 3.0
         self.state_cache = self._build_state({}, countdown=self._countdown_remaining())
         self.done = False
@@ -165,9 +154,11 @@ class LocalGameAdapter(GameClientProtocol):
                 # 评估：取 argmax
                 actions[slot] = self.agent.act(self.last_obs[slot], epsilon=0.0)
 
-        observations, _, dones, info = self.env.step(actions)
+        observations, rewards, dones, info = self.env.step(actions)
         self.last_obs = observations
-        self._apply_events(info.get("events"))
+        for i, r in enumerate(rewards):
+            if i < len(self.scores):
+                self.scores[i] += float(r)
         if all(dones) or info.get("game_over"):
             self.done = True
 
@@ -217,26 +208,7 @@ class LocalGameAdapter(GameClientProtocol):
         remaining = self.countdown_until - time.time()
         return remaining if remaining > 0 else None
 
-    def _apply_events(self, events: Optional[Sequence[Dict]]) -> None:
-        if not events:
-            return
-
-        # 与训练保持一致：用塑形奖励累计到 scores
-        # 注意：scores 仅用于渲染面板展示，不影响环境逻辑。
-        for idx, event in enumerate(events):
-            if idx >= len(self.scores):
-                break
-            value = 0.0
-            if event.get("alive"):
-                value += self.reward_survive
-            if event.get("ate_food"):
-                value += self.reward_food
-            kills = int(event.get("kills", 0) or 0)
-            if kills:
-                value += self.reward_kill * kills
-            if event.get("died"):
-                value += self.reward_death
-            self.scores[idx] += value
+    
 
 
 def build_agent(eval_cfg: EvalConfig) -> Optional[A2CAgent]:

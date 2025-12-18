@@ -1,4 +1,4 @@
-"""A2C 推理/训练用的智能体实现。"""
+"""A2C 推理/训练用的智能体实现 (增强版)。"""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ class A2CRolloutBatch:
 
 
 class A2CAgent(BaseAgent):
-    """共享策略的 A2C 智能体（Actor-Critic）。"""
+    """共享策略的 A2C 智能体（Actor-Critic），支持 GAE。"""
 
     def __init__(self, config: A2CConfig, device: Optional[torch.device] = None) -> None:
         self.cfg = config
@@ -41,12 +41,28 @@ class A2CAgent(BaseAgent):
         self.action_dim = 3
 
         self.net = A2CBackbone(
-            input_channels=3,
+            input_channels=int(getattr(config, "obs_channels", 10)),
             grid_size=config.grid_size,
             action_dim=self.action_dim,
         ).to(self.device)
 
-        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=config.lr, eps=1.5e-4)
+        self.optimizer = torch.optim.AdamW(
+            self.net.parameters(), 
+            lr=config.lr, 
+            eps=1e-5,
+            weight_decay=1e-4  # L2正则化
+        )
+        
+        # 学习率调度器
+        if config.lr_decay:
+            updates = max(1, int(config.total_frames // (config.rollout_length * max(1, getattr(config, "num_envs", 1)))))
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=updates,
+                eta_min=config.lr_min
+            )
+        else:
+            self.scheduler = None
 
     # ------------------------------------------------------------------
     # 推理接口
@@ -79,10 +95,53 @@ class A2CAgent(BaseAgent):
         torch.save(self.net.state_dict(), path)
 
     # ------------------------------------------------------------------
+    # GAE 计算
+    # ------------------------------------------------------------------
+    def compute_gae(
+        self,
+        rewards: torch.Tensor,
+        values: torch.Tensor,
+        dones: torch.Tensor,
+        last_value: torch.Tensor,
+        gamma: float,
+        gae_lambda: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """计算 Generalized Advantage Estimation。
+        
+        Args:
+            rewards: (T, N) 奖励
+            values: (T, N) 价值估计
+            dones: (T, N) 结束标志
+            last_value: (N,) 最后状态的价值
+            gamma: 折扣因子
+            gae_lambda: GAE lambda参数
+            
+        Returns:
+            advantages: (T, N) GAE优势
+            returns: (T, N) 目标回报
+        """
+        T, N = rewards.shape
+        advantages = torch.zeros_like(rewards)
+        last_gae = torch.zeros(N, device=rewards.device)
+        
+        for t in reversed(range(T)):
+            if t == T - 1:
+                next_value = last_value
+            else:
+                next_value = values[t + 1]
+            
+            delta = rewards[t] + gamma * next_value * (1 - dones[t]) - values[t]
+            last_gae = delta + gamma * gae_lambda * (1 - dones[t]) * last_gae
+            advantages[t] = last_gae
+        
+        returns = advantages + values
+        return advantages, returns
+
+    # ------------------------------------------------------------------
     # 训练相关
     # ------------------------------------------------------------------
     def train_step(self, batch: Any, weights: Any = None) -> Tuple[float, Optional[np.ndarray]]:
-        """对一个 rollout 做一次 A2C 更新。"""
+        """对一个 rollout 做一次 A2C 更新，使用 GAE。"""
 
         if not isinstance(batch, A2CRolloutBatch):
             raise TypeError("batch must be an A2CRolloutBatch")
@@ -112,15 +171,25 @@ class A2CAgent(BaseAgent):
 
         with torch.no_grad():
             _, last_value = self.net(last_state)
-            bootstrap = last_value * (1.0 - last_done)
+            last_value = last_value * (1.0 - last_done)
 
-            returns = torch.zeros((T, N), dtype=torch.float32, device=device)
-            running = bootstrap
-            for t in range(T - 1, -1, -1):
-                running = rewards[t] + gamma * running * (1.0 - dones[t])
-                returns[t] = running
+            if self.cfg.use_gae:
+                # 使用GAE计算优势
+                advantages, returns = self.compute_gae(
+                    rewards, values_pred.detach(), dones, last_value,
+                    gamma, self.cfg.gae_lambda
+                )
+            else:
+                # 传统的n-step回报
+                returns = torch.zeros((T, N), dtype=torch.float32, device=device)
+                running = last_value
+                for t in range(T - 1, -1, -1):
+                    running = rewards[t] + gamma * running * (1.0 - dones[t])
+                    returns[t] = running
+                advantages = returns - values_pred.detach()
 
-            advantages = returns - values_pred
+            # 标准化优势 - 减少方差
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         valid = masks.view(-1) > 0.0
         if valid.sum().item() == 0:
@@ -132,8 +201,8 @@ class A2CAgent(BaseAgent):
         flat_values = values_pred.view(-1)[valid]
         flat_returns = returns.view(-1)[valid]
 
-        policy_loss = -(flat_log_probs * flat_adv.detach()).mean()
-        value_loss = F.mse_loss(flat_values, flat_returns)
+        policy_loss = -(flat_log_probs * flat_adv).mean()
+        value_loss = F.smooth_l1_loss(flat_values, flat_returns)  # 使用Huber loss更稳定
         entropy_loss = -flat_entropy.mean()
 
         loss = policy_loss + self.cfg.value_coef * value_loss + self.cfg.entropy_coef * entropy_loss
@@ -142,6 +211,10 @@ class A2CAgent(BaseAgent):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.cfg.max_grad_norm)
         self.optimizer.step()
+        
+        # 更新学习率
+        if self.scheduler is not None:
+            self.scheduler.step()
 
         return float(loss.item()), None
 
