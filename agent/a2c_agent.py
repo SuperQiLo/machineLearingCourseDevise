@@ -25,8 +25,6 @@ class A2CRolloutBatch:
     actions: np.ndarray  # (T, N)
     rewards: np.ndarray  # (T, N)
     dones: np.ndarray  # (T, N)
-    values: np.ndarray  # (T, N)
-    log_probs: np.ndarray  # (T, N)
     masks: np.ndarray  # (T, N) 1 表示有效(当步 alive)
     last_state: np.ndarray  # (N, C, W, H)
     last_done: np.ndarray  # (N,)
@@ -41,8 +39,8 @@ class A2CAgent(BaseAgent):
         self.action_dim = 3
 
         self.net = A2CBackbone(
-            input_channels=int(getattr(config, "obs_channels", 10)),
-            grid_size=config.grid_size,
+            input_channels=int(getattr(config, "obs_channels", 3)),
+            obs_size=getattr(config, "obs_size", 84),
             action_dim=self.action_dim,
         ).to(self.device)
 

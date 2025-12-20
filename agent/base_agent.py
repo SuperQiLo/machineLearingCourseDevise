@@ -16,7 +16,7 @@ class BaseAgent(ABC):
         Returns:
             int: The action index (0: Straight, 1: Left, 2: Right).
         """
-        pass
+        raise NotImplementedError
 
     @abstractmethod
     def train_step(self, batch: Any, weights: Optional[np.ndarray] = None) -> Tuple[float, Optional[np.ndarray]]:
@@ -29,7 +29,7 @@ class BaseAgent(ABC):
         Returns:
             Tuple[float, Optional[np.ndarray]]: A tuple containing the loss value and TD-errors (if applicable).
         """
-        pass
+        raise NotImplementedError
 
     @abstractmethod
     def save(self, path: str) -> None:
@@ -38,7 +38,7 @@ class BaseAgent(ABC):
         Args:
             path: filesystem path to save the model.
         """
-        pass
+        raise NotImplementedError
 
     @abstractmethod
     def load(self, path: str) -> None:
@@ -47,4 +47,4 @@ class BaseAgent(ABC):
         Args:
             path: filesystem path to load the model from.
         """
-        pass
+        raise NotImplementedError

@@ -1,0 +1,7 @@
+{
+    "python.defaultInterpreterPath": "C:\\ProgramData\\miniconda3\\envs\\pdf2zh\\python.exe",
+    "python.terminal.activateEnvInCurrentTerminal": true,
+    "terminal.integrated.env.windows": {
+        "CONDA_DEFAULT_ENV": "pdf2zh"
+    }
+}

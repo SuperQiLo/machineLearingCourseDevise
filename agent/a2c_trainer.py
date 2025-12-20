@@ -36,6 +36,7 @@ class A2CTrainer:
             death_penalty=config.death_penalty,
             kill_reward=config.kill_reward,
             distance_shaping_scale=config.distance_shaping_scale,
+            repetition_penalty=config.repetition_penalty,
         )
 
         self.envs: List[MultiSnakeEnv] = [
@@ -51,12 +52,6 @@ class A2CTrainer:
         frame = 0
         episode = 0
         last_loss = 0.0
-
-        if self.cfg.resume:
-            loaded = self._try_load_training_checkpoint()
-            if loaded is not None:
-                frame, episode, self.best_score, last_loss = loaded
-                obs_envs = [env.reset() for env in self.envs]
 
         self.agent.net.train()
 
@@ -87,7 +82,6 @@ class A2CTrainer:
 
             if frame % self.cfg.save_interval == 0:
                 self.agent.save(self.cfg.checkpoint_path())
-                self._save_training_checkpoint(frame, episode, last_loss)
 
             avg_return = float(np.mean(self._episode_returns)) if self._episode_returns else -math.inf
             if avg_return > self.best_score:
@@ -96,7 +90,6 @@ class A2CTrainer:
 
         final_path = self._final_path()
         self.agent.save(final_path)
-        self._save_training_checkpoint(frame, episode, last_loss)
         return final_path
 
     def _prefix(self) -> str:
@@ -112,46 +105,7 @@ class A2CTrainer:
     def _final_path(self) -> Path:
         return self.cfg.checkpoint_path().with_name(f"{self._prefix()}_final.pth")
 
-    def _save_training_checkpoint(self, frame: int, episode: int, last_loss: float) -> None:
-        path = self.cfg.trainer_checkpoint_path()
-        payload = {
-            "frame": int(frame),
-            "episode": int(episode),
-            "best_score": float(self.best_score),
-            "last_loss": float(last_loss),
-            "net_state": self.agent.net.state_dict(),
-            "optimizer_state": self.agent.optimizer.state_dict(),
-            "scheduler_state": self.agent.scheduler.state_dict() if self.agent.scheduler is not None else None,
-        }
-        torch.save(payload, path)
 
-    def _try_load_training_checkpoint(self) -> Optional[tuple[int, int, float, float]]:
-        path = self.cfg.trainer_checkpoint_path()
-        if not path.exists():
-            return None
-
-        kwargs = {"map_location": self.device}
-        try:
-            payload = torch.load(path, weights_only=False, **kwargs)  # type: ignore[arg-type]
-        except TypeError:
-            payload = torch.load(path, **kwargs)
-
-        if not isinstance(payload, dict):
-            return None
-
-        self.agent.net.load_state_dict(payload.get("net_state", {}))
-        opt_state = payload.get("optimizer_state")
-        if opt_state:
-            self.agent.optimizer.load_state_dict(opt_state)
-        sch_state = payload.get("scheduler_state")
-        if self.agent.scheduler is not None and sch_state:
-            self.agent.scheduler.load_state_dict(sch_state)
-
-        frame = int(payload.get("frame", 0))
-        episode = int(payload.get("episode", 0))
-        best_score = float(payload.get("best_score", self.best_score))
-        last_loss = float(payload.get("last_loss", 0.0))
-        return frame, episode, best_score, last_loss
 
     def _collect_rollout(
         self, obs_envs: List[List[np.ndarray]]
@@ -160,15 +114,13 @@ class A2CTrainer:
         E = self.cfg.num_envs
         S = self.cfg.num_snakes
         B = E * S
-        C = int(getattr(self.cfg, "obs_channels", 10))
-        G = self.cfg.grid_size
+        C = int(getattr(self.cfg, "obs_channels", 3))
+        G = self.cfg.obs_size
 
         states = np.zeros((T, B, C, G, G), dtype=np.float32)
         actions = np.zeros((T, B), dtype=np.int64)
         rewards = np.zeros((T, B), dtype=np.float32)
         dones = np.zeros((T, B), dtype=np.float32)
-        values = np.zeros((T, B), dtype=np.float32)
-        log_probs = np.zeros((T, B), dtype=np.float32)
         masks = np.zeros((T, B), dtype=np.float32)
 
         ep_returns = np.zeros((E, S), dtype=np.float32)
@@ -189,27 +141,20 @@ class A2CTrainer:
             # 采样动作（仅对存活个体）
             x = torch.as_tensor(states[t], dtype=torch.float32, device=self.device)
             with torch.no_grad():
-                logits, v = self.agent.net(x)
+                logits, _ = self.agent.net(x)
                 dist = torch.distributions.Categorical(logits=logits)
                 a = dist.sample()
-                lp = dist.log_prob(a)
 
             a_np = a.detach().cpu().numpy().astype(np.int64)
-            v_np = v.detach().cpu().numpy().astype(np.float32).reshape(-1)
-            lp_np = lp.detach().cpu().numpy().astype(np.float32)
 
             for i in range(B):
                 if not alive_mask[i]:
                     a_np[i] = 0
-                    v_np[i] = 0.0
-                    lp_np[i] = 0.0
                     masks[t, i] = 0.0
                 else:
                     masks[t, i] = 1.0
 
             actions[t] = a_np
-            values[t] = v_np
-            log_probs[t] = lp_np
 
             # 按 env 切片执行 step
             next_obs_envs: List[List[np.ndarray]] = []
@@ -242,8 +187,6 @@ class A2CTrainer:
                 actions=actions,
                 rewards=rewards,
                 dones=dones,
-                values=values,
-                log_probs=log_probs,
                 masks=masks,
                 last_state=last_state,
                 last_done=last_done,

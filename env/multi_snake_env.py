@@ -6,7 +6,7 @@
 - 环境直接返回 reward（不要在 trainer 里二次拼接），避免不一致与隐性 bug
 - reward 默认采用 step penalty + 食物奖励 + 死亡惩罚 + 击杀奖励 + 距离塑形
     其中 step penalty 用于消除“原地转圈拿存活奖励”的局部最优
-- 观测采用轻量 6 通道网格，便于卷积网络学习，且每步构造开销小
+- 观测采用 (3, 84, 84) RGB 图像，便于 CNN 学习
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from enum import Enum
 from typing import Dict, List, Optional, Sequence, Tuple, Set
 
 import numpy as np
+import pygame
 
 from env.config import EnvConfig
 
@@ -84,26 +85,23 @@ class MultiSnakeEnv:
         self.num_food = cfg.num_food
         self.max_steps = cfg.max_steps
 
+        # 统一的配色与单元尺寸，供渲染和协议复用
+        self.colors: List[Tuple[int, int, int]] = [
+            (0, 255, 159),
+            (255, 0, 85),
+            (0, 243, 255),
+            (255, 204, 0),
+            (189, 0, 255),
+            (255, 153, 0),
+        ]
+        self.cell_size = 20
+
         self.snakes: List[Dict] = []
         self.food: List[Tuple[int, int]] = []
         self.steps = 0
-        self.grid_shape = (self.width, self.height)
-
-        # 渲染辅助颜色
-        self.colors = [
-            "green",
-            "blue",
-            "red",
-            "yellow",
-            "purple",
-            "orange",
-            "teal",
-            "pink",
-            "lime",
-            "cyan",
-            "magenta",
-            "silver",
-        ]
+        self._surface = None
+        # 记录每条蛇的上一次动作，用于计算重复动作惩罚
+        self._last_actions: List[int] = [0] * num_snakes
 
     # ------------------------------------------------------------------
     # 环境生命周期
@@ -135,6 +133,9 @@ class MultiSnakeEnv:
         while len(self.food) < self.num_food:
             self._spawn_food()
 
+        # 重置动作记录
+        self._last_actions = [0] * self.num_snakes
+
         return self._get_observations()
 
     # ------------------------------------------------------------------
@@ -158,7 +159,7 @@ class MultiSnakeEnv:
         dones = self._apply_movements(next_heads, will_grow, snakes_to_die, events)
 
         curr_heads = [snake["body"][0] if snake.get("alive", True) and snake.get("body") else None for snake in self.snakes]
-        rewards = self._compute_rewards(events, prev_heads, curr_heads, prev_food)
+        rewards = self._compute_rewards(events, prev_heads, curr_heads, prev_food, actions)
 
         alive_count = sum(1 for snake in self.snakes if snake["alive"])
         game_over = alive_count <= 1 or self.steps >= self.max_steps
@@ -176,21 +177,37 @@ class MultiSnakeEnv:
         prev_heads: Sequence[Optional[Tuple[int, int]]],
         curr_heads: Sequence[Optional[Tuple[int, int]]],
         prev_food: Sequence[Tuple[int, int]],
+        actions: Sequence[int],
     ) -> List[float]:
+        """计算每条蛇的即时奖励。
+        
+        奖励设计原则：
+        1. 每步都有微小惩罚 (step_penalty)，防止无意义移动
+        2. 吃到食物有大奖励 (food_reward)，引导蛇主动寻找食物
+        3. 死亡有惩罚 (death_penalty)，避免冒险行为
+        4. 击杀其他蛇有奖励 (kill_reward)，鼓励竞争
+        5. 距离塑形 (distance_shaping)，靠近食物有微小正奖励
+        6. 重复动作惩罚 (repetition_penalty)，防止原地转圈
+        """
         cfg = self.config
         rewards = [0.0 for _ in range(self.num_snakes)]
 
         for i, event in enumerate(events):
+            # 已死亡且本帧未死的蛇不给奖励
             if not event.alive and not event.died:
                 rewards[i] = 0.0
                 continue
 
+            # 基础每步惩罚
             r = float(cfg.step_penalty)
 
+            # 吃到食物奖励
             if event.ate_food:
                 r += float(cfg.food_reward)
+            # 击杀奖励
             if event.kills:
                 r += float(cfg.kill_reward) * float(event.kills)
+            # 死亡惩罚
             if event.died:
                 r += float(cfg.death_penalty)
 
@@ -203,7 +220,18 @@ class MultiSnakeEnv:
                     curr_d = min(abs(ch[0] - fx) + abs(ch[1] - fy) for fx, fy in self.food) if self.food else prev_d
                     r += float(cfg.distance_shaping_scale) * float(prev_d - curr_d)
 
+            # 重复动作惩罚：连续执行相同动作时给予额外惩罚，打破转圈圈局部最优
+            if hasattr(cfg, 'repetition_penalty') and cfg.repetition_penalty != 0.0:
+                if i < len(actions) and i < len(self._last_actions):
+                    if actions[i] == self._last_actions[i]:
+                        r += float(cfg.repetition_penalty)
+
             rewards[i] = float(r)
+
+        # 更新上一次动作记录
+        for i, action in enumerate(actions):
+            if i < len(self._last_actions):
+                self._last_actions[i] = action
 
         return rewards
 
@@ -214,7 +242,7 @@ class MultiSnakeEnv:
         """校验动作数组长度，与蛇数量不符时直接抛错。"""
 
         if len(actions) != self.num_snakes:
-            raise ValueError("actions 数组长度必须与蛇数量一致。")
+            raise ValueError(f"actions 长度为 {len(actions)}，必须与蛇数量 {self.num_snakes} 一致。")
 
     def _init_step_events(self) -> List[StepEvent]:
         """为每条蛇初始化事件记录，默认继承当前存活状态。"""
@@ -350,18 +378,127 @@ class MultiSnakeEnv:
     # 观测与渲染
     # ------------------------------------------------------------------
     def _get_observations(self) -> List[np.ndarray]:
-        """返回所有蛇的 6 通道网格观测。"""
+        """返回所有蛇的图像观测 (3, 84, 84)。"""
+        
+        # 渲染全局图像
+        full_surface = self._render_full_surface()
+        
+        obs_list = []
+        for i in range(self.num_snakes):
+            obs = self._get_agent_observation(full_surface, i)
+            obs_list.append(obs)
+        return obs_list
 
-        return [
-            build_observation_from_snapshot(
-                width=self.width,
-                height=self.height,
-                snakes=self.snakes,
-                food=self.food,
-                slot=i,
-            )
-            for i in range(self.num_snakes)
-        ]
+    def _render_full_surface(self) -> pygame.Surface:
+        """渲染整个游戏画面（精致霓虹风格，用于 RL 观测或静态导出）。"""
+
+        if not pygame.get_init():
+            pygame.init()
+
+        # 配色方案 (与 Renderer 保持一致)
+        bg_color = (13, 15, 26)
+        grid_color = (25, 30, 45)
+        food_color = (255, 0, 85)
+        snake_colors = self.colors
+
+        width_px = self.width * self.cell_size
+        height_px = self.height * self.cell_size
+
+        if not self._surface or self._surface.get_size() != (width_px, height_px):
+            self._surface = pygame.Surface((width_px, height_px), flags=pygame.SRCALPHA)
+
+        surf = self._surface
+        surf.fill(bg_color)
+
+        # 1. 绘制网格
+        for x in range(self.width + 1):
+            pygame.draw.line(surf, grid_color, (x * self.cell_size, 0), (x * self.cell_size, height_px))
+        for y in range(self.height + 1):
+            pygame.draw.line(surf, grid_color, (0, y * self.cell_size), (width_px, y * self.cell_size))
+
+        # 2. 绘制食物
+        for fx, fy in self.food:
+            center = ((fx + 0.5) * self.cell_size, (fy + 0.5) * self.cell_size)
+            radius = self.cell_size * 0.35
+            
+            # 辉光 (静态环境使用固定发光)
+            glow_radius = radius * 2.0
+            glow_surf = pygame.Surface((glow_radius * 2, glow_radius * 2), pygame.SRCALPHA)
+            pygame.draw.circle(glow_surf, (*food_color, 60), (glow_radius, glow_radius), glow_radius)
+            surf.blit(glow_surf, (center[0] - glow_radius, center[1] - glow_radius))
+            
+            pygame.draw.circle(surf, (255, 255, 255), center, radius)
+            pygame.draw.circle(surf, food_color, center, radius, width=2)
+
+        # 3. 绘制蛇
+        for i, snake in enumerate(self.snakes):
+            if not snake.get("alive", True):
+                continue
+
+            base_color = snake_colors[i % len(snake_colors)]
+            body = snake.get("body", [])
+            if not body: continue
+
+            # 绘制连接的身体
+            for idx in range(len(body) - 1):
+                p1 = body[idx]
+                p2 = body[idx+1]
+                
+                start_px = ((p1[0] + 0.5) * self.cell_size, (p1[1] + 0.5) * self.cell_size)
+                end_px = ((p2[0] + 0.5) * self.cell_size, (p2[1] + 0.5) * self.cell_size)
+                
+                shade = max(0.4, 1.0 - (idx / len(body)) * 0.6)
+                color = tuple(int(c * shade) for c in base_color)
+                
+                width = self.cell_size * 0.8
+                pygame.draw.line(surf, color, start_px, end_px, int(width))
+                pygame.draw.circle(surf, color, start_px, width // 2)
+                pygame.draw.circle(surf, color, end_px, width // 2)
+
+            # 绘制头部
+            head = body[0]
+            head_px = ((head[0] + 0.5) * self.cell_size, (head[1] + 0.5) * self.cell_size)
+            
+            # 头部发光
+            hg_radius = self.cell_size * 1.0
+            hg_surf = pygame.Surface((hg_radius*2, hg_radius*2), pygame.SRCALPHA)
+            pygame.draw.circle(hg_surf, (*base_color, 120), (hg_radius, hg_radius), hg_radius)
+            surf.blit(hg_surf, (head_px[0] - hg_radius, head_px[1] - hg_radius))
+            
+            pygame.draw.circle(surf, (255, 255, 255), head_px, self.cell_size * 0.45)
+            pygame.draw.circle(surf, base_color, head_px, self.cell_size * 0.45, width=2)
+
+        return surf
+
+    def _get_agent_observation(self, surface: pygame.Surface, agent_idx: int) -> np.ndarray:
+        """获取特定 Agent 的观测图像 (3, 84, 84)。
+        
+        目前实现为 Global View，即所有 Agent 看到的一样。
+        如果需要 Egocentric，需要在这里做裁剪或旋转。
+        鉴于这是 Snake 游戏，全局视野通常较好。
+        """
+        if agent_idx >= len(self.snakes) or not self.snakes[agent_idx]["alive"]:
+            # 死亡则返回全黑或特定画面
+            return np.zeros((3, 84, 84), dtype=np.float32)
+
+        # 缩放到 84x84
+        target_size = (84, 84)
+        scaled = pygame.transform.scale(surface, target_size)
+        
+        # 转为 numpy (W, H, 3)
+        # pygame.surfarray.pixels3d 返回的是 (W, H, 3) 且 referencing the surface pixels
+        # 复制一份 channel order (H, W, 3) -> Transpose to (3, H, W) for PyTorch
+        
+        # pixels3d: (width, height, rgb)
+        pixels = pygame.surfarray.array3d(scaled)
+        # PyTorch expect (C, H, W). pygame is (W, H, C) usually?
+        # Let's verify: pygame x is width, y is height.
+        # Transpose to (C, H, W) -> (2, 1, 0)
+        
+        # Normalize to 0-1
+        obs = pixels.transpose(2, 1, 0).astype(np.float32) / 255.0
+        
+        return obs
 
     def render_text(self) -> None:
         """简易字符渲染，方便调试。"""
@@ -477,78 +614,3 @@ class MultiSnakeEnv:
         if len(layouts) < self.num_snakes:
             raise RuntimeError("无法初始化所有蛇，请增大地图尺寸或减少蛇数量。")
         return layouts
-
-
-def build_observation_from_snapshot(
-    *,
-    width: int,
-    height: int,
-    snakes: Sequence[Dict],
-    food: Sequence[Tuple[int, int]],
-    slot: int,
-) -> np.ndarray:
-    """根据状态快照构造单条蛇的 10 通道观测（轻量，可训练）。
-
-    通道说明:
-    - 0: 自己头
-    - 1: 自己身体(不含头)
-    - 2: 敌方头
-    - 3: 敌方身体(不含头)
-    - 4: 食物
-    - 5: 墙（边界格子为 1）
-    - 6~9: 自身朝向 one-hot（UP/RIGHT/DOWN/LEFT），在“蛇头格子”置 1
-    """
-
-    num_channels = 10
-
-    obs = np.zeros((num_channels, width, height), dtype=np.float32)
-    if slot >= len(snakes) or slot < 0:
-        return obs
-
-    snake = snakes[slot]
-    if not snake.get("alive", True):
-        return obs
-
-    body = snake.get("body", [])
-    if body:
-        hx, hy = body[0]
-        if 0 <= hx < width and 0 <= hy < height:
-            obs[0, hx, hy] = 1.0
-
-            # 朝向编码（相对动作必须知道当前朝向，否则会学成固定转圈）
-            direction = snake.get("direction", Direction.UP)
-            if isinstance(direction, Direction):
-                dir_index = int(direction.value) % 4
-            else:
-                try:
-                    dir_index = int(direction) % 4
-                except Exception:
-                    dir_index = 0
-            obs[6 + dir_index, hx, hy] = 1.0
-        for bx, by in body[1:]:
-            if 0 <= bx < width and 0 <= by < height:
-                obs[1, bx, by] = 1.0
-
-    for idx, other in enumerate(snakes):
-        if idx == slot or not other.get("alive", True):
-            continue
-        other_body = other.get("body", [])
-        if not other_body:
-            continue
-        ohx, ohy = other_body[0]
-        if 0 <= ohx < width and 0 <= ohy < height:
-            obs[2, ohx, ohy] = 1.0
-        for bx, by in other_body[1:]:
-            if 0 <= bx < width and 0 <= by < height:
-                obs[3, bx, by] = 1.0
-
-    for fx, fy in food:
-        if 0 <= fx < width and 0 <= fy < height:
-            obs[4, fx, fy] = 1.0
-
-    obs[5, 0, :] = 1.0
-    obs[5, width - 1, :] = 1.0
-    obs[5, :, 0] = 1.0
-    obs[5, :, height - 1] = 1.0
-
-    return obs

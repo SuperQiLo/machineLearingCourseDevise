@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from collections import deque
 from pathlib import Path
 from typing import Callable, Deque, Dict, List, Optional
@@ -46,12 +45,12 @@ class RainbowTrainer:
             death_penalty=config.death_penalty,
             kill_reward=config.kill_reward,
             distance_shaping_scale=config.distance_shaping_scale,
+            repetition_penalty=config.repetition_penalty,
         )
         self.envs: List[MultiSnakeEnv] = [
             MultiSnakeEnv(config=env_cfg, seed=12345 + i) for i in range(config.num_envs)
         ]
         self.progress_cb = progress_cb
-        self.best_score = -math.inf
 
         self._episode_returns: Deque[float] = deque(maxlen=200)
 
@@ -64,13 +63,6 @@ class RainbowTrainer:
         episode = 0
         epsilon = self.cfg.epsilon_start
         last_loss = 0.0
-
-        if self.cfg.resume:
-            loaded = self._try_load_training_checkpoint()
-            if loaded is not None:
-                frame, episode, epsilon, self.best_score, last_loss = loaded
-                obs_envs = [env.reset() for env in self.envs]
-                episode_scores.fill(0.0)
 
         while frame < self.cfg.total_frames:
             # 先为每个 env 生成动作，再 step，写 replay
@@ -145,11 +137,9 @@ class RainbowTrainer:
 
             if frame % self.cfg.save_interval == 0:
                 self.agent.save(self.cfg.checkpoint_path())
-                self._save_training_checkpoint(frame, episode, epsilon, last_loss)
 
         final_path = self._final_path()
         self.agent.save(final_path)
-        self._save_training_checkpoint(frame, episode, epsilon, last_loss)
         return final_path
 
     def _prefix(self) -> str:
@@ -162,49 +152,6 @@ class RainbowTrainer:
     def _final_path(self) -> Path:
         return self.cfg.checkpoint_path().with_name(f"{self._prefix()}_final.pth")
 
-    def _save_training_checkpoint(self, frame: int, episode: int, epsilon: float, last_loss: float) -> None:
-        path = self.cfg.trainer_checkpoint_path()
-        payload = {
-            "frame": int(frame),
-            "episode": int(episode),
-            "epsilon": float(epsilon),
-            "best_score": float(self.best_score),
-            "last_loss": float(last_loss),
-            "online_state": self.agent.online_net.state_dict(),
-            "target_state": self.agent.target_net.state_dict(),
-            "optimizer_state": self.agent.optimizer.state_dict(),
-            "replay_state": self.replay.state_dict(),
-        }
-        torch.save(payload, path)
 
-    def _try_load_training_checkpoint(self) -> Optional[tuple[int, int, float, float, float]]:
-        path = self.cfg.trainer_checkpoint_path()
-        if not path.exists():
-            return None
-
-        kwargs = {"map_location": self.device}
-        try:
-            payload = torch.load(path, weights_only=False, **kwargs)  # type: ignore[arg-type]
-        except TypeError:
-            payload = torch.load(path, **kwargs)
-
-        if not isinstance(payload, dict):
-            return None
-
-        self.agent.online_net.load_state_dict(payload.get("online_state", {}))
-        self.agent.target_net.load_state_dict(payload.get("target_state", {}))
-        opt_state = payload.get("optimizer_state")
-        if opt_state:
-            self.agent.optimizer.load_state_dict(opt_state)
-        replay_state = payload.get("replay_state")
-        if isinstance(replay_state, dict):
-            self.replay.load_state_dict(replay_state)
-
-        frame = int(payload.get("frame", 0))
-        episode = int(payload.get("episode", 1))
-        epsilon = float(payload.get("epsilon", self.cfg.epsilon_start))
-        best_score = float(payload.get("best_score", self.best_score))
-        last_loss = float(payload.get("last_loss", 0.0))
-        return frame, episode, epsilon, best_score, last_loss
 
         

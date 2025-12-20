@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
 from env.config import EnvConfig
@@ -23,7 +23,7 @@ class RoomConfig:
     num_snakes: int = 4
     num_food: int = 6
     max_steps: int = 1500
-    tick_rate: float = 0.12
+    tick_rate: float = 0.08
 
     @classmethod
     def from_request(cls, raw: dict) -> "RoomConfig":
@@ -38,7 +38,7 @@ class RoomConfig:
         requested_snakes = _int("num_snakes", 4, minimum=1)
         num_food = _int("num_food", 6, minimum=1)
         max_steps = _int("max_steps", 1500, minimum=100)
-        tick_rate: float = float(raw.get("tick_rate", 0.12))
+        tick_rate: float = float(raw.get("tick_rate", 0.08))
         return cls(
             grid_size=grid_size,
             num_snakes=requested_snakes,
@@ -76,7 +76,7 @@ class ClientSession:
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
     room_id: Optional[str] = None
-    pending_action: int = 0
+    action_queue: List[int] = field(default_factory=list)
 
 
 class BaseRoom:
@@ -214,7 +214,7 @@ class BattleRoom(BaseRoom):
                 now = asyncio.get_event_loop().time()
                 if self.countdown_until is not None and now < self.countdown_until:
                     await self._broadcast_state(countdown_remaining=self.countdown_until - now)
-                    await asyncio.sleep(self.tick_rate)
+                    await asyncio.sleep(min(0.05, self.tick_rate))
                     continue
                 if self.countdown_until is not None and now >= self.countdown_until:
                     self.countdown_until = None
@@ -248,8 +248,10 @@ class BattleRoom(BaseRoom):
             if session is None:
                 actions.append(0)
                 continue
-            action = session.pending_action
-            session.pending_action = 0
+            if session.action_queue:
+                action = session.action_queue.pop(0)
+            else:
+                action = 0  # Straight
             actions.append(action)
         return actions
 
@@ -581,7 +583,9 @@ class CloudGameServer:
         elif mtype == "leave_room":
             await self._leave_room(session)
         elif mtype == "action":
-            session.pending_action = int(payload.get("value", 0))
+            session.action_queue.append(int(payload.get("value", 0)))
+            if len(session.action_queue) > 3:  # 限制队列长度防止过度积压
+                session.action_queue.pop(0)
         elif mtype == "set_role":
             await self._set_role(session, payload.get("role"))
         elif mtype == "set_ready":

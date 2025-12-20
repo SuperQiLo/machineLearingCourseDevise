@@ -40,7 +40,7 @@ def parse_args() -> EvalConfig:
     parser.add_argument("--grid-size", type=int, default=30, help="棋盘边长")
     parser.add_argument("--num-snakes", type=int, default=2, help="场上蛇数量，至少 2 条")
     parser.add_argument("--num-food", type=int, default=8, help="食物数量")
-    parser.add_argument("--tick", type=float, default=0.12, help="环境步进间隔（秒）")
+    parser.add_argument("--tick", type=float, default=0.08, help="环境步进间隔（秒）")
     parser.add_argument(
         "--human-slot",
         type=int,
@@ -99,7 +99,7 @@ class LocalGameAdapter(GameClientProtocol):
         self.human_slot = config.human_slot
         self.ai_slots = tuple(slot for slot in config.ai_slots if slot != self.human_slot)
 
-        self.pending_human_action = 0
+        self.human_action_queue: List[int] = []
         self.last_obs: List = self.env.reset()
         self.scores: List[float] = [0.0 for _ in range(self.env.num_snakes)]
         self.countdown_until = time.time() + 3.0
@@ -115,7 +115,9 @@ class LocalGameAdapter(GameClientProtocol):
     def send_action(self, action: int) -> None:
         if self.human_slot is None:
             return
-        self.pending_human_action = int(action)
+        self.human_action_queue.append(int(action))
+        if len(self.human_action_queue) > 3:
+            self.human_action_queue.pop(0)
 
     def run_loop(self) -> None:
         self._running = True
@@ -128,8 +130,13 @@ class LocalGameAdapter(GameClientProtocol):
                     time.sleep(min(self.cfg.tick_rate, 0.05))
                     continue
                 self.countdown_until = None
+            # 优化 Tick 频率：仅在步进耗时低于设定间隔时进行休眠
+            step_start_time = time.time()
             self.step_once()
-            time.sleep(self.cfg.tick_rate)
+            step_duration = time.time() - step_start_time
+            sleep_time = self.cfg.tick_rate - step_duration
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
     def stop(self) -> None:
         self._running = False
@@ -141,8 +148,10 @@ class LocalGameAdapter(GameClientProtocol):
 
         if self.human_slot is not None and self.human_slot < self.env.num_snakes:
             if self.env.snakes[self.human_slot]["alive"]:
-                actions[self.human_slot] = self.pending_human_action
-        self.pending_human_action = 0
+                if self.human_action_queue:
+                    actions[self.human_slot] = self.human_action_queue.pop(0)
+                else:
+                    actions[self.human_slot] = 0
 
         if self.agent:
             self.agent.net.eval()

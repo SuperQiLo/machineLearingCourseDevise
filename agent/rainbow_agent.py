@@ -28,14 +28,14 @@ class RainbowAgent(BaseAgent):
         self.action_dim = 3
 
         self.online_net = RainbowBackbone(
-            input_channels=int(getattr(config, "obs_channels", 10)),
-            grid_size=config.grid_size,
+            input_channels=int(getattr(config, "obs_channels", 3)),
+            obs_size=getattr(config, "obs_size", 84),
             action_dim=self.action_dim,
             atom_size=config.atom_size,
         ).to(self.device)
         self.target_net = RainbowBackbone(
-            input_channels=int(getattr(config, "obs_channels", 10)),
-            grid_size=config.grid_size,
+            input_channels=int(getattr(config, "obs_channels", 3)),
+            obs_size=getattr(config, "obs_size", 84),
             action_dim=self.action_dim,
             atom_size=config.atom_size,
         ).to(self.device)

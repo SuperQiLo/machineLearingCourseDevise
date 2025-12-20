@@ -50,25 +50,19 @@ README.md
    若你看到 `ModuleNotFoundError: No module named 'torch'`，说明当前 Python 环境没装上 PyTorch。
    - CPU 版本可直接：`pip install torch`
    - GPU 版本请按 PyTorch 官方安装指引选择对应 CUDA 轮子（不同机器/驱动不同）。
+   
+   **注意**：本项目使用 `pygame` 进行无需显示器的图像渲染，请确保已安装 `pygame`。
 
-2. 训练 A2C：
+2. 训练 A2C (图像输入版)：
    ```bat
    python a2c_train.py
-   :: 或双击 scripts\run_a2c_train.bat
+   :: 或双击 scripts\run_a2c_train.bat (需自行更新脚本内容)
    ```
-   课程式训练（推荐，更容易收敛且不容易学成转圈）：
-   ```bat
-   python a2c_curriculum_train.py
-   ```
-   说明：课程训练的最终阶段会在 `30x30` 地图上训练。
-3. 训练 Rainbow：
+   说明：现在训练默认使用 84x84 的 RGB 图像作为输入，不再使用网格特征。
+
+3. 训练 Rainbow (图像输入版)：
    ```bat
    python rainbow_train.py
-   :: 或双击 scripts\run_rainbow_train.bat
-   ```
-   课程式训练（推荐）：
-   ```bat
-   python rainbow_curriculum_train.py
    ```
 4. 本地评估/演示（会打开渲染器）：
    ```bat

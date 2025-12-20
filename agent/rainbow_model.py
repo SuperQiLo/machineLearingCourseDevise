@@ -101,8 +101,8 @@ class RainbowBackbone(nn.Module):
 
     def __init__(
         self,
-        input_channels: int = 6,  # 增强的观测通道数
-        grid_size: int = 30,
+        input_channels: int = 3,  # RGB 观测通道数
+        obs_size: int = 84,
         action_dim: int = 3,
         atom_size: int = 51,
     ) -> None:
@@ -111,7 +111,7 @@ class RainbowBackbone(nn.Module):
         self.atom_size = atom_size
 
         # 采样网格大小以自动推导展平维度
-        dummy = torch.zeros(1, input_channels, grid_size, grid_size)
+        dummy = torch.zeros(1, input_channels, obs_size, obs_size)
 
         # 增强的编码器
         self.stem = nn.Sequential(

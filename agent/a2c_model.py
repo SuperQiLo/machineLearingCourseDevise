@@ -45,14 +45,14 @@ class A2CBackbone(nn.Module):
     def __init__(
         self,
         input_channels: int = 3,
-        grid_size: int = 30,
+        obs_size: int = 84,
         action_dim: int = 3,
     ) -> None:
         super().__init__()
         self.action_dim = action_dim
-        self.grid_size = grid_size
+        self.obs_size = obs_size
 
-        dummy = torch.zeros(1, input_channels, grid_size, grid_size)
+        dummy = torch.zeros(1, input_channels, obs_size, obs_size)
 
         # 初始特征提取
         self.stem = nn.Sequential(

@@ -473,7 +473,7 @@ class ClientWindow(QMainWindow):
         self.steps_spin.setValue(1500)
         self.tick_spin = QSpinBox()
         self.tick_spin.setRange(1, 500)
-        self.tick_spin.setValue(120)
+        self.tick_spin.setValue(80)
         self.tick_spin.setSuffix(" ms")
         self.create_btn = QPushButton("创建房间")
         self.create_btn.clicked.connect(self._create_room)
