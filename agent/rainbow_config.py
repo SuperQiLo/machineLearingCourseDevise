@@ -43,6 +43,10 @@ class RainbowConfig:
     replay_capacity: int = 500_000     # 经验池容量
     lr: float = 1e-4                   # 学习率
 
+    # ==================== 性能/显存参数 ====================
+    # 0 表示自动：根据显存粗估初值，并在 OOM 时自动二分回退
+    train_micro_batch_size: int = 0    # 将 DQN batch 分块训练，降低单次前向/反向显存峰值
+
     # ==================== C51 分布式 RL 参数 ====================
     atom_size: int = 51                # 价值分布的支撑点数量
     v_min: float = -10.0               # 价值分布的最小值

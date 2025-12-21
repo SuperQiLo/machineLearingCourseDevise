@@ -147,7 +147,12 @@ class A2CAgent(BaseAgent):
         device = self.device
         gamma = self.cfg.gamma
 
-        states = torch.as_tensor(batch.states, dtype=torch.float32, device=device)  # (T,N,C,W,H)
+        # 注意：这里的 (T*N) 可能很大（例如 256*128=32768），如果一次性喂入 CNN，
+        # cuDNN 可能为卷积选择需要超大 workspace 的算法而导致 OOM。
+        # 因此将前向/反向拆成 micro-batch 累积梯度。
+
+        # states 留在 CPU，按块搬运到 GPU，显著降低峰值显存
+        states_cpu = torch.as_tensor(batch.states, dtype=torch.float32, device="cpu")  # (T,N,C,W,H)
         actions = torch.as_tensor(batch.actions, dtype=torch.long, device=device)  # (T,N)
         rewards = torch.as_tensor(batch.rewards, dtype=torch.float32, device=device)  # (T,N)
         dones = torch.as_tensor(batch.dones, dtype=torch.float32, device=device)  # (T,N)
@@ -156,65 +161,138 @@ class A2CAgent(BaseAgent):
         last_state = torch.as_tensor(batch.last_state, dtype=torch.float32, device=device)  # (N,C,W,H)
         last_done = torch.as_tensor(batch.last_done, dtype=torch.float32, device=device)  # (N,)
 
-        T, N = states.shape[0], states.shape[1]
+        T, N = int(states_cpu.shape[0]), int(states_cpu.shape[1])
+        total = T * N
+        flat_states_cpu = states_cpu.view(total, *states_cpu.shape[2:])
 
-        flat_states = states.view(T * N, *states.shape[2:])
-        logits, values_pred = self.net(flat_states)
-        logits = logits.view(T, N, -1)
-        values_pred = values_pred.view(T, N)
+        def _initial_micro_bs() -> int:
+            cfg_mb = int(getattr(self.cfg, "train_micro_batch_size", 0))
+            if cfg_mb > 0:
+                return min(cfg_mb, total)
 
-        dist = torch.distributions.Categorical(logits=logits)
-        log_probs = dist.log_prob(actions)  # (T,N)
-        entropy = dist.entropy()  # (T,N)
+            # auto：用可用显存给一个保守初值，再依赖 OOM 回退兜底
+            # 这里不尝试精确建模激活/工作区，只做“合理起步 + 失败自动二分”。
+            start = min(total, 2048)
+            if device.type == "cuda" and torch.cuda.is_available():
+                try:
+                    free_bytes, _ = torch.cuda.mem_get_info(device)
+                    free_gb = float(free_bytes) / (1024.0 ** 3)
+                    # 经验：每 GB 给 ~256 个样本的起步上限，并做硬上限保护
+                    start = min(total, max(start, int(free_gb * 256)))
+                    start = min(start, 8192)
+                except Exception:
+                    pass
+            return max(64, int(start))
 
-        with torch.no_grad():
-            _, last_value = self.net(last_state)
-            last_value = last_value * (1.0 - last_done)
+        def _empty_cuda_cache() -> None:
+            if device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-            if self.cfg.use_gae:
-                # 使用GAE计算优势
-                advantages, returns = self.compute_gae(
-                    rewards, values_pred.detach(), dones, last_value,
-                    gamma, self.cfg.gae_lambda
-                )
-            else:
-                # 传统的n-step回报
-                returns = torch.zeros((T, N), dtype=torch.float32, device=device)
-                running = last_value
-                for t in range(T - 1, -1, -1):
-                    running = rewards[t] + gamma * running * (1.0 - dones[t])
-                    returns[t] = running
-                advantages = returns - values_pred.detach()
+        def _compute_values_pred(micro_bs: int) -> torch.Tensor:
+            values_pred_flat = torch.empty((total,), dtype=torch.float32, device=device)
+            with torch.no_grad():
+                for start in range(0, total, micro_bs):
+                    end = min(total, start + micro_bs)
+                    x = flat_states_cpu[start:end].to(device, non_blocking=False)
+                    _, v = self.net(x)
+                    values_pred_flat[start:end] = v
+            return values_pred_flat.view(T, N)
 
-            # 标准化优势 - 减少方差
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        def _backward_update(
+            micro_bs: int,
+            advantages: torch.Tensor,
+            returns: torch.Tensor,
+            valid: torch.Tensor,
+            valid_count: int,
+        ) -> float:
+            flat_actions = actions.view(-1)
+            flat_adv = advantages.view(-1)
+            flat_returns = returns.view(-1)
 
-        valid = masks.view(-1) > 0.0
-        if valid.sum().item() == 0:
-            return 0.0, None
+            self.optimizer.zero_grad(set_to_none=True)
+            total_loss_value = 0.0
+            denom = float(valid_count)
 
-        flat_log_probs = log_probs.view(-1)[valid]
-        flat_adv = advantages.view(-1)[valid]
-        flat_entropy = entropy.view(-1)[valid]
-        flat_values = values_pred.view(-1)[valid]
-        flat_returns = returns.view(-1)[valid]
+            for start in range(0, total, micro_bs):
+                end = min(total, start + micro_bs)
+                mb_valid = valid[start:end]
+                if not bool(mb_valid.any().item()):
+                    continue
 
-        policy_loss = -(flat_log_probs * flat_adv).mean()
-        value_loss = F.smooth_l1_loss(flat_values, flat_returns)  # 使用Huber loss更稳定
-        entropy_loss = -flat_entropy.mean()
+                x = flat_states_cpu[start:end].to(device, non_blocking=False)
+                logits_mb, values_mb = self.net(x)
+                dist_mb = torch.distributions.Categorical(logits=logits_mb)
 
-        loss = policy_loss + self.cfg.value_coef * value_loss + self.cfg.entropy_coef * entropy_loss
+                act_mb = flat_actions[start:end]
+                adv_mb = flat_adv[start:end]
+                ret_mb = flat_returns[start:end]
 
-        self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.cfg.max_grad_norm)
-        self.optimizer.step()
-        
-        # 更新学习率
-        if self.scheduler is not None:
-            self.scheduler.step()
+                logp_mb = dist_mb.log_prob(act_mb)
+                ent_mb = dist_mb.entropy()
 
-        return float(loss.item()), None
+                policy_term = -((logp_mb[mb_valid] * adv_mb[mb_valid]).sum() / denom)
+                value_term = F.smooth_l1_loss(values_mb[mb_valid], ret_mb[mb_valid], reduction="sum") / denom
+                entropy_term = -(ent_mb[mb_valid].sum() / denom)
+
+                loss_mb = policy_term + self.cfg.value_coef * value_term + self.cfg.entropy_coef * entropy_term
+                total_loss_value += float(loss_mb.detach().item())
+                loss_mb.backward()
+
+            torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.cfg.max_grad_norm)
+            self.optimizer.step()
+            if self.scheduler is not None:
+                self.scheduler.step()
+            return float(total_loss_value)
+
+        # -------------------- 自适应 micro-batch：OOM 时自动二分回退重试 --------------------
+        micro_bs = _initial_micro_bs()
+        last_oom: Exception | None = None
+        cfg_mb_raw = int(getattr(self.cfg, "train_micro_batch_size", 0))
+
+        for _ in range(8):
+            try:
+                values_pred = _compute_values_pred(micro_bs)
+
+                with torch.no_grad():
+                    _, last_value = self.net(last_state)
+                    last_value = last_value * (1.0 - last_done)
+
+                    if self.cfg.use_gae:
+                        advantages, returns = self.compute_gae(
+                            rewards, values_pred, dones, last_value, gamma, self.cfg.gae_lambda
+                        )
+                    else:
+                        returns = torch.zeros((T, N), dtype=torch.float32, device=device)
+                        running = last_value
+                        for t in range(T - 1, -1, -1):
+                            running = rewards[t] + gamma * running * (1.0 - dones[t])
+                            returns[t] = running
+                        advantages = returns - values_pred
+
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+                valid = masks.view(-1) > 0.0
+                valid_count = int(valid.sum().item())
+                if valid_count == 0:
+                    return 0.0, None
+
+                loss_value = _backward_update(micro_bs, advantages, returns, valid, valid_count)
+                mode = "auto" if cfg_mb_raw <= 0 else "fixed"
+                print(f"[A2C] micro_bs({mode}) = {micro_bs}", flush=True)
+                return float(loss_value), None
+
+            except torch.OutOfMemoryError as e:
+                last_oom = e
+                _empty_cuda_cache()
+                # 二分回退；确保最终至少为 1
+                micro_bs = max(1, micro_bs // 2)
+                if micro_bs == 1:
+                    break
+
+        # 如果自动回退也失败，抛出最后一次 OOM
+        if last_oom is not None:
+            raise last_oom
+        raise RuntimeError("A2C train_step failed unexpectedly")
 
     def evaluate_actions(self, states: torch.Tensor, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """可选的评估接口：返回 (log_probs, entropy, values)。"""

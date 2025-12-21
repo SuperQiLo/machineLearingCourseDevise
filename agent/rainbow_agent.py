@@ -99,10 +99,12 @@ class RainbowAgent(BaseAgent):
         if not isinstance(batch, TransitionBatch):
             raise TypeError("batch must be a TransitionBatch")
         
-        start_states = torch.as_tensor(batch.states, dtype=torch.float32, device=device)
+        # states/next_states 可能很大；为降低峰值显存，先放 CPU，再按 micro-batch 搬运
+        start_states_cpu = torch.as_tensor(batch.states, dtype=torch.float32, device="cpu")
+        next_states_cpu = torch.as_tensor(batch.next_states, dtype=torch.float32, device="cpu")
+
         actions = torch.as_tensor(batch.actions, dtype=torch.long, device=device).unsqueeze(-1)
         rewards = torch.as_tensor(batch.rewards, dtype=torch.float32, device=device)
-        next_states = torch.as_tensor(batch.next_states, dtype=torch.float32, device=device)
         dones = torch.as_tensor(batch.dones, dtype=torch.float32, device=device)
         
         # Handle weights
@@ -113,52 +115,114 @@ class RainbowAgent(BaseAgent):
         else:
             weights_t = torch.as_tensor(weights, dtype=torch.float32, device=device)
 
-        self.online_net.reset_noise()
-        self.target_net.reset_noise()
+        batch_size = int(start_states_cpu.shape[0])
+        atom_size = int(self.cfg.atom_size)
 
-        # 当前动作对应的分布
-        advantage, value = self.online_net(start_states)
-        dist = self._logits_to_dist(advantage, value)
-        action_dist = dist.gather(1, actions.unsqueeze(-1).expand(-1, 1, self.cfg.atom_size)).squeeze(1)
-        action_dist = torch.clamp(action_dist, min=1e-6)
+        def _initial_micro_bs() -> int:
+            cfg_mb = int(getattr(self.cfg, "train_micro_batch_size", 0))
+            if cfg_mb > 0:
+                return min(cfg_mb, batch_size)
+            start = min(batch_size, 512)
+            if device.type == "cuda" and torch.cuda.is_available():
+                try:
+                    free_bytes, _ = torch.cuda.mem_get_info(device)
+                    free_gb = float(free_bytes) / (1024.0 ** 3)
+                    start = min(batch_size, max(start, int(free_gb * 128)))
+                    start = min(start, 4096)
+                except Exception:
+                    pass
+            return max(32, int(start))
 
-        with torch.no_grad():
-            next_advantage, next_value = self.online_net(next_states)
-            next_dist = self._logits_to_dist(next_advantage, next_value)
-            next_q = torch.sum(next_dist * self.support, dim=-1)
-            next_actions = next_q.argmax(dim=1, keepdim=True)
+        def _empty_cuda_cache() -> None:
+            if device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-            target_advantage, target_value = self.target_net(next_states)
-            target_dist_full = self._logits_to_dist(target_advantage, target_value)
-            target_dist = target_dist_full.gather(
-                1,
-                next_actions.unsqueeze(-1).expand(-1, 1, self.cfg.atom_size),
-            ).squeeze(1)
+        micro_bs = _initial_micro_bs()
+        cfg_mb_raw = int(getattr(self.cfg, "train_micro_batch_size", 0))
+        last_oom: Exception | None = None
 
-            t_z = rewards.unsqueeze(1) + (self.cfg.gamma**self.cfg.multi_step) * (1.0 - dones.unsqueeze(1)) * self.support
-            t_z = t_z.clamp(self.cfg.v_min, self.cfg.v_max)
-            b = (t_z - self.cfg.v_min) / self.delta_z
-            l = b.floor().long()
-            u = b.ceil().long()
-            l = l.clamp(0, self.cfg.atom_size - 1)
-            u = u.clamp(0, self.cfg.atom_size - 1)
+        for _ in range(8):
+            try:
+                # 固定一次 update 内的噪声（不要在 micro-batch 内重复 reset）
+                self.online_net.reset_noise()
+                self.target_net.reset_noise()
 
-            proj_dist = torch.zeros_like(target_dist)
-            batch_range = torch.arange(target_dist.size(0), device=device).unsqueeze(1) * self.cfg.atom_size
-            proj_dist.view(-1).index_add_(0, (l + batch_range).view(-1), (target_dist * (u.float() - b)).view(-1))
-            proj_dist.view(-1).index_add_(0, (u + batch_range).view(-1), (target_dist * (b - l.float())).view(-1))
+                self.optimizer.zero_grad(set_to_none=True)
+                td_errors = torch.empty((batch_size,), dtype=torch.float32, device=device)
 
-        loss = -torch.sum(proj_dist * torch.log(action_dist), dim=1)
-        loss = (loss * weights_t).mean()
+                # 以全 batch 的 mean 为目标：sum(loss_i * w_i) / B
+                denom = float(batch_size)
+                total_loss_value = 0.0
 
-        self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.online_net.parameters(), 10.0)
-        self.optimizer.step()
+                for start in range(0, batch_size, micro_bs):
+                    end = min(batch_size, start + micro_bs)
+                    mb = end - start
 
-        td_errors = torch.abs(torch.sum((proj_dist - action_dist), dim=1)).detach()
+                    s_x = start_states_cpu[start:end].to(device, non_blocking=False)
+                    a_mb = actions[start:end]
 
-        return loss.item(), td_errors
+                    # 当前动作分布（带梯度）
+                    adv, val = self.online_net(s_x)
+                    dist = self._logits_to_dist(adv, val)
+                    action_dist = dist.gather(1, a_mb.unsqueeze(-1).expand(-1, 1, atom_size)).squeeze(1)
+                    action_dist = torch.clamp(action_dist, min=1e-6)
+
+                    # 目标投影（无梯度）
+                    with torch.no_grad():
+                        ns_x = next_states_cpu[start:end].to(device, non_blocking=False)
+                        r_mb = rewards[start:end]
+                        d_mb = dones[start:end]
+                        w_mb = weights_t[start:end]
+
+                        next_adv, next_val = self.online_net(ns_x)
+                        next_dist = self._logits_to_dist(next_adv, next_val)
+                        next_q = torch.sum(next_dist * self.support, dim=-1)
+                        next_actions = next_q.argmax(dim=1, keepdim=True)
+
+                        tar_adv, tar_val = self.target_net(ns_x)
+                        tar_dist_full = self._logits_to_dist(tar_adv, tar_val)
+                        tar_dist = tar_dist_full.gather(
+                            1,
+                            next_actions.unsqueeze(-1).expand(-1, 1, atom_size),
+                        ).squeeze(1)
+
+                        t_z = r_mb.unsqueeze(1) + (self.cfg.gamma**self.cfg.multi_step) * (1.0 - d_mb.unsqueeze(1)) * self.support
+                        t_z = t_z.clamp(self.cfg.v_min, self.cfg.v_max)
+                        b = (t_z - self.cfg.v_min) / self.delta_z
+                        l = b.floor().long().clamp(0, atom_size - 1)
+                        u = b.ceil().long().clamp(0, atom_size - 1)
+
+                        proj_dist = torch.zeros((mb, atom_size), dtype=torch.float32, device=device)
+                        batch_range = torch.arange(mb, device=device).unsqueeze(1) * atom_size
+                        proj_dist.view(-1).index_add_(0, (l + batch_range).view(-1), (tar_dist * (u.float() - b)).view(-1))
+                        proj_dist.view(-1).index_add_(0, (u + batch_range).view(-1), (tar_dist * (b - l.float())).view(-1))
+
+                    # 交叉熵：-sum(proj * log(p))，并按 weights 加权
+                    per_sample = -torch.sum(proj_dist * torch.log(action_dist), dim=1)
+                    loss_mb = (per_sample * w_mb).sum() / denom
+                    total_loss_value += float(loss_mb.detach().item())
+                    loss_mb.backward()
+
+                    td_errors[start:end] = torch.abs(torch.sum(proj_dist - action_dist.detach(), dim=1))
+
+                torch.nn.utils.clip_grad_norm_(self.online_net.parameters(), 10.0)
+                self.optimizer.step()
+
+                mode = "auto" if cfg_mb_raw <= 0 else "fixed"
+                print(f"[Rainbow] micro_bs({mode}) = {micro_bs}", flush=True)
+
+                return float(total_loss_value), td_errors.detach().cpu().numpy()
+
+            except torch.OutOfMemoryError as e:
+                last_oom = e
+                _empty_cuda_cache()
+                micro_bs = max(1, micro_bs // 2)
+                if micro_bs == 1:
+                    break
+
+        if last_oom is not None:
+            raise last_oom
+        raise RuntimeError("Rainbow train_step failed unexpectedly")
 
     def sync_target(self) -> None:
         """将在线网络的权重复制到目标网络。"""
