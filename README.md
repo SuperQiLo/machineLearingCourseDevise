@@ -48,7 +48,7 @@ python gui_game.py --mode single --human
 python gui_game.py --mode single --algo dqn --model agent/checkpoints/dqn_best.pth
 
 # 观看 PPO 混战 (4蛇互搏)
-python gui_game.py --mode battle --algo ppo --model agent/checkpoints/ppo_battle_final.pth
+python gui_game.py --mode battle --algo ppo --model agent/checkpoints/ppo_battle_best.pth
 ```
 
 ### 3. 模型训练

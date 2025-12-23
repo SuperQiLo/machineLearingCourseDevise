@@ -238,7 +238,7 @@ class MainWindow(QMainWindow):
             algo = self.algo_combo.currentText().lower()
             try:
                 # Use Factory
-                self.agent = get_agent(algo, 15, str(path))
+                self.agent = get_agent(algo, 24, str(path))
                 self.ai_timer.start(50)
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to load agent: {e}")
@@ -284,6 +284,11 @@ class MainWindow(QMainWindow):
         if self.mode_combo.currentText() != "Human": return
         
         key = event.key()
+        if key == Qt.Key.Key_Space:
+            if self.player_id != -1:
+                self.net_thread.send({"type": "ACTION", "action": 3}) # DASH
+            return
+
         target = None
         if key == Qt.Key.Key_Up: target = Direction.UP
         elif key == Qt.Key.Key_Down: target = Direction.DOWN
@@ -291,9 +296,8 @@ class MainWindow(QMainWindow):
         elif key == Qt.Key.Key_Right: target = Direction.RIGHT
         
         if target is not None and self.player_id != -1:
-             # Logic to infer relative action
-             # Need current direction of OUR snake
-             if self.player_id >= len(self.board.snakes): return # Not spawned yet or sync issue
+             # ... (direction logic stays same)
+             if self.player_id >= len(self.board.snakes): return
              
              s = self.board.snakes[self.player_id]
              if len(s) >= 2:
@@ -314,30 +318,14 @@ class MainWindow(QMainWindow):
     def ai_step(self):
         if self.player_id == -1 or not self.agent: return
         if self.player_id >= len(self.board.snakes): return
-        if self.board.dead[self.player_id]: return # AI dead
+        if self.player_id < len(self.board.dead) and self.board.dead[self.player_id]: return
         
         # Sync dummy env
         self.dummy_env.snakes = [ [tuple(x) for x in s] for s in self.board.snakes ]
-        self.dummy_env.foods = self.board.food # renderer.py stores list in self.food
+        self.dummy_env.foods = self.board.food
         self.dummy_env.dead = self.board.dead
         
         # Infer directions for obs
-        # Note: renderer.py stores snakes simply, but environment needs directions to build Obs
-        # We must re-infer directions for ALL snakes from their body positions
-        for i, s in enumerate(self.dummy_env.snakes):
-            if len(s) >= 2:
-                h, n = s[0], s[1]
-                if h[0] == n[0] and h[1] < n[1]: self.dummy_env.directions.append(Direction.UP)
-                elif h[0] == n[0] and h[1] > n[1]: self.dummy_env.directions.append(Direction.DOWN)
-                elif h[0] < n[0] and h[1] == n[1]: self.dummy_env.directions.append(Direction.LEFT)
-                elif h[0] > n[0] and h[1] == n[1]: self.dummy_env.directions.append(Direction.RIGHT)
-                else: self.dummy_env.directions.append(Direction.UP)
-            else:
-                self.dummy_env.directions.append(Direction.UP)
-        
-        # Only keep last N (since we append above inside loop, need to clear first?)
-        # BattleSnakeEnv.__init__ inits directions as empty list.
-        # But we reused instance. We should clear directions before appending.
         self.dummy_env.directions = []
         for i, s in enumerate(self.dummy_env.snakes):
              if len(s) >= 2:
@@ -350,7 +338,7 @@ class MainWindow(QMainWindow):
              else:
                 self.dummy_env.directions.append(Direction.UP)
 
-        # Get Obs
+        # Get Dict Obs (V3)
         obs = self.dummy_env._get_agent_obs(self.player_id)
         action = self.agent.act(obs)
         self.net_thread.send({"type": "ACTION", "action": action})
