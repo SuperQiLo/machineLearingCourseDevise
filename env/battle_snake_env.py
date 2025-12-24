@@ -33,11 +33,12 @@ class BattleSnakeConfig:
     max_steps: int = 1000        # Increased: Allow longer episodes
     
     # Rewards
-    food_reward: float = 10.0
-    death_penalty: float = -10.0
-    kill_reward: float = 20.0
-    closer_reward: float = 0.2
-    farther_penalty: float = -0.3
+    food_reward: float = 20.0 # High prioritize eating
+    death_penalty: float = -15.0 
+    kill_reward: float = 15.0
+    closer_reward: float = 0.3 # Stronger pull
+    farther_penalty: float = -0.2 # Higher cost for going away
+    step_penalty: float = -0.05 # High cost for time wasting (breaks loops)
 
 class BattleSnakeEnv:
     """Multi-Agent Snake Environment with Multiple Foods."""
@@ -111,14 +112,18 @@ class BattleSnakeEnv:
         return self._get_observations()
 
     def step(self, actions: List[int]) -> Tuple[List[np.ndarray], List[float], List[bool], Dict]:
-        rewards = [0.0] * self.config.num_snakes
+        rewards = [self.config.step_penalty] * self.config.num_snakes
         dones = [False] * self.config.num_snakes
         self.steps += 1
         
         # 0. Pre-process Dash
         move_repeats = [1] * self.config.num_snakes
         for i in range(self.config.num_snakes):
-            if not self.dead[i] and actions[i] == Action.DASH: # DASH
+            if self.dead[i]:
+                rewards[i] = 0.0 # No penalty for dead snakes
+                continue
+                
+            if actions[i] == Action.DASH: # DASH
                 if len(self.snakes[i]) > 3: # Minimum length to dash
                     move_repeats[i] = 2
                     # Penalty for dashing (cost of length)
@@ -232,10 +237,16 @@ class BattleSnakeEnv:
         food_up, food_down, food_left, food_right = 0.0, 0.0, 0.0, 0.0
         if self.foods:
             closest_food = min(self.foods, key=lambda f: abs(head[0]-f[0]) + abs(head[1]-f[1]))
-            food_up = float(closest_food[1] < head[1])
-            food_down = float(closest_food[1] > head[1])
-            food_left = float(closest_food[0] < head[0])
-            food_right = float(closest_food[0] > head[0])
+            # Magnetic food sensing (V3.4)
+            # Signal is strongest when close to 0.
+            # Up/Down
+            dy = head[1] - closest_food[1]
+            if dy > 0: food_up = max(0, 1.0 - dy / self.height)
+            elif dy < 0: food_down = max(0, 1.0 - abs(dy) / self.height)
+            # Left/Right
+            dx = head[0] - closest_food[0]
+            if dx > 0: food_left = max(0, 1.0 - dx / self.width)
+            elif dx < 0: food_right = max(0, 1.0 - abs(dx) / self.width)
         
         # 2. Multi-level Danger & Radar (3 directions: Straight, Left, Right)
         # Directions to check

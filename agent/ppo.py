@@ -86,7 +86,7 @@ class PPOAgent:
         if path.exists():
             state_dict = torch.load(path, map_location=self.device, weights_only=True)
             self.net.load_state_dict(state_dict)
-            print(f"PPO V3 Agent loaded from {path}")
+            # print(f"PPO V3 Agent loaded from {path}") # Commented out to keep console clean
         else:
             print(f"Warning: PPO model not found at {path}")
 

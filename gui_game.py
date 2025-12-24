@@ -23,6 +23,7 @@ class GameWindow(QMainWindow):
                  grid_size=20, human=False, food_count=None):
         super().__init__()
         self.setWindowTitle(f"Battle Snake V3 - {mode.upper()} [{algo.upper()}]")
+        self.resize(1000, 700) # Ensure window is large enough initially
         self.setStyleSheet("background-color: #1e1e2e; color: #cdd6f4; font-family: 'Segoe UI', sans-serif;")
         
         # 1. Setup Env (Unified)

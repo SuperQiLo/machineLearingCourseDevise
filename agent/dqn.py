@@ -65,7 +65,7 @@ class DQNAgent:
         if path.exists():
             state_dict = torch.load(path, map_location=self.device, weights_only=True)
             self.net.load_state_dict(state_dict)
-            print(f"DQN V3 Agent loaded from {path}")
+            # print(f"DQN V3 Agent loaded from {path}")
         else:
             print(f"Warning: DQN model not found at {path}")
 

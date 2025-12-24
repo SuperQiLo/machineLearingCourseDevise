@@ -26,16 +26,15 @@ def run_step(cmd, desc):
 def main():
     print("=== Snake PPO Curriculum Training ===")
     
-    # 1. Phase 1: Pre-train on Single Snake
-    # PPO base learning for basics
-    run_step("train_ppo.py --single --steps 500000", "1. Pre-training (Single Snake)")
+    # 1. Phase 1: Pre-train on Single Snake (Now 1M steps for V3.3)
+    # PPO base learning for navigation & food finding
+    run_step("train_ppo.py --single --steps 1000000", "1. Pre-training (Single Snake)")
     
     # Target: agent/checkpoints/ppo_best.pth
     
-    # 2. Phase 2: Fine-tune on Multi Snake (Battle)
-    # Loading base weights.
-    # Note: Using half steps for fine-tuning as it's harder/slower or just enough.
-    run_step("train_ppo.py --load agent/checkpoints/ppo_best.pth --steps 1000000", "2. Fine-tuning (Battle Mode)")
+    # 2. Phase 2: Fine-tune on Multi Snake (Now 3M-5M steps recommended)
+    # Competitive Self-Play takes time to mature.
+    run_step("train_ppo.py --load agent/checkpoints/ppo_best.pth --steps 3000000", "2. Fine-tuning (Battle Mode with Self-Play)")
     
     print("\n=== PPO Curriculum Completed ===")
     print("Final Model: agent/checkpoints/ppo_battle_best.pth")
