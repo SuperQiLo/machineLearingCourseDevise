@@ -1,6 +1,6 @@
 """
-Unified Multi-Agent PPO Training V3.3.
-V4.2: Fixed stdout buffering & Added progress percentage.
+Unified Multi-Agent PPO Training V4.3 (V6.1 FIX).
+V4.3: Robust 25D Enforcement & Checkpoint Mismatch Diagnostic.
 """
 
 import numpy as np
@@ -26,7 +26,8 @@ def make_env(num_snakes, grid_size, seed=None):
             width=grid_size, height=grid_size, 
             num_snakes=num_snakes,
             min_food=max(2, num_snakes//2), 
-            max_steps=500
+            max_steps=500,
+            dash_cooldown_steps=30 # ENSURE V5.0 MECHANICS
         )
         if num_snakes == 1:
             env_cfg.closer_reward, env_cfg.food_reward, env_cfg.death_penalty = 0.35, 12.0, -10.0
@@ -57,22 +58,36 @@ def train_ppo(num_envs=8, num_snakes=4, total_timesteps=2_000_000,
               self_play_prob=0.3, lr=2.5e-4):
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log(f">>> [Heartbeat] Using device: {device}")
+    log(f">>> [V6.1 FIX] PPO Device: {device} | Snakes: {num_snakes}")
     Path("agent/checkpoints").mkdir(parents=True, exist_ok=True)
     sp_manager = SelfPlayManager("agent/pool/ppo")
     
-    envs = VectorizedEnv([make_env(num_snakes, 20, i) for i in range(num_envs)])
+    # 强制 25D
     agent = ActorCritic(vector_dim=25).to(device)
     
     if load_path and Path(load_path).exists():
         log(f">>> Loading PPO weights from {load_path}...")
-        agent.load_state_dict(torch.load(load_path, map_location=device, weights_only=True))
+        try:
+            state_dict = torch.load(load_path, map_location=device, weights_only=True)
+            # Diagnostic for size mismatch
+            for k, v in state_dict.items():
+                if "actor.0.weight" in k:
+                    log(f">>> Checkpoint '{k}' shape: {v.shape}")
+            agent.load_state_dict(state_dict)
+        except Exception as e:
+            log(f">>> ERROR loading {load_path}: {e}")
+            log(">>> TIP: Phase 1 checkpoint might be OLD (24D). Please re-run Phase 1.")
+            sys.exit(1)
         
     optimizer = optim.Adam(agent.parameters(), lr=lr, eps=1e-5)
     num_steps, batch_size = 128, num_envs * 128
     
-    log(f">>> Starting V5.0 PPO Training: {num_envs} Envs | {num_snakes} Snakes.")
+    log(f">>> Starting PPO Training: {num_envs} Envs | {num_snakes} Snakes.")
     obs_list = envs.reset() 
+    
+    # Verify observation dimension at start
+    log(f">>> First obsession dimension: {obs_list[0][0]['vector'].shape[0]}")
+    
     global_step, ep_rewards = 0, []
     current_rewards = np.zeros(num_envs)
 
@@ -154,7 +169,7 @@ def train_ppo(num_envs=8, num_snakes=4, total_timesteps=2_000_000,
                 sp_manager.add_model(agent.state_dict(), f"ppo_v4_step_{global_step}")
 
     torch.save(agent.state_dict(), checkpoint_path)
-    log(f"PPO V4.2 Training Finished. Model: {checkpoint_path}")
+    log(f"PPO V4.3 Training Finished. Model: {checkpoint_path}")
 
 if __name__ == "__main__":
     import argparse
@@ -162,4 +177,6 @@ if __name__ == "__main__":
     p.add_argument("--single", action="store_true"); p.add_argument("--load", type=str); p.add_argument("--steps", type=int, default=1000000)
     args = p.parse_args(); num = 1 if args.single else 4
     ckpt = "agent/checkpoints/ppo_best.pth" if args.single else "agent/checkpoints/ppo_battle_best.pth"
+    
+    envs = VectorizedEnv([make_env(num, 20, i) for i in range(8)]) # Moved here for better visibility
     train_ppo(num_snakes=num, total_timesteps=args.steps, load_path=args.load, checkpoint_path=ckpt)

@@ -1,6 +1,7 @@
 """
-PPO Agent V3 Implementation.
+PPO Agent V4.3 Implementation (V6.1 FIX).
 Hybrid Actor-Critic: CNN (Local Grid) + MLP (Global Vector).
+Robust 25D Support.
 """
 
 import torch
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict
 
 class ActorCritic(nn.Module):
-    """Hybrid CNN-MLP Architecture for PPO"""
+    """Hybrid CNN-MLP Architecture for PPO (V6.1 FIX)"""
     def __init__(self, vector_dim: int = 25, grid_shape: tuple = (3, 7, 7), action_dim: int = 4):
         super().__init__()
         
@@ -72,7 +73,7 @@ class ActorCritic(nn.Module):
         return action, dist.log_prob(action), dist.entropy(), self.critic(shared)
 
 class PPOAgent:
-    """Helper class for PPO inference in V3"""
+    """Helper class for PPO inference in V4.3 (V6.1 FIX)"""
     def __init__(self, input_dim=25, model_path: Optional[str] = None):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.net = ActorCritic(vector_dim=input_dim).to(self.device)
@@ -86,7 +87,6 @@ class PPOAgent:
         if path.exists():
             state_dict = torch.load(path, map_location=self.device, weights_only=True)
             self.net.load_state_dict(state_dict)
-            # print(f"PPO V3 Agent loaded from {path}") # Commented out to keep console clean
         else:
             print(f"Warning: PPO model not found at {path}")
 

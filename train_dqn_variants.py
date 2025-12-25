@@ -1,5 +1,5 @@
 """
-Unified Trainer for DQN Variants (V5.0).
+Unified Trainer for DQN Variants (V6.1 FIX).
 Supports: DQN, DDQN, PER, Dueling-PER.
 Features: 30-step Cooldown Awareness, 25D Observation.
 """
@@ -78,6 +78,7 @@ class PrioritizedReplayBuffer:
 
     @property
     def size(self):
+        """Fixed AttributeError by exposing size property"""
         return self.tree.size
 
     def push(self, state, action, reward, next_state, done):
@@ -98,8 +99,9 @@ class PrioritizedReplayBuffer:
             
         # Importance Sampling Weights
         weights = np.array(weights)
-        weights = (len(batch) * weights) ** (-self.beta) # Approximation
-        weights /= weights.max()
+        # Fixed AttributeError: 'list' object has no attribute 'size'
+        weights = (len(batch) * weights) ** (-self.beta) 
+        weights /= (weights.max() + 1e-8)
         
         # Unpack
         o_grids = np.array([x[0]['grid'] for x in batch])
@@ -152,7 +154,7 @@ class DQNVariantTrainer:
         if cfg.single_snake:
             cfg.num_snakes = 1
             
-        log(f">>> [Heartbeat] Variant: {cfg.variant.upper()} | Device: {self.device}")
+        log(f">>> [V6.1 FIX] Variant: {cfg.variant.upper()} | Device: {self.device}")
         
         env_cfg = BattleSnakeConfig(num_snakes=cfg.num_snakes, dash_cooldown_steps=30)
         if cfg.num_snakes == 1:
@@ -168,6 +170,7 @@ class DQNVariantTrainer:
         elif cfg.variant == "dueling": self.net_cls = DuelingDQNNet
         else: raise ValueError(f"Unknown variant {cfg.variant}")
         
+        # Explicit 25D Vector Dim
         self.policy_net = self.net_cls(vector_dim=25).to(self.device)
         self.target_net = self.net_cls(vector_dim=25).to(self.device)
         
@@ -194,13 +197,12 @@ class DQNVariantTrainer:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         torch.save(self.policy_net.state_dict(), p)
-        log(f">>> Model saved to {path}")
+        # log(f">>> Model saved to {path}")
 
     def train(self):
         log(f">>> Starting {self.cfg.variant.upper()} Training...")
         obs_batch = [env.reset() for env in self.envs]
         ep_rewards = [0.0] * self.cfg.num_envs
-        ep_counts = [0] * self.cfg.num_envs
         recent_rewards = []
         
         last_log_time = time.time()
@@ -218,8 +220,12 @@ class DQNVariantTrainer:
                         if random.random() < eps: env_acts.append(random.randint(0, 3))
                         else:
                             obs = obs_batch[e_idx][0]
-                            t_g = torch.tensor(obs['grid'], device=self.device).unsqueeze(0)
-                            t_v = torch.tensor(obs['vector'], device=self.device).unsqueeze(0)
+                            # Debug: verify obs shape once
+                            if self.steps == self.cfg.num_envs and e_idx == 0:
+                                log(f">>> Obs Vector Shape: {obs['vector'].shape}")
+                            
+                            t_g = torch.tensor(obs['grid'], dtype=torch.float32, device=self.device).unsqueeze(0)
+                            t_v = torch.tensor(obs['vector'], dtype=torch.float32, device=self.device).unsqueeze(0)
                             with torch.no_grad():
                                 env_acts.append(self.policy_net(t_g, t_v).argmax().item())
                     else: env_acts.append(random.randint(0, 3)) 
@@ -271,7 +277,7 @@ class DQNVariantTrainer:
         # Current Q
         q_curr = self.policy_net(states['grid'], states['vector']).gather(1, actions.unsqueeze(1)).squeeze(1)
         
-        # Next Q (Double DQN Logic for all advanced variants)
+        # Next Q
         with torch.no_grad():
             if self.cfg.variant == "dqn":
                 q_next = self.target_net(next_states['grid'], next_states['vector']).max(1)[0]
