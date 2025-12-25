@@ -76,6 +76,10 @@ class PrioritizedReplayBuffer:
         self.epsilon = 1e-6
         self.max_priority = 1.0
 
+    @property
+    def size(self):
+        return self.tree.size
+
     def push(self, state, action, reward, next_state, done):
         data = (state, action, reward, next_state, done)
         self.tree.add(self.max_priority ** self.alpha, data)
@@ -94,7 +98,7 @@ class PrioritizedReplayBuffer:
             
         # Importance Sampling Weights
         weights = np.array(weights)
-        weights = (batch.size * weights) ** (-self.beta) # Approximation
+        weights = (len(batch) * weights) ** (-self.beta) # Approximation
         weights /= weights.max()
         
         # Unpack
