@@ -237,8 +237,8 @@ class MainWindow(QMainWindow):
 
             algo = self.algo_combo.currentText().lower()
             try:
-                # Use Factory
-                self.agent = get_agent(algo, 24, str(path))
+                # V5 baseline is 25D
+                self.agent = get_agent(algo, 25, str(path))
                 self.ai_timer.start(50)
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to load agent: {e}")
@@ -271,6 +271,12 @@ class MainWindow(QMainWindow):
                 msg.get("dead"),
                 self.player_id
             )
+            # Sync to dummy_env for AI observations (V5.0)
+            self.dummy_env.snakes = [ [tuple(x) for x in s] for s in self.board.snakes ]
+            self.dummy_env.foods = [tuple(f) for f in self.board.food]
+            self.dummy_env.dead = self.board.dead
+            self.dummy_env.dash_cooldowns = msg.get("dash_cooldowns", [0]*4)
+            
             # Scores
             scores = msg.get("scores", [])
             txt = ""
@@ -320,12 +326,7 @@ class MainWindow(QMainWindow):
         if self.player_id >= len(self.board.snakes): return
         if self.player_id < len(self.board.dead) and self.board.dead[self.player_id]: return
         
-        # Sync dummy env
-        self.dummy_env.snakes = [ [tuple(x) for x in s] for s in self.board.snakes ]
-        self.dummy_env.foods = self.board.food
-        self.dummy_env.dead = self.board.dead
-        
-        # Infer directions for obs
+        # Sync directions for obs
         self.dummy_env.directions = []
         for i, s in enumerate(self.dummy_env.snakes):
              if len(s) >= 2:
@@ -338,7 +339,7 @@ class MainWindow(QMainWindow):
              else:
                 self.dummy_env.directions.append(Direction.UP)
 
-        # Get Dict Obs (V3)
+        # Get Dict Obs (V5 expects 25D)
         obs = self.dummy_env._get_agent_obs(self.player_id)
         action = self.agent.act(obs)
         self.net_thread.send({"type": "ACTION", "action": action})

@@ -1,7 +1,6 @@
 """
-DQN Agent V3 Implementation.
-Hybrid Architecture: CNN (Local Grid) + MLP (Global Vector).
-V5.0: Updated to 25D vector (Cooldown).
+Double DQN Agent V5 Implementation.
+Focus: Decoupling action selection and evaluation to reduce Q-value overestimation.
 """
 
 import torch
@@ -10,8 +9,8 @@ import numpy as np
 from pathlib import Path
 from typing import Optional, Dict
 
-class DQNNet(nn.Module):
-    """Hybrid CNN-MLP Architecture for Snake AI"""
+class DDQNNet(nn.Module):
+    """Hybrid CNN-MLP Architecture for Snake AI (DDQN Compatible)"""
     def __init__(self, vector_dim: int = 25, grid_shape: tuple = (3, 7, 7), action_dim: int = 4):
         super().__init__()
         
@@ -49,11 +48,11 @@ class DQNNet(nn.Module):
         combined = torch.cat([cnn_feat, vector], dim=1)
         return self.fc(combined)
 
-class DQNAgent:
-    """Helper class for DQN inference in V3"""
+class DDQNAgent:
+    """Helper class for Double DQN inference"""
     def __init__(self, input_dim: int = 25, model_path: Optional[str] = None):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.net = DQNNet(vector_dim=input_dim).to(self.device)
+        self.net = DDQNNet(vector_dim=input_dim).to(self.device)
         self.net.eval()
         
         if model_path:
@@ -65,10 +64,9 @@ class DQNAgent:
             state_dict = torch.load(path, map_location=self.device, weights_only=True)
             self.net.load_state_dict(state_dict)
         else:
-            print(f"Warning: DQN model not found at {path}")
+            print(f"Warning: DDQN model not found at {path}")
 
     def act(self, obs: Dict[str, np.ndarray]) -> int:
-        """Process dict observation: {'vector': ..., 'grid': ...}"""
         with torch.no_grad():
             t_grid = torch.as_tensor(obs['grid'], dtype=torch.float32, device=self.device).unsqueeze(0)
             t_vec = torch.as_tensor(obs['vector'], dtype=torch.float32, device=self.device).unsqueeze(0)

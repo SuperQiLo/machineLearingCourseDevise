@@ -62,7 +62,7 @@ def train_ppo(num_envs=8, num_snakes=4, total_timesteps=2_000_000,
     sp_manager = SelfPlayManager("agent/pool/ppo")
     
     envs = VectorizedEnv([make_env(num_snakes, 20, i) for i in range(num_envs)])
-    agent = ActorCritic(vector_dim=24).to(device)
+    agent = ActorCritic(vector_dim=25).to(device)
     
     if load_path and Path(load_path).exists():
         log(f">>> Loading PPO weights from {load_path}...")
@@ -71,7 +71,7 @@ def train_ppo(num_envs=8, num_snakes=4, total_timesteps=2_000_000,
     optimizer = optim.Adam(agent.parameters(), lr=lr, eps=1e-5)
     num_steps, batch_size = 128, num_envs * 128
     
-    log(f">>> Starting V4.2 PPO Training: {num_envs} Envs | {num_snakes} Snakes.")
+    log(f">>> Starting V5.0 PPO Training: {num_envs} Envs | {num_snakes} Snakes.")
     obs_list = envs.reset() 
     global_step, ep_rewards = 0, []
     current_rewards = np.zeros(num_envs)
@@ -105,7 +105,7 @@ def train_ppo(num_envs=8, num_snakes=4, total_timesteps=2_000_000,
                     if num_snakes > 1 and random.random() < self_play_prob:
                          for s_idx in range(1, num_snakes):
                              m_p = sp_manager.sample_model()
-                             if m_p: envs.history_agents[i][s_idx] = PPOAgent(input_dim=24, model_path=str(m_p))
+                             if m_p: envs.history_agents[i][s_idx] = PPOAgent(input_dim=25, model_path=str(m_p))
 
             b_grid.append(t_grid); b_vector.append(t_vec); b_acts.append(action)
             b_logprobs.append(logprob); b_values.append(value.flatten())
@@ -118,7 +118,7 @@ def train_ppo(num_envs=8, num_snakes=4, total_timesteps=2_000_000,
             f_g, f_v = [o[0]['grid'] for o in obs_list], [o[0]['vector'] for o in obs_list]
             next_v = agent.get_value(torch.tensor(np.array(f_g), dtype=torch.float32).to(device), torch.tensor(np.array(f_v), dtype=torch.float32).to(device)).reshape(1, -1)
             
-        bg, bv, ba, blp, bval = torch.stack(b_grid).view(-1,3,7,7), torch.stack(b_vector).view(-1,24), torch.stack(b_acts).view(-1), torch.stack(b_logprobs).view(-1), torch.stack(b_values)
+        bg, bv, ba, blp, bval = torch.stack(b_grid).view(-1,3,7,7), torch.stack(b_vector).view(-1,25), torch.stack(b_acts).view(-1), torch.stack(b_logprobs).view(-1), torch.stack(b_values)
         br, bd = torch.stack(b_rewards), torch.stack(b_dones)
         
         advantages = torch.zeros_like(br).to(device)

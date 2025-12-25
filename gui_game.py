@@ -10,11 +10,11 @@ from typing import List, Optional
 import numpy as np
 import torch
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QLabel, QFrame)
+                             QHBoxLayout, QLabel, QFrame, QProgressBar)
 from PyQt6.QtCore import QTimer, Qt
 
 # Import Refactored Modules
-from env.battle_snake_env import BattleSnakeEnv, BattleSnakeConfig, Direction, Action
+from env.battle_snake_env import BattleSnakeEnv, BattleSnakeConfig, Direction, Action, ObservationDict
 from agent import get_agent
 from utils.renderer import GameRenderer, COLORS_SNAKE
 
@@ -22,23 +22,23 @@ class GameWindow(QMainWindow):
     def __init__(self, mode="battle", algo="dqn", model_path=None, fps=10, 
                  grid_size=20, human=False, food_count=None):
         super().__init__()
-        self.setWindowTitle(f"Battle Snake V3 - {mode.upper()} [{algo.upper()}]")
-        self.resize(1000, 700) # Ensure window is large enough initially
+        self.setWindowTitle(f"Battle Snake V5 - {mode.upper()} [{algo.upper()}]")
+        self.resize(1100, 750)
         self.setStyleSheet("background-color: #1e1e2e; color: #cdd6f4; font-family: 'Segoe UI', sans-serif;")
         
-        # 1. Setup Env (Unified)
+        # 1. Setup Env (V5: 25D)
         num_snakes = 1 if mode == "single" else 4
-        if food_count is None:
-            food_count = max(2, num_snakes)
+        if food_count is None: food_count = max(2, num_snakes)
             
         self.env = BattleSnakeEnv(BattleSnakeConfig(
             width=grid_size, height=grid_size, 
             num_snakes=num_snakes,
             min_food=food_count,
-            max_steps=2000
+            max_steps=2000,
+            dash_cooldown_steps=30
         ))
         
-        # 2. Main Layout (Horizontal: Game | HUD)
+        # 2. Main Layout
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QHBoxLayout(main_widget)
@@ -49,7 +49,7 @@ class GameWindow(QMainWindow):
         
         # HUD Panel
         self.hud = QFrame()
-        self.hud.setFixedWidth(200)
+        self.hud.setFixedWidth(250)
         self.hud.setStyleSheet("background-color: #313244; border-radius: 10px; padding: 10px;")
         hud_layout = QVBoxLayout(self.hud)
         
@@ -57,36 +57,46 @@ class GameWindow(QMainWindow):
         title.setStyleSheet("font-weight: bold; font-size: 16px; color: #f5c2e7; margin-bottom: 10px;")
         hud_layout.addWidget(title)
         
-        self.rank_labels = []
+        self.rank_labels: List[QLabel] = []
+        self.cooldown_bars: List[QProgressBar] = []
+        
         for i in range(num_snakes):
             lbl = QLabel(f"P{i}: 0")
             lbl.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {COLORS_SNAKE[i % len(COLORS_SNAKE)].name()};")
             hud_layout.addWidget(lbl)
             self.rank_labels.append(lbl)
             
+            # Cooldown Bar
+            bar = QProgressBar()
+            bar.setFixedHeight(8)
+            bar.setRange(0, 100)
+            bar.setTextVisible(False)
+            bar.setStyleSheet(f"""
+                QProgressBar {{ background-color: #1e1e2e; border-radius: 4px; }}
+                QProgressBar::chunk {{ background-color: {COLORS_SNAKE[i % len(COLORS_SNAKE)].name()}; border-radius: 4px; }}
+            """)
+            hud_layout.addWidget(bar)
+            self.cooldown_bars.append(bar)
+            
         hud_layout.addStretch()
         
         status_title = QLabel("GAME STATUS")
         status_title.setStyleSheet("font-weight: bold; font-size: 14px; color: #94e2d5; margin-top: 20px;")
         hud_layout.addWidget(status_title)
-        
         self.status_label = QLabel("Running...")
         hud_layout.addWidget(self.status_label)
-        
         layout.addWidget(self.hud, stretch=1)
         
         # 3. Agents
         self.agents = [None] * num_snakes
         self.is_human = [False] * num_snakes
-        if human:
-            self.is_human[0] = True
+        if human: self.is_human[0] = True
             
-        # Load AI for non-human slots
         for i in range(num_snakes):
             if not self.is_human[i] and model_path:
                 try:
-                    # In V3, input_dim for vector part is 24
-                    self.agents[i] = get_agent(algo, 24, str(model_path))
+                    # V5 baseline is 25D
+                    self.agents[i] = get_agent(algo, 25, str(model_path))
                 except Exception as e:
                     print(f"Error loading agent for P{i}: {e}")
 
@@ -94,9 +104,8 @@ class GameWindow(QMainWindow):
         self.timer = QTimer()
         self.timer.timeout.connect(self.game_step)
         self.timer.start(int(1000/fps))
-        
         self.obs_list = self.env.reset()
-        self.human_target = None
+        self.human_target: Optional[Direction | str] = None
         
     def reset_game(self):
         self.obs_list = self.env.reset()
@@ -107,24 +116,20 @@ class GameWindow(QMainWindow):
         if key == Qt.Key.Key_Space:
             self.human_target = "DASH"
             return
-            
         target = None
         if key == Qt.Key.Key_Up: target = Direction.UP
         elif key == Qt.Key.Key_Down: target = Direction.DOWN
         elif key == Qt.Key.Key_Left: target = Direction.LEFT
         elif key == Qt.Key.Key_Right: target = Direction.RIGHT
-        
-        if target is not None:
-             self.human_target = target
+        if target is not None: self.human_target = target
 
-    def get_human_action(self, agent_idx):
+    def get_human_action(self, agent_idx: int) -> int:
          target = self.human_target
          if target == "DASH":
              self.human_target = None 
              return 3 # Action.DASH
-             
          curr = self.env.directions[agent_idx]
-         if target is None or target == curr: return 0
+         if target is None or not isinstance(target, Direction) or target == curr: return 0
          if (curr - 1) % 4 == target: return 1
          if (curr + 1) % 4 == target: return 2
          return 0
@@ -132,32 +137,23 @@ class GameWindow(QMainWindow):
     def game_step(self):
         actions = []
         for i in range(self.env.config.num_snakes):
-            if self.env.dead[i]:
-                actions.append(0)
-                continue
-                
-            if self.is_human[i]:
-                actions.append(self.get_human_action(i))
-            elif self.agents[i]:
-                actions.append(self.agents[i].act(self.obs_list[i]))
-            else:
-                actions.append(0)
+            if self.env.dead[i]: actions.append(0)
+            elif self.is_human[i]: actions.append(self.get_human_action(i))
+            elif self.agents[i]: actions.append(self.agents[i].act(self.obs_list[i]))
+            else: actions.append(0)
         
         self.obs_list, rewards, dones, info = self.env.step(actions)
-        
-        # Update UI
         self.board.update_state(self.env.snakes, self.env.foods, self.env.dead, 0 if self.is_human[0] else -1)
         
-        # Update HUD Ranking
         scores = info.get("scores", [0]*len(self.env.snakes))
-        # Sort indices by score
         ranked_indices = sorted(range(len(scores)), key=lambda k: scores[k], reverse=True)
         
         for i, idx in enumerate(ranked_indices):
             status = "DEAD" if self.env.dead[idx] else f"LEN: {len(self.env.snakes[idx])}"
             self.rank_labels[idx].setText(f"P{idx}: {scores[idx]} ({status})")
-            # Highlight current head position in leaderboard? Or just order?
-            # For simplicity, just update text.
+            # Update Cooldown Bar (V5)
+            cd_pct = 100 - (self.env.dash_cooldowns[idx] / self.env.config.dash_cooldown_steps * 100)
+            self.cooldown_bars[idx].setValue(int(cd_pct))
             
         if all(dones):
             self.status_label.setText("Game Over!")
@@ -165,17 +161,15 @@ class GameWindow(QMainWindow):
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", type=str, default="battle", choices=["single", "battle"])
-    parser.add_argument("--algo", type=str, default="dqn", choices=["dqn", "ppo"])
-    parser.add_argument("--model", type=str, default=None)
-    parser.add_argument("--fps", type=int, default=10)
-    parser.add_argument("--grid", type=int, default=20)
-    parser.add_argument("--human", action="store_true")
-    parser.add_argument("--food", type=int, default=None)
-    
-    args = parser.parse_args()
-    
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", type=str, default="battle", choices=["single", "battle"])
+    p.add_argument("--algo", type=str, default="dqn", choices=["dqn", "ppo", "ddqn", "per", "dueling"])
+    p.add_argument("--model", type=str, default=None)
+    p.add_argument("--fps", type=int, default=10)
+    p.add_argument("--grid", type=int, default=20)
+    p.add_argument("--human", action="store_true")
+    p.add_argument("--food", type=int, default=None)
+    args = p.parse_args()
     app = QApplication(sys.argv)
     win = GameWindow(mode=args.mode, algo=args.algo, model_path=args.model, 
                      fps=args.fps, grid_size=args.grid, human=args.human, food_count=args.food)

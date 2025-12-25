@@ -12,7 +12,7 @@ from typing import Optional, Tuple, Dict
 
 class ActorCritic(nn.Module):
     """Hybrid CNN-MLP Architecture for PPO"""
-    def __init__(self, vector_dim: int = 24, grid_shape: tuple = (3, 7, 7), action_dim: int = 4):
+    def __init__(self, vector_dim: int = 25, grid_shape: tuple = (3, 7, 7), action_dim: int = 4):
         super().__init__()
         
         # 1. Feature Extractor (CNN for Grid)
@@ -73,7 +73,7 @@ class ActorCritic(nn.Module):
 
 class PPOAgent:
     """Helper class for PPO inference in V3"""
-    def __init__(self, input_dim=24, model_path: Optional[str] = None):
+    def __init__(self, input_dim=25, model_path: Optional[str] = None):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.net = ActorCritic(vector_dim=input_dim).to(self.device)
         self.net.eval()

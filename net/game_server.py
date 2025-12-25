@@ -28,7 +28,7 @@ class GameServer:
         print(f"Server started on {HOST}:{PORT}")
         
         # Game State
-        self.env = BattleSnakeEnv(config=BattleSnakeConfig(num_snakes=MAX_PLAYERS))
+        self.env = BattleSnakeEnv(config=BattleSnakeConfig(num_snakes=MAX_PLAYERS, dash_cooldown_steps=30))
         self.env.reset()
         
         # Clients: {conn: player_id} (player_id -1 for spectator)
@@ -47,7 +47,7 @@ class GameServer:
         
         for conn in to_remove:
             self.remove_client(conn)
-
+            
     def remove_client(self, conn):
         if conn in self.clients:
             pid = self.clients[conn]
@@ -118,9 +118,10 @@ class GameServer:
                 state = {
                     "type": "STATE",
                     "snakes": self.env.snakes,
-                    "food": self.env.foods, # Changed to list
+                    "food": self.env.foods,
                     "dead": self.env.dead,
-                    "scores": self.env.scores
+                    "scores": self.env.scores,
+                    "dash_cooldowns": self.env.dash_cooldowns # Added in V5.0
                 }
                 
                 # Reset input to 0 (Straight) ? 
