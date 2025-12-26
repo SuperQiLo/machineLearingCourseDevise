@@ -30,26 +30,72 @@ def make_env(num_snakes, grid_size, seed=None):
             dash_cooldown_steps=30 # ENSURE V5.0 MECHANICS
         )
         if num_snakes == 1:
-            env_cfg.closer_reward, env_cfg.food_reward, env_cfg.death_penalty = 0.35, 12.0, -10.0
+            # Single Snake Reward Tuning (V6.3)
+            env_cfg.closer_reward = 0.01 
+            env_cfg.food_reward = 25.0
+            env_cfg.death_penalty = -20.0
         else:
-            env_cfg.closer_reward, env_cfg.kill_reward, env_cfg.death_penalty = 0.1, 30.0, -25.0
+            env_cfg.closer_reward, env_cfg.kill_reward, env_cfg.death_penalty = 0.05, 30.0, -25.0
         return BattleSnakeEnv(env_cfg, seed=seed)
     return thunk
 
 class VectorizedEnv:
-    def __init__(self, env_fns):
+    def __init__(self, env_fns, device):
         self.envs = [fn() for fn in env_fns]
         self.num_envs = len(self.envs)
-        self.history_agents: List[List[Optional[PPOAgent]]] = [[None]*env.config.num_snakes for env in self.envs]
+        self.device = device
+        # V6.8: Store model paths instead of agent objects
+        self.opp_model_paths: List[List[Optional[str]]] = [[None]*env.config.num_snakes for env in self.envs]
+        self.loaded_models: Dict[str, nn.Module] = {}
+
+    def _get_model(self, path: str) -> Optional[nn.Module]:
+        if path not in self.loaded_models:
+            try:
+                model = ActorCritic(vector_dim=25).to(self.device)
+                state_dict = torch.load(path, map_location=self.device, weights_only=True)
+                model.load_state_dict(state_dict)
+                model.eval()
+                self.loaded_models[path] = model
+                if len(self.loaded_models) > 5:
+                    del self.loaded_models[next(iter(self.loaded_models))]
+            except Exception: return None
+        return self.loaded_models.get(path)
+
     def reset(self): return [env.reset() for env in self.envs]
-    def step(self, learning_actions_list, current_obs):
-        res = []
-        for i, env in enumerate(self.envs):
-            env_acts = []
-            for j in range(env.config.num_snakes):
-                if self.history_agents[i][j]: env_acts.append(self.history_agents[i][j].act(current_obs[i][j]))
-                else: env_acts.append(learning_actions_list[i][j])
-            res.append(env.step(env_acts))
+
+    def step(self, learning_actions, current_obs):
+        # learning_actions: [num_envs] (int actions for learner)
+        all_actions = [[None]*env.config.num_snakes for env in self.envs]
+        
+        # 1. Group by model
+        groups: Dict[Optional[nn.Module], List[Tuple[int, int, dict]]] = {None: []}
+        for i in range(self.num_envs):
+            all_actions[i][0] = int(learning_actions[i]) # Always greedy/sampled learner action
+            for j in range(1, self.envs[0].config.num_snakes):
+                m_path = self.opp_model_paths[i][j]
+                if m_path:
+                    model = self._get_model(m_path)
+                    if model:
+                        groups[model] = groups.get(model, [])
+                        groups[model].append((i, j, current_obs[i][j]))
+                    else: all_actions[i][j] = random.randint(0, 3)
+                else: all_actions[i][j] = random.randint(0, 3)
+
+        # 2. Omni-Batch Inference for opponents
+        for model, samples in groups.items():
+            if not samples or model is None: continue
+            with torch.no_grad():
+                grids = np.array([s[2]['grid'] for s in samples])
+                vecs = np.array([s[2]['vector'] for s in samples])
+                t_g = torch.as_tensor(grids, dtype=torch.float32, device=self.device)
+                t_v = torch.as_tensor(vecs, dtype=torch.float32, device=self.device)
+                logits, _ = model.actor(torch.cat([model.conv(t_g), t_v], dim=1)), None
+                acts = logits.argmax(dim=1).cpu().numpy()
+                for idx, (e_idx, s_idx, _) in enumerate(samples):
+                    all_actions[e_idx][s_idx] = int(acts[idx])
+
+        # 3. Environment Step
+        res = [self.envs[i].step(all_actions[i]) for i in range(self.num_envs)]
         obs_n, rew_n, done_n, info_n = zip(*res)
         return list(obs_n), list(rew_n), list(done_n), list(info_n)
 
@@ -82,6 +128,7 @@ def train_ppo(num_envs=8, num_snakes=4, total_timesteps=2_000_000,
     optimizer = optim.Adam(agent.parameters(), lr=lr, eps=1e-5)
     num_steps, batch_size = 128, num_envs * 128
     
+    envs = VectorizedEnv([make_env(num_snakes, 20, i) for i in range(num_envs)], device)
     log(f">>> Starting PPO Training: {num_envs} Envs | {num_snakes} Snakes.")
     obs_list = envs.reset() 
     
@@ -107,8 +154,7 @@ def train_ppo(num_envs=8, num_snakes=4, total_timesteps=2_000_000,
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(t_grid, t_vec)
                 
-            multi_actions = [[int(action[e].item())] + [0]*(num_snakes-1) for e in range(num_envs)]
-            next_obs, rewards, dones, _ = envs.step(multi_actions, obs_list)
+            next_obs, rewards, dones, _ = envs.step(action.cpu().numpy(), obs_list)
             
             for i in range(num_envs):
                 current_rewards[i] += rewards[i][0]
@@ -116,12 +162,12 @@ def train_ppo(num_envs=8, num_snakes=4, total_timesteps=2_000_000,
                     ep_rewards.append(current_rewards[i])
                     current_rewards[i] = 0
                     next_obs[i] = envs.envs[i].reset()
-                    # Self-Play Shuffle
+                    # Self-Play Shuffle (V6.8)
                     if num_snakes > 1 and random.random() < self_play_prob:
                          for s_idx in range(1, num_snakes):
                              m_p = sp_manager.sample_model()
-                             if m_p: envs.history_agents[i][s_idx] = PPOAgent(input_dim=25, model_path=str(m_p))
-
+                             if m_p: envs.opp_model_paths[i][s_idx] = str(m_p)
+            
             b_grid.append(t_grid); b_vector.append(t_vec); b_acts.append(action)
             b_logprobs.append(logprob); b_values.append(value.flatten())
             b_rewards.append(torch.tensor([r[0] for r in rewards], device=device))
@@ -178,5 +224,4 @@ if __name__ == "__main__":
     args = p.parse_args(); num = 1 if args.single else 4
     ckpt = "agent/checkpoints/ppo_best.pth" if args.single else "agent/checkpoints/ppo_battle_best.pth"
     
-    envs = VectorizedEnv([make_env(num, 20, i) for i in range(8)]) # Moved here for better visibility
     train_ppo(num_snakes=num, total_timesteps=args.steps, load_path=args.load, checkpoint_path=ckpt)

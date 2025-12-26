@@ -29,21 +29,21 @@ class ActorCritic(nn.Module):
         
         # 2. Actor Head
         self.actor = nn.Sequential(
-            nn.Linear(vector_dim + cnn_out_dim, 256),
+            nn.Linear(vector_dim + cnn_out_dim, 512),
             nn.Tanh(),
-            nn.Linear(256, 128),
+            nn.Linear(512, 256),
             nn.Tanh(),
-            nn.Linear(128, action_dim),
+            nn.Linear(256, action_dim),
             nn.Softmax(dim=-1)
         )
         
         # 3. Critic Head
         self.critic = nn.Sequential(
-            nn.Linear(vector_dim + cnn_out_dim, 256),
+            nn.Linear(vector_dim + cnn_out_dim, 512),
             nn.Tanh(),
-            nn.Linear(256, 128),
+            nn.Linear(512, 256),
             nn.Tanh(),
-            nn.Linear(128, 1)
+            nn.Linear(256, 1)
         )
         
         self._init_weights()

@@ -29,11 +29,11 @@ class DQNNet(nn.Module):
         
         # 2. MLP for Global Features
         self.fc = nn.Sequential(
-            nn.Linear(vector_dim + cnn_out_dim, 256),
+            nn.Linear(vector_dim + cnn_out_dim, 512),
             nn.ReLU(),
-            nn.Linear(256, 128),
+            nn.Linear(512, 256),
             nn.ReLU(),
-            nn.Linear(128, action_dim)
+            nn.Linear(256, action_dim)
         )
         self._init_weights()
     

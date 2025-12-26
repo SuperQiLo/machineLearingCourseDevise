@@ -1,7 +1,7 @@
 """
-Unified Trainer for DQN Variants (V6.1 FIX).
+Unified Trainer for DQN Variants (V6.7 - Turbo Battle Performance).
 Supports: DQN, DDQN, PER, Dueling-PER.
-Features: 30-step Cooldown Awareness, 25D Observation.
+Features: Omni-Batch Inference (Massive FPS boost), Soft Updates, Algorithm-Specific Hyperparameters.
 """
 
 import math
@@ -78,7 +78,6 @@ class PrioritizedReplayBuffer:
 
     @property
     def size(self):
-        """Fixed AttributeError by exposing size property"""
         return self.tree.size
 
     def push(self, state, action, reward, next_state, done):
@@ -97,13 +96,10 @@ class PrioritizedReplayBuffer:
             weights.append(p / self.tree.total_priority)
             batch.append(data)
             
-        # Importance Sampling Weights
         weights = np.array(weights)
-        # Fixed AttributeError: 'list' object has no attribute 'size'
         weights = (len(batch) * weights) ** (-self.beta) 
         weights /= (weights.max() + 1e-8)
         
-        # Unpack
         o_grids = np.array([x[0]['grid'] for x in batch])
         o_vecs = np.array([x[0]['vector'] for x in batch])
         acts = np.array([x[1] for x in batch])
@@ -136,30 +132,51 @@ class TrainConfig:
     total_frames: int = 1_000_000
     num_envs: int = 8
     batch_size: int = 256
-    lr: float = 2e-4
-    eps_decay: int = 500_000
-    target_update: int = 2000
+    lr: float = 1e-4
+    eps_decay: int = 200_000
+    tau: float = 0.005 # Soft update parameter
     num_snakes: int = 4
-    pool_dir: str = "agent/pool/dqn_variants"
+    pool_dir: str = "agent/pool/dqn"
     load_path: Optional[str] = None
     save_path: str = "agent/checkpoints/dqn_best.pth"
     single_snake: bool = False
+    self_play_prob: float = 0.5
 
 class DQNVariantTrainer:
     def __init__(self, cfg: TrainConfig):
         self.cfg = cfg
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Override for single snake mode
         if cfg.single_snake:
             cfg.num_snakes = 1
-            
-        log(f">>> [V6.1 FIX] Variant: {cfg.variant.upper()} | Device: {self.device}")
+
+        # Algorithm-Specific Hyperparameters (V6.7 Matrix)
+        if cfg.variant == "dqn":
+            self.lr = 5.0e-5
+            self.closer_reward = 0.15
+            self.buffer_size = 300_000
+        elif cfg.variant == "ddqn":
+            self.lr = 1.0e-4
+            self.closer_reward = 0.05
+            self.buffer_size = 400_000
+        else:
+            self.lr = 2.0e-4
+            self.closer_reward = 0.01
+            self.buffer_size = 250_000
+
+        log(f">>> [V6.7 Omni-Batch] Variant: {cfg.variant.upper()} | LR: {self.lr} | Tau: {cfg.tau}")
+        log(f">>> Pool Directory: {cfg.pool_dir}")
         
         env_cfg = BattleSnakeConfig(num_snakes=cfg.num_snakes, dash_cooldown_steps=30)
         if cfg.num_snakes == 1:
-            env_cfg.closer_reward, env_cfg.food_reward, env_cfg.death_penalty = 0.35, 12.0, -10.0
-            log(">>> Running in SINGLE SNAKE mode.")
+            env_cfg.closer_reward = self.closer_reward
+            env_cfg.food_reward = 25.0
+            env_cfg.death_penalty = -20.0
+            log(f">>> SINGLE SNAKE mode | CloserReward: {env_cfg.closer_reward}")
+        else:
+            env_cfg.closer_reward = 0.01
+            env_cfg.kill_reward = 30.0
+            env_cfg.death_penalty = -25.0
         
         self.envs = [BattleSnakeEnv(env_cfg) for _ in range(cfg.num_envs)]
         
@@ -170,125 +187,170 @@ class DQNVariantTrainer:
         elif cfg.variant == "dueling": self.net_cls = DuelingDQNNet
         else: raise ValueError(f"Unknown variant {cfg.variant}")
         
-        # Explicit 25D Vector Dim
         self.policy_net = self.net_cls(vector_dim=25).to(self.device)
         self.target_net = self.net_cls(vector_dim=25).to(self.device)
         
-        # Load weights
         if cfg.load_path and Path(cfg.load_path).exists():
             log(f">>> Loading weights from {cfg.load_path}...")
             state_dict = torch.load(cfg.load_path, map_location=self.device, weights_only=True)
             self.policy_net.load_state_dict(state_dict)
             
         self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=cfg.lr)
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.lr)
         
-        # Select Buffer
         if "per" in cfg.variant or "dueling" in cfg.variant:
-            self.memory = PrioritizedReplayBuffer(100_000, (3, 7, 7), 25, cfg.batch_size, self.device)
+            self.memory = PrioritizedReplayBuffer(self.buffer_size, (3, 7, 7), 25, cfg.batch_size, self.device)
         else:
-            self.memory = FastReplayBuffer(150_000, (3, 7, 7), 25, cfg.batch_size, self.device)
+            self.memory = FastReplayBuffer(self.buffer_size, (3, 7, 7), 25, cfg.batch_size, self.device)
             
         self.steps = 0
         self.sp_manager = SelfPlayManager(cfg.pool_dir)
+        
+        # Self-Play Manager (V6.7 Model Cache)
+        # Store model paths for opponents. None means random.
+        self.opp_model_paths = [[None]*cfg.num_snakes for _ in range(cfg.num_envs)]
+        self.loaded_opp_models: Dict[str, nn.Module] = {}
+        
         self.best_reward = -float('inf')
 
     def save_model(self, path):
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         torch.save(self.policy_net.state_dict(), p)
-        # log(f">>> Model saved to {path}")
+
+    def _get_opp_model(self, path: str) -> nn.Module:
+        """Get model from cache or load from disk"""
+        if path not in self.loaded_opp_models:
+            model = self.net_cls(vector_dim=25).to(self.device)
+            try:
+                state_dict = torch.load(path, map_location=self.device, weights_only=True)
+                model.load_state_dict(state_dict)
+                model.eval()
+                self.loaded_opp_models[path] = model
+                # Limit cache size to prevent memory leak
+                if len(self.loaded_opp_models) > 5:
+                    key_to_del = next(iter(self.loaded_opp_models))
+                    del self.loaded_opp_models[key_to_del]
+            except Exception:
+                return None
+        return self.loaded_opp_models.get(path)
 
     def train(self):
-        log(f">>> Starting {self.cfg.variant.upper()} Training...")
+        log(f">>> Starting {self.cfg.variant.upper()} Training (V6.7 Omni-Batch)...")
         obs_batch = [env.reset() for env in self.envs]
         ep_rewards = [0.0] * self.cfg.num_envs
         recent_rewards = []
-        
         last_log_time = time.time()
         
         while self.steps < self.cfg.total_frames:
+            # 1. Group all snakes by model for Omni-Batch Inference
+            # { model_ptr: [(env_idx, snake_idx, obs)] }
+            groups: Dict[Optional[nn.Module], List[Tuple[int, int, Dict]]] = {None: []}
+            
             self.steps += self.cfg.num_envs
-            eps = 0.05 + (0.95) * math.exp(-1. * self.steps / self.cfg.eps_decay)
+            eps = max(0.05, 1.0 - self.steps / self.cfg.eps_decay)
             
-            # Action selection
-            all_actions = []
+            all_actions = [ [None]*self.cfg.num_snakes for _ in range(self.cfg.num_envs) ]
+            
             for e_idx in range(self.cfg.num_envs):
-                env_acts = []
-                for s_idx in range(self.cfg.num_snakes):
-                    if s_idx == 0: # Learning Agent
-                        if random.random() < eps: env_acts.append(random.randint(0, 3))
+                # Learner Agent (0)
+                if random.random() < eps:
+                    all_actions[e_idx][0] = random.randint(0, 3)
+                else:
+                    groups[self.policy_net] = groups.get(self.policy_net, [])
+                    groups[self.policy_net].append((e_idx, 0, obs_batch[e_idx][0]))
+                
+                # Opponent Agents (1+)
+                for s_idx in range(1, self.cfg.num_snakes):
+                    m_path = self.opp_model_paths[e_idx][s_idx]
+                    if m_path:
+                        model = self._get_opp_model(m_path)
+                        if model:
+                            groups[model] = groups.get(model, [])
+                            groups[model].append((e_idx, s_idx, obs_batch[e_idx][s_idx]))
                         else:
-                            obs = obs_batch[e_idx][0]
-                            # Debug: verify obs shape once
-                            if self.steps == self.cfg.num_envs and e_idx == 0:
-                                log(f">>> Obs Vector Shape: {obs['vector'].shape}")
-                            
-                            t_g = torch.tensor(obs['grid'], dtype=torch.float32, device=self.device).unsqueeze(0)
-                            t_v = torch.tensor(obs['vector'], dtype=torch.float32, device=self.device).unsqueeze(0)
-                            with torch.no_grad():
-                                env_acts.append(self.policy_net(t_g, t_v).argmax().item())
-                    else: env_acts.append(random.randint(0, 3)) 
-                all_actions.append(env_acts)
+                            all_actions[e_idx][s_idx] = random.randint(0, 3)
+                    else:
+                        all_actions[e_idx][s_idx] = random.randint(0, 3)
+
+            # 2. Execute Omni-Batch Inference
+            for model, samples in groups.items():
+                if not samples: continue
+                if model is None: continue # Handled by random
+                
+                with torch.no_grad():
+                    grids = np.array([s[2]['grid'] for s in samples])
+                    vecs = np.array([s[2]['vector'] for s in samples])
+                    t_g = torch.as_tensor(grids, dtype=torch.float32, device=self.device)
+                    t_v = torch.as_tensor(vecs, dtype=torch.float32, device=self.device)
+                    q_vals = model(t_g, t_v)
+                    acts = q_vals.argmax(dim=1).cpu().numpy()
+                    for i, (env_idx, snake_idx, _) in enumerate(samples):
+                        all_actions[env_idx][snake_idx] = int(acts[i])
             
-            # Env Step
+            # 3. Env Step
             next_obs_batch = []
             for e_idx in range(self.cfg.num_envs):
                 n_obs, rews, dones, _ = self.envs[e_idx].step(all_actions[e_idx])
                 
-                # Push transition (Agent 0)
                 self.memory.push(obs_batch[e_idx][0], all_actions[e_idx][0], rews[0], n_obs[0], dones[0])
                 ep_rewards[e_idx] += rews[0]
                 
                 if dones[0]:
                     recent_rewards.append(ep_rewards[e_idx])
                     if len(recent_rewards) > 100: recent_rewards.pop(0)
-                    
                     ep_rewards[e_idx] = 0.0
                     next_obs_batch.append(self.envs[e_idx].reset())
+                    
+                    # Self-Play Shuffle
+                    if self.cfg.num_snakes > 1 and random.random() < self.cfg.self_play_prob:
+                        opp_idx = random.randint(1, self.cfg.num_snakes-1)
+                        m_p = self.sp_manager.sample_model()
+                        if m_p:
+                            self.opp_model_paths[e_idx][opp_idx] = str(m_p)
                 else:
                     next_obs_batch.append(n_obs)
             
             obs_batch = next_obs_batch
             
-            # Update
             if self.memory.size > 2000:
                 self.update()
             
-            if self.steps % self.cfg.target_update < self.cfg.num_envs:
-                self.target_net.load_state_dict(self.policy_net.state_dict())
+            # 4. Soft Update
+            for target_param, policy_param in zip(self.target_net.parameters(), self.policy_net.parameters()):
+                target_param.data.copy_(self.cfg.tau * policy_param.data + (1.0 - self.cfg.tau) * target_param.data)
                 
-            if self.steps % 10000 < self.cfg.num_envs:
-                fps = 10000 / (time.time() - last_log_time)
+            # 5. Heartbeat Logging
+            log_interval = 2000 if self.steps < 20000 else 10000
+            if self.steps % log_interval < self.cfg.num_envs:
+                fps = log_interval / (time.time() - last_log_time)
                 avg_r = np.mean(recent_rewards) if recent_rewards else 0
                 log(f"Step: {self.steps} | EPS: {eps:.2f} | Rew: {avg_r:.2f} | FPS: {fps:.1f} | Var: {self.cfg.variant}")
                 last_log_time = time.time()
                 
-                # Save best
                 if avg_r > self.best_reward and len(recent_rewards) >= 20:
                     self.best_reward = avg_r
                     self.save_model(self.cfg.save_path)
+            
+            if self.steps % 150000 < self.cfg.num_envs:
+                self.sp_manager.add_model(self.policy_net.state_dict(), f"{self.cfg.variant}_step_{self.steps}")
         
-        self.save_model(self.cfg.save_path) # Final save
+        self.save_model(self.cfg.save_path)
 
     def update(self):
         states, actions, rewards, next_states, dones, weights, idxs = self.memory.sample()
-        
-        # Current Q
         q_curr = self.policy_net(states['grid'], states['vector']).gather(1, actions.unsqueeze(1)).squeeze(1)
         
-        # Next Q
         with torch.no_grad():
             if self.cfg.variant == "dqn":
                 q_next = self.target_net(next_states['grid'], next_states['vector']).max(1)[0]
-            else: # DDQN Logic
+            else:
                 best_actions = self.policy_net(next_states['grid'], next_states['vector']).argmax(1)
                 q_next = self.target_net(next_states['grid'], next_states['vector']).gather(1, best_actions.unsqueeze(1)).squeeze(1)
             target = rewards + 0.99 * q_next * (~dones)
             
         td_errors = q_curr - target
-        
-        if weights is not None: # PER logic
+        if weights is not None:
             loss = (weights * (td_errors ** 2)).mean()
             self.memory.update_priorities(idxs, td_errors.detach().cpu().numpy())
         else:
@@ -304,16 +366,21 @@ if __name__ == "__main__":
     p = ArgumentParser()
     p.add_argument("--variant", type=str, default="dqn", choices=["dqn", "ddqn", "per", "dueling"])
     p.add_argument("--steps", type=int, default=1000000)
-    p.add_argument("--single", action="store_true", help="Single snake mode")
-    p.add_argument("--load", type=str, default=None, help="Path to pre-trained model")
-    p.add_argument("--save", type=str, default="agent/checkpoints/dqn_best.pth", help="Path to save model")
+    p.add_argument("--single", action="store_true")
+    p.add_argument("--load", type=str, default=None)
+    p.add_argument("--save", type=str, default="agent/checkpoints/dqn_best.pth")
+    p.add_argument("--sp-prob", type=float, default=0.5)
     args = p.parse_args()
+    
+    p_dir = f"agent/pool/{args.variant}"
     
     cfg = TrainConfig(
         variant=args.variant, 
         total_frames=args.steps,
         single_snake=args.single,
         load_path=args.load,
-        save_path=args.save
+        save_path=args.save,
+        self_play_prob=args.sp_prob,
+        pool_dir=p_dir
     )
     DQNVariantTrainer(cfg).train()
