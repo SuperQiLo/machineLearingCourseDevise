@@ -67,7 +67,7 @@ class FastReplayBuffer:
         )
 
 class PrioritizedReplayBuffer:
-    def __init__(self, capacity, grid_shape, vector_dim, batch_size, device, alpha=0.6, beta=0.4):
+    def __init__(self, capacity, grid_shape, vector_dim, batch_size, device, alpha=0.5, beta=0.4):
         self.tree = SumTree(capacity)
         self.batch_size = batch_size
         self.device = device
@@ -150,33 +150,50 @@ class DQNVariantTrainer:
         if cfg.single_snake:
             cfg.num_snakes = 1
 
-        # Algorithm-Specific Hyperparameters (V6.7 Matrix)
+        # Algorithm-Specific Hyperparameters (V6.9 Optim-Matrix)
         if cfg.variant == "dqn":
             self.lr = 5.0e-5
             self.closer_reward = 0.15
             self.buffer_size = 300_000
+            self.grad_clip = 1.0
         elif cfg.variant == "ddqn":
             self.lr = 1.0e-4
+            self.closer_reward = 0.08
+            self.buffer_size = 400_000
+            self.grad_clip = 1.0
+        elif cfg.variant == "per":
+            self.lr = 1.0e-4 # Reduced from 2e-4 for PER stability
+            self.closer_reward = 0.05
+            self.buffer_size = 300_000
+            self.grad_clip = 0.5 # Tighten clipping for PER
+        elif cfg.variant == "dueling":
+            self.lr = 1.5e-4 if cfg.single_snake else 2.5e-4 # Boost Battle LR for Dueling
             self.closer_reward = 0.05
             self.buffer_size = 400_000
+            self.grad_clip = 0.8
         else:
             self.lr = 2.0e-4
             self.closer_reward = 0.01
             self.buffer_size = 250_000
+            self.grad_clip = 1.0
 
-        log(f">>> [V6.7 Omni-Batch] Variant: {cfg.variant.upper()} | LR: {self.lr} | Tau: {cfg.tau}")
-        log(f">>> Pool Directory: {cfg.pool_dir}")
+        log(f">>> [V6.9 Survival-Balanced] Variant: {cfg.variant.upper()} | LR: {self.lr} | GradClip: {self.grad_clip}")
         
-        env_cfg = BattleSnakeConfig(num_snakes=cfg.num_snakes, dash_cooldown_steps=30)
+        env_cfg = BattleSnakeConfig(num_snakes=cfg.num_snakes, dash_cooldown_steps=15)
         if cfg.num_snakes == 1:
+            # Phase 1: High focus on navigation
             env_cfg.closer_reward = self.closer_reward
             env_cfg.food_reward = 25.0
             env_cfg.death_penalty = -20.0
-            log(f">>> SINGLE SNAKE mode | CloserReward: {env_cfg.closer_reward}")
+            log(f">>> PHASE 1 (Single) | Closer: {env_cfg.closer_reward} | Death: {env_cfg.death_penalty}")
         else:
-            env_cfg.closer_reward = 0.01
+            # Phase 2: Survival & Combat Balance (V6.9)
+            env_cfg.closer_reward = 0.05   # Keep some guiding in battle
+            env_cfg.step_reward = 0.01     # Survival incentive
+            env_cfg.death_penalty = -15.0  # Reduced penalty to avoid cowardice
             env_cfg.kill_reward = 30.0
-            env_cfg.death_penalty = -25.0
+            env_cfg.food_reward = 20.0
+            log(f">>> PHASE 2 (Battle) | Closer: {env_cfg.closer_reward} | Death: {env_cfg.death_penalty} | SurvivalBonus: 0.01")
         
         self.envs = [BattleSnakeEnv(env_cfg) for _ in range(cfg.num_envs)]
         
@@ -316,7 +333,14 @@ class DQNVariantTrainer:
             if self.memory.size > 2000:
                 self.update()
             
-            # 4. Soft Update
+            # 4. Multi-Stage Learning Rate Decay (V7.0)
+            # Final 20% of frames: Decay LR to 10% for precision
+            if self.steps > self.cfg.total_frames * 0.8:
+                current_lr = self.lr * 0.1
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = current_lr
+
+            # 5. Soft Update
             for target_param, policy_param in zip(self.target_net.parameters(), self.policy_net.parameters()):
                 target_param.data.copy_(self.cfg.tau * policy_param.data + (1.0 - self.cfg.tau) * target_param.data)
                 
@@ -358,7 +382,7 @@ class DQNVariantTrainer:
             
         self.optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+        nn.utils.clip_grad_norm_(self.policy_net.parameters(), self.grad_clip)
         self.optimizer.step()
 
 if __name__ == "__main__":

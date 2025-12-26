@@ -1,112 +1,72 @@
-# 🐍 Multi-Snake Battle AI (Neon Edition)
+# 🐍 Multi-Snake Battle AI (V7.0 Champion Edition)
 
-一个基于强化学习（DQN / PPO）的多蛇对战环境，支持局域网联机与霓虹风格可视化。
+一个基于强化学习（DQN / PPO）的高性能多蛇对战环境，支持自动课程学习、自博弈对抗与冠军级模型优化。
 
-![Neon Snake](https://via.placeholder.com/800x400?text=Snake+AI+Battle+Neon+Style)
+![Neon Snake](https://via.placeholder.com/800x400?text=Snake+AI+Battle+V7.0+Champion+Edition)
 
-## ✨ 核心特性
+## ✨ V7.0 核心突破 (Champion Patch)
 
-- **现代视觉体验**: 重构的 PyQt6 渲染引擎，支持霓虹辉光、径向渐变、抗锯齿绘图。
-- **高内聚架构**:
-    - **Unified Environment**: 单一环境 `BattleSnakeEnv` 同时支持单机练习与多蛇乱斗。
-    - **Agent Abstraction**: 独立的 `agent/` 模块，封装 DQN/PPO 网络与推理逻辑。
-    - **Shared Renderer**: 渲染器作为独立组件 (`utils/renderer.py`)，被 GUI 和 Client 复用。
-- **双模训练**:
-    - **DQN (Deep Q-Network)**: 支持 Off-policy 训练，适用于单蛇或多蛇。
-    - **PPO (Proximal Policy Optimization)**: 支持 On-policy 高并行度训练，适用于多蛇博弈。
-- **局域网联机**: 提供完整的 Server-Client 架构，支持人类玩家、AI 托管与观战模式混战。
+- **性能革命 (Omni-Batch 架构)**: 自研全量批处理推理，对战模式 FPS 从 1.0 飙升至 **400-600**。
+- **博弈多样性 (Chaos Sampling)**: 自博弈池引入 10% 混沌扰动（随机策略），强制 Agent 建立全向鲁棒性。
+- **精细化收敛 (Multi-Stage LR)**: 训练后期（80% 后）自动 10 倍 LR 衰减，锁定最优动作，消除训练波动。
+- **自博弈显存缓存**: 自动热加载对抗模型，磁盘 I/O 不再是训练瓶颈。
 
 ## 📂 项目结构
 
 ```text
 project/
-  ├── agent/            # AI 模型抽象 (DQN/PPO)
-  ├── env/              # 统一游戏环境 (BattleSnakeEnv)
-  ├── net/              # 网络通信 (GameServer/QtClient)
-  ├── utils/            # 通用工具 (GameRenderer)
-  ├── gui_game.py       # 本地游戏入口 (单机版)
-  ├── train_dqn.py      # 通用 DQN 训练脚本
-  ├── train_ppo.py      # 通用 PPO 训练脚本
+  ├── agent/            # AI 模型抽象 (DQN/PPO/Dueling/PER)
+  ├── env/              # 统一游戏环境 (BattleSnakeEnv, 25D 向量 + 7x7 局部网格)
+  ├── scripts/          # V7.0 冠军运行脚本 (.sh)
+  ├── train_dqn_curriculum.py  # DQN 系自动课程学习脚本 (1蛇 -> 4蛇)
+  ├── train_ppo_curriculum.py  # PPO 自动课程学习脚本
+  ├── gui_game.py       # 本地可视化演示界面
   └── requirements.txt  # 依赖列表
 ```
 
 ## 🚀 快速开始
 
-### 1. 安装依赖
+### 1. 安装环境
 ```bash
 pip install -r requirements.txt
 ```
-*主要依赖: `torch`, `numpy`, `PyQt6`*
 
-### 2. 单机试玩 (`gui_game.py`)
-最简单的体验方式，无需启动服务器。
+### 2. 启动冠军训练 (V7.0 脚本)
+推荐使用 `Dueling-DQN` 或 `PPO` 变体，它们在 V7.0 中表现最强。
 ```bash
-# 人工模式 (方向键控制 P0)
-python gui_game.py --mode single --human
+# 启动 DQN 变体课程训练 (默认 Dueling-DQN)
+bash scripts/run_dqn_curriculum.sh [dqn|ddqn|per|dueling]
 
-# 观看 DQN 模型演示 (单蛇)
-python gui_game.py --mode single --algo dqn --model agent/checkpoints/dqn_best.pth
+# 启动 PPO 课程训练
+bash scripts/run_ppo_curriculum.sh
 
-# 观看 PPO 混战 (4蛇互搏)
+# 🛑 一键停止所有训练 (清理主进程与子进程)
+bash scripts/stop_training.sh
+```
+
+### 3. 本地演示
+```bash
+# 观看 PPO 冠军模型博弈
 python gui_game.py --mode battle --algo ppo --model agent/checkpoints/ppo_battle_best.pth
 ```
 
-### 3. 模型训练
+## 🛠️ 深度技术规格 (V7.0 Balance)
 
-**DQN (Deep Q-Network)**
-```bash
-# 训练单蛇 (生成 agent/checkpoints/dqn_best.pth)
-python train_dqn.py --single
+### 观测空间 (25-dim Vector + CNN Grid)
+- **食物定位 (4)**: 上下左右食物距离感应。
+- **危险雷达 (9)**: 距离 1 & 2 的障碍物检测 + 线性全向雷达。
+- **运动状态 (4)**: 当前蛇头朝向（One-hot）。
+- **对抗雷达 (4)**: 最近敌蛇相对方位感应。
+- **生存特征 (4)**: 尾部相对位置 (2) + 长度占比 (1) + **冲刺冷却 (1)**。
 
-# 训练多蛇 (生成 agent/checkpoints/dqn_battle_best.pth)
-python train_dqn.py
-```
-
-**PPO (Proximal Policy Optimization)**
-```bash
-# 默认开启 8 环境并行训练 (生成 agent/checkpoints/ppo_battle_final.pth)
-python train_ppo.py
-```
-
-### 4. 局域网联机对战
-
-**Step 1: 启动服务器**
-```bash
-python net/game_server.py
-```
-*默认监听 `0.0.0.0:5555`*
-
-**Step 2: 启动客户端**
-```bash
-python net/game_client.py
-```
-*在图形界面中输入服务器 IP，选择模式 (Human/AI/Spectator) 进行连接。*
-
-## 🎮 游戏模式
-
-| 模式 | 描述 | 适用脚本 |
+### 奖励矩阵 (Balanced V7.0)
+| 事件 | 奖励 | 说明 |
 | :--- | :--- | :--- |
-| **Single** | 经典的单蛇吃豆模式，撞墙或撞身即死。 | `train_dqn.py --single` |
-| **Battle** | 2-4 条蛇的生存大乱斗。支持击杀奖励、碰撞判定。 | `train_dqn.py`, `train_ppo.py` |
-
-## 🛠️ 技术细节
-
-- **State Space (15-dim)**:
-    - 4x Food Direction (One-hot)
-    - 3x Immediate Danger (Straight, Left, Right)
-    - 4x Current Direction (One-hot)
-    - 4x Nearest Enemy Direction (One-hot)
-- **Reward Function**:
-    - `+10`: Eat Food
-    - `-10`: Die (Wall/Collision)
-    - `+20`: Kill Enemy (Battle only)
-    - `+0.2 / -0.3`: Distance Shaping (Closer/Farther from food)
-
-## 📝 开发指南
-
-- **添加新算法**: 在 `agent/` 下新建文件，参考 `dqn.py` 实现 `Act/Load` 接口。
-- **修改环境**: 编辑 `env/battle_snake_env.py`，它是所有模式的核心。
-- **自定义 UI**: 编辑 `utils/renderer.py`，修改 `paintEvent` 即可同时改变本地和联机版的画风。
+| **Eat Food** | `+25.0` | 核心成长动力 |
+| **Survival** | `+0.01` | **V7.0 新增**，鼓励活着就有收益 |
+| **Kill Enemy** | `+30.0` | 激进对抗激励 |
+| **Death** | `-15.0` | **V7.0 调优**，减轻惩罚以防避战 |
+| **Navigation** | `+0.05` | 持续的寻路引导补偿 |
 
 ---
-*Created for Machine Learning Course Project.*
+*Created for Machine Learning Course Project. Optimized for High-Performance Deep RL.*

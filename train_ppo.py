@@ -27,15 +27,20 @@ def make_env(num_snakes, grid_size, seed=None):
             num_snakes=num_snakes,
             min_food=max(2, num_snakes//2), 
             max_steps=500,
-            dash_cooldown_steps=30 # ENSURE V5.0 MECHANICS
+            dash_cooldown_steps=15 # ENSURE V5.0 MECHANICS
         )
         if num_snakes == 1:
-            # Single Snake Reward Tuning (V6.3)
-            env_cfg.closer_reward = 0.01 
+            # Phase 1: Navigation emphasis
+            env_cfg.closer_reward = 0.08
             env_cfg.food_reward = 25.0
             env_cfg.death_penalty = -20.0
         else:
-            env_cfg.closer_reward, env_cfg.kill_reward, env_cfg.death_penalty = 0.05, 30.0, -25.0
+            # Phase 2: Survival & Combat Balance (V6.9)
+            env_cfg.closer_reward = 0.05
+            env_cfg.step_reward = 0.01 
+            env_cfg.kill_reward = 30.0
+            env_cfg.death_penalty = -15.0
+            env_cfg.food_reward = 20.0
         return BattleSnakeEnv(env_cfg, seed=seed)
     return thunk
 
@@ -139,8 +144,11 @@ def train_ppo(num_envs=8, num_snakes=4, total_timesteps=2_000_000,
     current_rewards = np.zeros(num_envs)
 
     while global_step < total_timesteps:
-        # LR Decay
+        # LR Decay and Multi-Stage Precision (V7.0)
         frac = 1.0 - (global_step / total_timesteps)
+        # Final 20% of frames: Additional precision decay
+        if global_step > total_timesteps * 0.8:
+            frac *= 0.1
         for g in optimizer.param_groups: g['lr'] = frac * lr
 
         b_grid, b_vector, b_acts, b_logprobs, b_rewards, b_dones, b_values = [], [], [], [], [], [], []
@@ -165,7 +173,7 @@ def train_ppo(num_envs=8, num_snakes=4, total_timesteps=2_000_000,
                     # Self-Play Shuffle (V6.8)
                     if num_snakes > 1 and random.random() < self_play_prob:
                          for s_idx in range(1, num_snakes):
-                             m_p = sp_manager.sample_model()
+                             m_p = sp_manager.sample_model(chaos_prob=0.1) # V7.0 Diversity
                              if m_p: envs.opp_model_paths[i][s_idx] = str(m_p)
             
             b_grid.append(t_grid); b_vector.append(t_vec); b_acts.append(action)
@@ -203,7 +211,7 @@ def train_ppo(num_envs=8, num_snakes=4, total_timesteps=2_000_000,
                 pg_loss = torch.max(-mb_a * ratio, -mb_a * torch.clamp(ratio, 0.8, 1.2)).mean()
                 v_loss = 0.5 * ((nv.view(-1) - returns[mb])**2).mean()
                 optimizer.zero_grad(); (pg_loss - 0.03 * ent.mean() + 0.5 * v_loss).backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), 0.5); optimizer.step()
+                nn.utils.clip_grad_norm_(agent.parameters(), 0.3); optimizer.step()
                 
         # Logging
         if global_step % 10240 < num_envs:

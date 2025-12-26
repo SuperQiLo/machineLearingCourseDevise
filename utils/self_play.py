@@ -30,7 +30,8 @@ class SelfPlayManager:
         torch.save(state_dict, path)
         self._refresh_pool()
 
-    def sample_model(self) -> Optional[Path]:
-        if not self.history_models:
+    def sample_model(self, chaos_prob: float = 0.1) -> Optional[Path]:
+        """Sample a model path or return None (Chaos/Random agent) for diversity"""
+        if not self.history_models or random.random() < chaos_prob:
             return None
         return random.choice(self.history_models)
