@@ -82,80 +82,116 @@ class NetworkThread(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Snake AI Battle - Client")
-        self.resize(800, 600)
-        self.setStyleSheet("background-color: #2b2b2b; color: white;")
+        self.setWindowTitle("Snake AI Battle - Neon Client")
+        self.resize(1000, 700)
         
-        # Central Widget
+        # Neon Style Sheet
+        self.setStyleSheet("""
+            QMainWindow { background-color: #1a1a1a; }
+            QWidget { background-color: #1a1a1a; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; }
+            QFrame#Settings { 
+                background-color: #252525; 
+                border-right: 2px solid #333;
+                border-radius: 0px;
+            }
+            QLabel { font-weight: bold; color: #00d4ff; font-size: 13px; }
+            QLineEdit, QComboBox { 
+                background-color: #333; 
+                border: 1px solid #444; 
+                border-radius: 4px; 
+                padding: 5px; 
+                color: #fff;
+            }
+            QPushButton { 
+                background-color: #007acc; 
+                color: white; 
+                border-radius: 4px; 
+                font-weight: bold; 
+                padding: 8px;
+            }
+            QPushButton:hover { background-color: #0098ff; }
+            QPushButton#ReadyBtn { background-color: #28a745; }
+            QPushButton#ReadyBtn:checked { background-color: #dc3545; }
+        """)
+        
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
         
-        # Left: Settings
-        settings_panel = QFrame()
-        settings_panel.setFrameShape(QFrame.Shape.StyledPanel)
-        settings_panel.setFixedWidth(250)
-        settings_layout = QVBoxLayout(settings_panel)
+        # Left Panel
+        self.settings_panel = QFrame()
+        self.settings_panel.setObjectName("Settings")
+        self.settings_panel.setFixedWidth(280)
+        settings_layout = QVBoxLayout(self.settings_panel)
+        settings_layout.setContentsMargins(20, 20, 20, 20)
+        settings_layout.setSpacing(15)
         
-        settings_layout.addWidget(QLabel("BATTLE SNAKE (v2)"))
+        title = QLabel("NEON BATTLE v7.2")
+        title.setStyleSheet("font-size: 18px; color: #ff00ff; margin-bottom: 10px;")
+        settings_layout.addWidget(title)
         
-        # Inputs...
         self.host_input = QLineEdit(DEFAULT_HOST)
-        settings_layout.addWidget(QLabel("Host:"))
+        settings_layout.addWidget(QLabel("SERVER HOST"))
         settings_layout.addWidget(self.host_input)
-        
-        self.port_input = QLineEdit(str(DEFAULT_PORT))
-        settings_layout.addWidget(QLabel("Port:"))
-        settings_layout.addWidget(self.port_input)
         
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["Human", "AI", "Spectator"])
-        settings_layout.addWidget(QLabel("Mode:"))
+        self.mode_combo.currentTextChanged.connect(self.toggle_ai_config)
+        settings_layout.addWidget(QLabel("CONTROL MODE"))
         settings_layout.addWidget(self.mode_combo)
         
-        # AI Config
+        # AI Config Container
+        self.ai_config_widget = QWidget()
+        ai_cfg_layout = QVBoxLayout(self.ai_config_widget)
+        ai_cfg_layout.setContentsMargins(0, 0, 0, 0)
+        ai_cfg_layout.setSpacing(10)
+        
         self.algo_combo = QComboBox()
-        # Dynamically load available agents
-        self.algo_combo.addItems([name.upper() for name in AGENTS.keys()])
-        settings_layout.addWidget(QLabel("Algo:"))
-        settings_layout.addWidget(self.algo_combo)
+        # V7.2: Strip "AGENT" for cleaner look
+        clean_algos = [name.replace("agent", "").upper() for name in AGENTS.keys()]
+        self.algo_combo.addItems(clean_algos)
+        ai_cfg_layout.addWidget(QLabel("ALGORITHM"))
+        ai_cfg_layout.addWidget(self.algo_combo)
         
-        settings_layout.addWidget(QLabel("Model:"))
-        
-        # Model Selection (Scan + Browse)
-        model_layout = QHBoxLayout()
+        ai_cfg_layout.addWidget(QLabel("MODEL CHECKPOINT"))
+        model_row = QHBoxLayout()
         self.model_combo = QComboBox()
-        self.model_combo.setEditable(True) # Allow custom input
+        self.model_combo.setEditable(True)
         self.refresh_models()
-        model_layout.addWidget(self.model_combo)
-        
-        btn_refresh = QPushButton("↻")
-        btn_refresh.setFixedWidth(30)
-        btn_refresh.clicked.connect(self.refresh_models)
-        model_layout.addWidget(btn_refresh)
-        
+        model_row.addWidget(self.model_combo)
         btn_browse = QPushButton("...")
         btn_browse.setFixedWidth(30)
         btn_browse.clicked.connect(self.browse_model)
-        model_layout.addWidget(btn_browse)
+        model_row.addWidget(btn_browse)
+        ai_cfg_layout.addLayout(model_row)
         
-        settings_layout.addLayout(model_layout)
+        settings_layout.addWidget(self.ai_config_widget)
+        self.ai_config_widget.setVisible(False)
         
-        # Connect Button
-        settings_layout.addSpacing(20)
-        self.btn_connect = QPushButton("CONNECT")
-        self.btn_connect.setStyleSheet("background-color: #007acc; font-weight: bold; padding: 10px;")
+        # Actions
+        settings_layout.addStretch()
+        self.btn_connect = QPushButton("CONNECT TO SERVER")
+        self.btn_connect.setFixedHeight(45)
         self.btn_connect.clicked.connect(self.connect_to_server)
         settings_layout.addWidget(self.btn_connect)
         
-        self.score_label = QLabel("Scores...")
-        self.score_label.setAlignment(Qt.AlignmentFlag.AlignTop)
-        settings_layout.addWidget(self.score_label)
-        settings_layout.addStretch()
+        self.btn_ready = QPushButton("SET READY")
+        self.btn_ready.setObjectName("ReadyBtn")
+        self.btn_ready.setCheckable(True)
+        self.btn_ready.setFixedHeight(45)
+        self.btn_ready.setVisible(False)
+        self.btn_ready.clicked.connect(self.send_ready)
+        settings_layout.addWidget(self.btn_ready)
         
-        # Right: Renderer
+        self.status_label = QLabel("Ready to connect...")
+        self.status_label.setStyleSheet("color: #888;")
+        settings_layout.addWidget(self.status_label)
+        
+        # Right Panel
         self.board = GameRenderer()
-        main_layout.addWidget(settings_panel)
+        main_layout.addWidget(self.settings_panel)
         main_layout.addWidget(self.board, 1)
         
         # Logic
@@ -164,185 +200,159 @@ class MainWindow(QMainWindow):
         self.agent = None
         self.ai_timer = QTimer()
         self.ai_timer.timeout.connect(self.ai_step)
-        
-        # Init dummy env for AI observation calculation
-        self.dummy_env = BattleSnakeEnv(BattleSnakeConfig(num_snakes=4)) # Max 4
+        self.dummy_env = BattleSnakeEnv(BattleSnakeConfig(num_snakes=4))
+        self.server_state = "WAITING"
+        self.countdown = 0
+
+    def toggle_ai_config(self, mode):
+        self.ai_config_widget.setVisible(mode == "AI")
 
     def refresh_models(self):
-        """Scan agent/checkpoints for .pth files"""
-        current_text = self.model_combo.currentText()
         self.model_combo.clear()
-        
-        # Find path relative to project root
         root = Path(__file__).parent.parent
-        checkpoints_dir = root / "agent" / "checkpoints"
-        
-        files = []
-        if checkpoints_dir.exists():
-            files = list(checkpoints_dir.glob("*.pth"))
-            
-        for f in files:
-            # Add relative path for cleaner display, but handle full path loading logic later
-            # Or just absolute? Let's store absolute but show name? 
-            # Simple: Store path as user data.
-            self.model_combo.addItem(f.name, str(f))
-            
-        # Add basic defaults if empty
-        if not files:
-            self.model_combo.addItem("No models found", "")
-            
-        if current_text:
-            self.model_combo.setCurrentText(current_text)
+        files = list((root / "agent" / "checkpoints").glob("*.pth"))
+        for f in files: self.model_combo.addItem(f.name, str(f))
 
     def browse_model(self):
-        file, _ = QFileDialog.getOpenFileName(self, "Select Model", str(Path(__file__).parent.parent), "Model Files (*.pth)")
+        file, _ = QFileDialog.getOpenFileName(self, "Select Model", str(Path(__file__).parent.parent), "Models (*.pth)")
         if file:
-            # Check if likely in list
-            path = Path(file)
-            self.model_combo.insertItem(0, path.name, str(path))
+            p = Path(file); self.model_combo.insertItem(0, p.name, str(p))
             self.model_combo.setCurrentIndex(0)
 
     def connect_to_server(self):
         if self.net_thread:
-            self.net_thread.stop()
-            self.net_thread = None
-            self.btn_connect.setText("CONNECT")
-            self.btn_connect.setStyleSheet("background-color: #007acc; font-weight: bold; padding: 10px;")
-            self.player_id = -1
-            self.board.player_id = -1
-            self.board.update()
+            self.net_thread.stop(); self.net_thread = None
+            self.btn_connect.setText("CONNECT TO SERVER")
+            self.btn_ready.setVisible(False)
+            self.status_label.setText("Disconnected")
             self.ai_timer.stop()
             return
             
-        # AI Setup
         if self.mode_combo.currentText() == "AI":
-            # Get path from combo
-            path_str = self.model_combo.currentData() 
-            if not path_str: 
-                # Maybe user typed manually?
-                path_str = self.model_combo.currentText()
-                # If typed manually relative?
-                if not Path(path_str).exists():
-                     # Try resolving relative to agent/checkpoints
-                     root = Path(__file__).parent.parent
-                     maybe_path = root / "agent" / "checkpoints" / path_str
-                     if maybe_path.exists():
-                         path_str = str(maybe_path)
-            
-            path = Path(path_str) if path_str else None
-            
-            if not path or not path.exists():
-                QMessageBox.critical(self, "Error", f"Model not found: {path_str}")
-                return
-
+            path_str = self.model_combo.currentData() or self.model_combo.currentText()
+            path = Path(path_str)
+            if not path.exists():
+                QMessageBox.critical(self, "Error", "Model not found."); return
             algo = self.algo_combo.currentText().lower()
+            if not algo.endswith("agent"): algo += "agent"
             try:
-                # V5 baseline is 25D
                 self.agent = get_agent(algo, 25, str(path))
                 self.ai_timer.start(50)
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to load agent: {e}")
-                return
+                QMessageBox.critical(self, "Error", f"Load failed: {e}"); return
         
-        self.net_thread = NetworkThread(self.host_input.text(), int(self.port_input.text()))
+        self.net_thread = NetworkThread(self.host_input.text(), DEFAULT_PORT)
         self.net_thread.msg_received.connect(self.handle_message)
         self.net_thread.disconnected.connect(self.on_disconnect)
         self.net_thread.start()
         self.btn_connect.setText("DISCONNECT")
-        self.btn_connect.setStyleSheet("background-color: #cc3333; font-weight: bold; padding: 10px;")
+        self.btn_ready.setVisible(True)
+        self.btn_ready.setChecked(False)
+        self.btn_ready.setText("SET READY")
 
+    def send_ready(self, checked):
+        if self.net_thread:
+            self.net_thread.send({"type": "READY", "ready": checked})
+            self.btn_ready.setText("CANCEL READY" if checked else "SET READY")
 
     def on_disconnect(self):
         self.net_thread = None
-        self.btn_connect.setText("CONNECT")
-        self.btn_connect.setStyleSheet("background-color: #007acc; font-weight: bold; padding: 10px;")
+        self.btn_connect.setText("CONNECT TO SERVER")
+        self.btn_ready.setVisible(False)
         self.ai_timer.stop()
-        self.score_label.setText("Disconnected")
+        self.status_label.setText("Connection Lost")
 
     def handle_message(self, msg):
         typ = msg.get("type")
         if typ == "WELCOME":
             self.player_id = msg.get("player_id")
             self.board.grid_size = msg.get("width")
-        elif typ == "STATE":
-            self.board.update_state(
-                msg.get("snakes"),
-                msg.get("food"),
-                msg.get("dead"),
-                self.player_id
-            )
-            # Sync to dummy_env for AI observations (V5.0)
-            self.dummy_env.snakes = [ [tuple(x) for x in s] for s in self.board.snakes ]
-            self.dummy_env.foods = [tuple(f) for f in self.board.food]
-            self.dummy_env.dead = self.board.dead
-            self.dummy_env.dash_cooldowns = msg.get("dash_cooldowns", [0]*4)
+            self.status_label.setText(f"Connected as P{self.player_id}")
+        elif typ == "SYNC":
+            self.server_state = msg.get("state")
+            self.countdown = msg.get("countdown", 0)
             
-            # Scores
+            # Sync Ready State (V7.4 Fix)
+            r_list = msg.get("ready_list", [])
+            if self.player_id != -1:
+                is_ready_on_server = self.player_id in r_list
+                # If state is WAITING and we are out of sync, force toggle button
+                if self.server_state == "WAITING" and self.btn_ready.isChecked() != is_ready_on_server:
+                    self.btn_ready.blockSignals(True)
+                    self.btn_ready.setChecked(is_ready_on_server)
+                    self.btn_ready.setText("CANCEL READY" if is_ready_on_server else "SET READY")
+                    self.btn_ready.blockSignals(False)
+
+            # Prepare Renderer
+            self.board.update_state(msg.get("snakes", []), msg.get("food", []), msg.get("dead", []), self.player_id)
+            self.board.countdown = self.countdown if self.server_state == "COUNTDOWN" else 0
+            
+            # Lobby Status
+            r_list = msg.get("ready_list", [])
+            p_list = msg.get("player_list", [])
             scores = msg.get("scores", [])
-            txt = ""
-            for i, s in enumerate(scores):
-                prefix = "> " if i == self.player_id else "  "
-                dead = " (DEAD)" if i < len(self.board.dead) and self.board.dead[i] else ""
-                txt += f"{prefix}P{i}: {s}{dead}\n"
-            self.score_label.setText(txt)
+            
+            txt = f"SERVER: {self.server_state}\n"
+            if self.server_state == "WAITING":
+                txt += f"READY: {len(r_list)}/{len(p_list)}\n\n"
+            elif self.server_state == "COUNTDOWN":
+                txt += f"STARTING IN {self.countdown}...\n\n"
+            
+            for pid in p_list:
+                mark = "[✓] " if pid in r_list else "[  ] "
+                prefix = "★ " if pid == self.player_id else "  "
+                dead = " (DEAD)" if pid < len(self.board.dead) and self.board.dead[pid] else ""
+                s = scores[pid] if pid < len(scores) else 0
+                txt += f"{prefix}{mark}P{pid}: {s}{dead}\n"
+            self.status_label.setText(txt)
+            
+            # AI Logic
+            if self.server_state == "PLAYING" and self.mode_combo.currentText() == "AI":
+                self.dummy_env.snakes = [ [tuple(x) for x in s] for s in self.board.snakes ]
+                self.dummy_env.foods = [tuple(f) for f in self.board.food]
+                self.dummy_env.dead = self.board.dead
+                self.dummy_env.dash_cooldowns = msg.get("dash_cooldowns", [0]*4)
 
     def keyPressEvent(self, event):
-        if self.mode_combo.currentText() != "Human": return
-        
+        if self.mode_combo.currentText() != "Human" or self.server_state != "PLAYING": return
         key = event.key()
         if key == Qt.Key.Key_Space:
-            if self.player_id != -1:
-                self.net_thread.send({"type": "ACTION", "action": 3}) # DASH
-            return
-
-        target = None
-        if key == Qt.Key.Key_Up: target = Direction.UP
-        elif key == Qt.Key.Key_Down: target = Direction.DOWN
-        elif key == Qt.Key.Key_Left: target = Direction.LEFT
-        elif key == Qt.Key.Key_Right: target = Direction.RIGHT
+            self.net_thread.send({"type": "ACTION", "action": 3}); return
         
-        if target is not None and self.player_id != -1:
-             # ... (direction logic stays same)
-             if self.player_id >= len(self.board.snakes): return
-             
-             s = self.board.snakes[self.player_id]
-             if len(s) >= 2:
-                 h, n = s[0], s[1]
-                 
-                 curr = Direction.UP
-                 if h[0] == n[0] and h[1] > n[1]: curr = Direction.DOWN
-                 elif h[0] < n[0] and h[1] == n[1]: curr = Direction.LEFT
-                 elif h[0] > n[0] and h[1] == n[1]: curr = Direction.RIGHT
-                 
-                 action = 0 # Straight
-                 if (curr - 1) % 4 == target: action = 1 # Left
-                 elif (curr + 1) % 4 == target: action = 2 # Right
-                 elif abs(curr - target) == 2: return # No 180 turn
-                 
-                 self.net_thread.send({"type": "ACTION", "action": action})
+        target = {Qt.Key.Key_Up: Direction.UP, Qt.Key.Key_Down: Direction.DOWN, 
+                  Qt.Key.Key_Left: Direction.LEFT, Qt.Key.Key_Right: Direction.RIGHT}.get(key)
+        
+        if target is not None and self.player_id != -1 and self.player_id < len(self.board.snakes):
+            s = self.board.snakes[self.player_id]
+            if len(s) >= 2:
+                h, n = s[0], s[1]
+                curr = Direction.UP
+                if h[0] == n[0] and h[1] > n[1]: curr = Direction.DOWN
+                elif h[0] < n[0] and h[1] == n[1]: curr = Direction.LEFT
+                elif h[0] > n[0] and h[1] == n[1]: curr = Direction.RIGHT
+                
+                action = 0
+                if (curr - 1) % 4 == target: action = 1
+                elif (curr + 1) % 4 == target: action = 2
+                elif abs(curr - target) == 2: return
+                self.net_thread.send({"type": "ACTION", "action": action})
 
     def ai_step(self):
-        if self.player_id == -1 or not self.agent: return
-        if self.player_id >= len(self.board.snakes): return
-        if self.player_id < len(self.board.dead) and self.board.dead[self.player_id]: return
+        if self.player_id == -1 or not self.agent or self.server_state != "PLAYING": return
+        if self.player_id >= len(self.board.snakes) or self.board.dead[self.player_id]: return
         
-        # Sync directions for obs
         self.dummy_env.directions = []
-        for i, s in enumerate(self.dummy_env.snakes):
-             if len(s) >= 2:
+        for s in self.dummy_env.snakes:
+            if len(s) >= 2:
                 h, n = s[0], s[1]
                 if h[0] == n[0] and h[1] < n[1]: self.dummy_env.directions.append(Direction.UP)
                 elif h[0] == n[0] and h[1] > n[1]: self.dummy_env.directions.append(Direction.DOWN)
                 elif h[0] < n[0] and h[1] == n[1]: self.dummy_env.directions.append(Direction.LEFT)
-                elif h[0] > n[0] and h[1] == n[1]: self.dummy_env.directions.append(Direction.RIGHT)
-                else: self.dummy_env.directions.append(Direction.UP)
-             else:
-                self.dummy_env.directions.append(Direction.UP)
-
-        # Get Dict Obs (V5 expects 25D)
+                else: self.dummy_env.directions.append(Direction.RIGHT)
+            else: self.dummy_env.directions.append(Direction.UP)
+            
         obs = self.dummy_env._get_agent_obs(self.player_id)
-        action = self.agent.act(obs)
-        self.net_thread.send({"type": "ACTION", "action": action})
+        self.net_thread.send({"type": "ACTION", "action": self.agent.act(obs)})
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

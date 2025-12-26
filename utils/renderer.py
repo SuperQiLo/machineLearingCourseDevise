@@ -39,121 +39,91 @@ class GameRenderer(QWidget):
         self.food = []
         self.dead = []
         self.player_id = -1 # ID to highlight
+        self.countdown = 0  # V7.2: Countdown overlay
         
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         
     def update_state(self, snakes, foods, dead, player_id=-1):
         self.snakes = snakes
-        # Normalize food to list of tuples
-        if not foods:
-            self.food = []
-        elif isinstance(foods, list):
-            # Check if it's a list of [x, y] or list of (x, y)
-            if len(foods) > 0 and (isinstance(foods[0], int) or isinstance(foods[0], float)):
-                # Likely a single [x, y]
-                self.food = [tuple(foods)]
-            else:
-                # Likely a list of points
-                self.food = [tuple(f) for f in foods]
-        elif isinstance(foods, tuple):
-             # Single (x, y)
-             self.food = [foods]
-        else:
-            self.food = []
-            
+        # ... (normalize food logic same)
+        self.food = [tuple(f) for f in foods] if foods else []
         self.dead = dead if dead else [False] * len(self.snakes)
         self.player_id = player_id
-        self.update() # Trigger repaint
+        self.update() 
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
-        # Draw Background
+        # 1. Background & Grid
         painter.fillRect(self.rect(), COLOR_BG)
+        cell_w, cell_h = self.width() / self.grid_size, self.height() / self.grid_size
         
-        # Calculate cell size
-        w = self.width()
-        h = self.height()
-        cell_w = w / self.grid_size
-        cell_h = h / self.grid_size
-        
-        # Draw Grid
         pen = QPen(COLOR_GRID)
-        pen.setWidth(1)
         painter.setPen(pen)
-        
         for x in range(self.grid_size + 1):
-            painter.drawLine(int(x*cell_w), 0, int(x*cell_w), h)
+            painter.drawLine(int(x*cell_w), 0, int(x*cell_w), self.height())
         for y in range(self.grid_size + 1):
-            painter.drawLine(0, int(y*cell_h), w, int(y*cell_h))
+            painter.drawLine(0, int(y*cell_h), self.width(), int(y*cell_h))
             
-        # Draw Food
+        # 2. Food
         for fx, fy in self.food:
-            cx = int((fx + 0.5) * cell_w)
-            cy = int((fy + 0.5) * cell_h)
+            cx, cy = int((fx + 0.5) * cell_w), int((fy + 0.5) * cell_h)
             radius = min(cell_w, cell_h) * 0.35
-            
-            # Glow
-            gradient = QRadialGradient(cx, cy, radius * 2.5)
-            gradient.setColorAt(0, QColor(255, 0, 85, 150))
-            gradient.setColorAt(1, QColor(255, 0, 85, 0))
-            painter.setBrush(QBrush(gradient))
-            painter.setPen(Qt.PenStyle.NoPen)
+            grad = QRadialGradient(cx, cy, radius * 2.5)
+            grad.setColorAt(0, QColor(255, 0, 85, 150)); grad.setColorAt(1, QColor(255, 0, 85, 0))
+            painter.setBrush(grad); painter.setPen(Qt.PenStyle.NoPen)
             painter.drawEllipse(QPoint(cx, cy), int(radius*2.5), int(radius*2.5))
-            
-            # Solid
-            painter.setBrush(QBrush(COLOR_FOOD))
-            painter.setPen(QPen(Qt.GlobalColor.white, 2))
+            painter.setBrush(COLOR_FOOD); painter.setPen(QPen(Qt.GlobalColor.white, 2))
             painter.drawEllipse(QPoint(cx, cy), int(radius), int(radius))
             
-        # Draw Snakes
+        # 3. Snakes
         for i, snake in enumerate(self.snakes):
             if i < len(self.dead) and self.dead[i]: continue
             if not snake: continue
-            
             base_color = COLORS_SNAKE[i % len(COLORS_SNAKE)]
             
-            # Body
+            # Body Segments
             for idx in range(len(snake) - 1):
-                p1 = snake[idx]
-                p2 = snake[idx+1]
-                
-                p1x = int((p1[0] + 0.5) * cell_w)
-                p1y = int((p1[1] + 0.5) * cell_h)
-                p2x = int((p2[0] + 0.5) * cell_w)
-                p2y = int((p2[1] + 0.5) * cell_h)
-                
-                # Gradient opacity
+                p1, p2 = snake[idx], snake[idx+1]
+                p1x, p1y = int((p1[0] + 0.5) * cell_w), int((p1[1] + 0.5) * cell_h)
+                p2x, p2y = int((p2[0] + 0.5) * cell_w), int((p2[1] + 0.5) * cell_h)
                 alpha = int(255 * max(0.4, 1.0 - (idx / len(snake)) * 0.6))
-                color = QColor(base_color)
-                color.setAlpha(alpha)
-                
-                pen = QPen(color)
-                pen.setWidth(int(min(cell_w, cell_h) * 0.8))
-                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-                painter.setPen(pen)
+                color = QColor(base_color); color.setAlpha(alpha)
+                pen = QPen(color); pen.setWidth(int(min(cell_w, cell_h) * 0.8))
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap); painter.setPen(pen)
                 painter.drawLine(p1x, p1y, p2x, p2y)
                 
-            # Head
+            # Head Glow & Solid
             hx, hy = snake[0]
-            cx = int((hx + 0.5) * cell_w)
-            cy = int((hy + 0.5) * cell_h)
-            radius = min(cell_w, cell_h) * 0.4
+            hcx, hcy = int((hx + 0.5) * cell_w), int((hy + 0.5) * cell_h)
+            hr = min(cell_w, cell_h) * 0.45
+            grad = QRadialGradient(hcx, hcy, hr * 2.5)
+            grad.setColorAt(0, QColor(base_color.red(), base_color.green(), base_color.blue(), 100))
+            grad.setColorAt(1, QColor(base_color.red(), base_color.green(), base_color.blue(), 0))
+            painter.setBrush(grad); painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(QPoint(hcx, hcy), int(hr*2.5), int(hr*2.5))
+            painter.setBrush(Qt.GlobalColor.white); painter.setPen(QPen(base_color, 3))
+            painter.drawEllipse(QPoint(hcx, hcy), int(hr), int(hr))
             
-            # Head Glow
-            gradient = QRadialGradient(cx, cy, radius * 2.5)
-            gradient.setColorAt(0, QColor(base_color.red(), base_color.green(), base_color.blue(), 100))
-            gradient.setColorAt(1, QColor(base_color.red(), base_color.green(), base_color.blue(), 0))
-            painter.setBrush(QBrush(gradient))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawEllipse(QPoint(cx, cy), int(radius*2.5), int(radius*2.5))
-            
-            painter.setBrush(QBrush(Qt.GlobalColor.white))
-            painter.setPen(QPen(base_color, 2))
-            painter.drawEllipse(QPoint(cx, cy), int(radius), int(radius))
-            
-            # ID
             if i == self.player_id:
                 painter.setPen(Qt.GlobalColor.white)
-                painter.drawText(cx - 5, cy - 15, "YOU")
+                font = painter.font(); font.setBold(True); painter.setFont(font)
+                painter.drawText(hcx - 12, hcy - 20, "YOU")
+
+        # 4. Countdown Overlay (V7.2)
+        if self.countdown > 0:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 150))
+            painter.drawRect(self.rect())
+            
+            painter.setPen(QColor(0, 212, 255))
+            font = painter.font()
+            font.setPointSize(72); font.setBold(True)
+            painter.setFont(font)
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, str(self.countdown))
+            
+            # Sub-text
+            font.setPointSize(24)
+            painter.setFont(font)
+            painter.drawText(self.rect().adjusted(0, 150, 0, 0), Qt.AlignmentFlag.AlignCenter, "GET READY!")

@@ -36,8 +36,6 @@ def _discover_agents():
                     
                     key = name.replace("Agent", "").lower() # DQNAgent -> dqn
                     AGENTS[key] = obj
-                    # Also register full class name for flexibility
-                    AGENTS[name] = obj
                     
         except ImportError as e:
             print(f"Warning: Failed to import agent module {module_info.name}: {e}")

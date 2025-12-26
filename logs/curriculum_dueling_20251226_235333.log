@@ -1,0 +1,48 @@
+=== Snake AI Curriculum Training [DUELING] ===
+
+>>> [Curriculum] Starting Phase: 1. Pre-training (Single Snake) -> agent/checkpoints/dueling_pretrain.pth
+>>> Command: train_dqn_variants.py --variant dueling --single --steps 500000 --save agent/checkpoints/dueling_pretrain.pth
+>>> [V6.9 Survival-Balanced] Variant: DUELING | LR: 0.00015 | GradClip: 0.8
+>>> PHASE 1 (Single) | Closer: 0.05 | Death: -15.0
+>>> Starting DUELING Training (V6.7 Omni-Batch)...
+Step: 2000 | EPS: 0.99 | Rew: -16.54 | FPS: 3359.3 | Var: dueling
+Step: 4000 | EPS: 0.98 | Rew: -16.13 | FPS: 508.6 | Var: dueling
+Step: 6000 | EPS: 0.97 | Rew: -15.14 | FPS: 545.2 | Var: dueling
+Step: 8000 | EPS: 0.96 | Rew: -14.38 | FPS: 525.1 | Var: dueling
+Step: 10000 | EPS: 0.95 | Rew: -13.07 | FPS: 546.9 | Var: dueling
+Step: 12000 | EPS: 0.94 | Rew: -13.38 | FPS: 565.3 | Var: dueling
+Step: 14000 | EPS: 0.93 | Rew: -15.09 | FPS: 536.1 | Var: dueling
+Step: 16000 | EPS: 0.92 | Rew: -13.02 | FPS: 531.3 | Var: dueling
+Step: 18000 | EPS: 0.91 | Rew: -12.59 | FPS: 508.6 | Var: dueling
+Step: 20000 | EPS: 0.90 | Rew: -12.75 | FPS: 2479.2 | Var: dueling
+Step: 30000 | EPS: 0.85 | Rew: -6.08 | FPS: 499.8 | Var: dueling
+Step: 40000 | EPS: 0.80 | Rew: -2.52 | FPS: 492.8 | Var: dueling
+Step: 50000 | EPS: 0.75 | Rew: 0.80 | FPS: 489.5 | Var: dueling
+Step: 60000 | EPS: 0.70 | Rew: 16.43 | FPS: 488.5 | Var: dueling
+Step: 70000 | EPS: 0.65 | Rew: 24.71 | FPS: 484.4 | Var: dueling
+Step: 80000 | EPS: 0.60 | Rew: 23.52 | FPS: 470.7 | Var: dueling
+Step: 90000 | EPS: 0.55 | Rew: 34.20 | FPS: 476.6 | Var: dueling
+Step: 100000 | EPS: 0.50 | Rew: 38.97 | FPS: 490.9 | Var: dueling
+Step: 110000 | EPS: 0.45 | Rew: 36.02 | FPS: 477.2 | Var: dueling
+Step: 120000 | EPS: 0.40 | Rew: 20.35 | FPS: 476.7 | Var: dueling
+Step: 130000 | EPS: 0.35 | Rew: 21.18 | FPS: 478.5 | Var: dueling
+Step: 140000 | EPS: 0.30 | Rew: 23.15 | FPS: 482.5 | Var: dueling
+Step: 150000 | EPS: 0.25 | Rew: 35.72 | FPS: 466.2 | Var: dueling
+Step: 160000 | EPS: 0.20 | Rew: 62.00 | FPS: 466.0 | Var: dueling
+Step: 170000 | EPS: 0.15 | Rew: 89.38 | FPS: 477.7 | Var: dueling
+Step: 180000 | EPS: 0.10 | Rew: 89.94 | FPS: 479.0 | Var: dueling
+Step: 190000 | EPS: 0.05 | Rew: 125.58 | FPS: 479.2 | Var: dueling
+Step: 200000 | EPS: 0.05 | Rew: 148.36 | FPS: 470.7 | Var: dueling
+Step: 210000 | EPS: 0.05 | Rew: 153.94 | FPS: 480.4 | Var: dueling
+Step: 220000 | EPS: 0.05 | Rew: 149.88 | FPS: 476.2 | Var: dueling
+Step: 230000 | EPS: 0.05 | Rew: 123.14 | FPS: 468.6 | Var: dueling
+Step: 240000 | EPS: 0.05 | Rew: 84.39 | FPS: 473.0 | Var: dueling
+Step: 250000 | EPS: 0.05 | Rew: 45.96 | FPS: 471.2 | Var: dueling
+Step: 260000 | EPS: 0.05 | Rew: 22.89 | FPS: 470.4 | Var: dueling
+Step: 270000 | EPS: 0.05 | Rew: -9.03 | FPS: 470.5 | Var: dueling
+Step: 280000 | EPS: 0.05 | Rew: -7.06 | FPS: 276.6 | Var: dueling
+Step: 290000 | EPS: 0.05 | Rew: -6.32 | FPS: 395.9 | Var: dueling
+Step: 300000 | EPS: 0.05 | Rew: -6.35 | FPS: 492.6 | Var: dueling
+Step: 310000 | EPS: 0.05 | Rew: -10.42 | FPS: 495.8 | Var: dueling
+Step: 320000 | EPS: 0.05 | Rew: -11.20 | FPS: 485.9 | Var: dueling
+Step: 330000 | EPS: 0.05 | Rew: -14.52 | FPS: 480.2 | Var: dueling

@@ -1,0 +1,51 @@
+=== Snake AI Curriculum Training [PER] ===
+
+>>> [Curriculum] Starting Phase: 1. Pre-training (Single Snake) -> agent/checkpoints/per_pretrain.pth
+>>> Command: train_dqn_variants.py --variant per --single --steps 500000 --save agent/checkpoints/per_pretrain.pth
+>>> [V6.9 Survival-Balanced] Variant: PER | LR: 5e-05 | GradClip: 0.5
+>>> PHASE 1 (Single) | Closer: 0.05 | Death: -15.0
+>>> Starting PER Training (V6.7 Omni-Batch)...
+Step: 2000 | EPS: 0.99 | Rew: -14.77 | FPS: 654.1 | Var: per
+Step: 4000 | EPS: 0.98 | Rew: -14.92 | FPS: 555.5 | Var: per
+Step: 6000 | EPS: 0.97 | Rew: -16.42 | FPS: 582.8 | Var: per
+Step: 8000 | EPS: 0.96 | Rew: -16.39 | FPS: 578.4 | Var: per
+Step: 10000 | EPS: 0.95 | Rew: -16.09 | FPS: 557.5 | Var: per
+Step: 12000 | EPS: 0.94 | Rew: -14.52 | FPS: 602.6 | Var: per
+Step: 14000 | EPS: 0.93 | Rew: -14.24 | FPS: 580.2 | Var: per
+Step: 16000 | EPS: 0.92 | Rew: -12.83 | FPS: 582.0 | Var: per
+Step: 18000 | EPS: 0.91 | Rew: -14.83 | FPS: 550.0 | Var: per
+Step: 20000 | EPS: 0.90 | Rew: -13.57 | FPS: 2731.5 | Var: per
+Step: 30000 | EPS: 0.85 | Rew: -8.88 | FPS: 560.3 | Var: per
+Step: 40000 | EPS: 0.80 | Rew: 3.53 | FPS: 524.6 | Var: per
+Step: 50000 | EPS: 0.75 | Rew: 4.10 | FPS: 539.8 | Var: per
+Step: 60000 | EPS: 0.70 | Rew: 10.72 | FPS: 528.6 | Var: per
+Step: 70000 | EPS: 0.65 | Rew: 25.13 | FPS: 514.5 | Var: per
+Step: 80000 | EPS: 0.60 | Rew: 32.20 | FPS: 524.3 | Var: per
+Step: 90000 | EPS: 0.55 | Rew: 40.44 | FPS: 508.1 | Var: per
+Step: 100000 | EPS: 0.50 | Rew: 51.65 | FPS: 525.9 | Var: per
+Step: 110000 | EPS: 0.45 | Rew: 34.54 | FPS: 528.0 | Var: per
+Step: 120000 | EPS: 0.40 | Rew: 17.79 | FPS: 515.6 | Var: per
+Step: 130000 | EPS: 0.35 | Rew: 31.78 | FPS: 515.6 | Var: per
+Step: 140000 | EPS: 0.30 | Rew: 39.69 | FPS: 506.8 | Var: per
+Step: 150000 | EPS: 0.25 | Rew: 55.16 | FPS: 529.8 | Var: per
+Step: 160000 | EPS: 0.20 | Rew: 43.83 | FPS: 512.0 | Var: per
+Step: 170000 | EPS: 0.15 | Rew: 89.28 | FPS: 517.6 | Var: per
+Step: 180000 | EPS: 0.10 | Rew: 127.23 | FPS: 525.7 | Var: per
+Step: 190000 | EPS: 0.10 | Rew: 154.35 | FPS: 515.9 | Var: per
+Step: 200000 | EPS: 0.10 | Rew: 53.09 | FPS: 506.8 | Var: per
+Step: 210000 | EPS: 0.10 | Rew: 52.70 | FPS: 509.9 | Var: per
+Step: 220000 | EPS: 0.10 | Rew: 35.72 | FPS: 526.9 | Var: per
+Step: 230000 | EPS: 0.10 | Rew: 17.29 | FPS: 511.4 | Var: per
+Step: 240000 | EPS: 0.10 | Rew: 9.42 | FPS: 518.8 | Var: per
+Step: 250000 | EPS: 0.10 | Rew: 11.81 | FPS: 513.2 | Var: per
+Step: 260000 | EPS: 0.10 | Rew: 27.91 | FPS: 506.3 | Var: per
+Step: 270000 | EPS: 0.10 | Rew: 11.31 | FPS: 512.2 | Var: per
+Step: 280000 | EPS: 0.10 | Rew: 27.23 | FPS: 506.9 | Var: per
+Step: 290000 | EPS: 0.10 | Rew: 23.49 | FPS: 508.6 | Var: per
+Step: 300000 | EPS: 0.10 | Rew: 6.18 | FPS: 347.1 | Var: per
+Step: 310000 | EPS: 0.10 | Rew: -6.65 | FPS: 347.7 | Var: per
+Step: 320000 | EPS: 0.10 | Rew: -8.44 | FPS: 528.8 | Var: per
+Step: 330000 | EPS: 0.10 | Rew: -15.26 | FPS: 553.1 | Var: per
+Step: 340000 | EPS: 0.10 | Rew: -20.64 | FPS: 537.5 | Var: per
+Step: 350000 | EPS: 0.10 | Rew: -19.08 | FPS: 546.1 | Var: per
+Step: 360000 | EPS: 0.10 | Rew: -21.61 | FPS: 519.1 | Var: per

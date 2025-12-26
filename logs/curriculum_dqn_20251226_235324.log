@@ -1,0 +1,87 @@
+=== Snake AI Curriculum Training [DQN] ===
+
+>>> [Curriculum] Starting Phase: 1. Pre-training (Single Snake) -> agent/checkpoints/dqn_pretrain.pth
+>>> Command: train_dqn_variants.py --variant dqn --single --steps 500000 --save agent/checkpoints/dqn_pretrain.pth
+>>> [V6.9 Survival-Balanced] Variant: DQN | LR: 0.0001 | GradClip: 1.0
+>>> PHASE 1 (Single) | Closer: 0.15 | Death: -15.0
+>>> Starting DQN Training (V6.7 Omni-Batch)...
+Step: 2000 | EPS: 0.99 | Rew: -11.58 | FPS: 3752.5 | Var: dqn
+Step: 4000 | EPS: 0.98 | Rew: -13.43 | FPS: 383.0 | Var: dqn
+Step: 6000 | EPS: 0.97 | Rew: -14.02 | FPS: 217.6 | Var: dqn
+Step: 8000 | EPS: 0.96 | Rew: -12.30 | FPS: 388.9 | Var: dqn
+Step: 10000 | EPS: 0.95 | Rew: -13.49 | FPS: 1016.1 | Var: dqn
+Step: 12000 | EPS: 0.94 | Rew: -13.07 | FPS: 940.6 | Var: dqn
+Step: 14000 | EPS: 0.93 | Rew: -12.89 | FPS: 998.9 | Var: dqn
+Step: 16000 | EPS: 0.92 | Rew: -10.48 | FPS: 936.1 | Var: dqn
+Step: 18000 | EPS: 0.91 | Rew: -12.10 | FPS: 875.9 | Var: dqn
+Step: 20000 | EPS: 0.90 | Rew: -12.86 | FPS: 4812.4 | Var: dqn
+Step: 30000 | EPS: 0.85 | Rew: -6.38 | FPS: 929.0 | Var: dqn
+Step: 40000 | EPS: 0.80 | Rew: -4.57 | FPS: 911.1 | Var: dqn
+Step: 50000 | EPS: 0.75 | Rew: -11.84 | FPS: 880.3 | Var: dqn
+Step: 60000 | EPS: 0.70 | Rew: -12.93 | FPS: 910.8 | Var: dqn
+Step: 70000 | EPS: 0.65 | Rew: -8.21 | FPS: 876.0 | Var: dqn
+Step: 80000 | EPS: 0.60 | Rew: -11.30 | FPS: 859.5 | Var: dqn
+Step: 90000 | EPS: 0.55 | Rew: -13.66 | FPS: 857.9 | Var: dqn
+Step: 100000 | EPS: 0.50 | Rew: -11.01 | FPS: 893.9 | Var: dqn
+Step: 110000 | EPS: 0.45 | Rew: -6.69 | FPS: 877.1 | Var: dqn
+Step: 120000 | EPS: 0.40 | Rew: -6.56 | FPS: 875.2 | Var: dqn
+Step: 130000 | EPS: 0.35 | Rew: -8.90 | FPS: 886.4 | Var: dqn
+Step: 140000 | EPS: 0.30 | Rew: -8.32 | FPS: 882.4 | Var: dqn
+Step: 150000 | EPS: 0.25 | Rew: -5.07 | FPS: 864.8 | Var: dqn
+Step: 160000 | EPS: 0.20 | Rew: -4.63 | FPS: 885.7 | Var: dqn
+Step: 170000 | EPS: 0.15 | Rew: -8.19 | FPS: 874.2 | Var: dqn
+Step: 180000 | EPS: 0.10 | Rew: -8.59 | FPS: 893.3 | Var: dqn
+Step: 190000 | EPS: 0.05 | Rew: -9.96 | FPS: 906.1 | Var: dqn
+Step: 200000 | EPS: 0.05 | Rew: -11.24 | FPS: 867.0 | Var: dqn
+Step: 210000 | EPS: 0.05 | Rew: 28.77 | FPS: 860.5 | Var: dqn
+Step: 220000 | EPS: 0.05 | Rew: 62.49 | FPS: 901.0 | Var: dqn
+Step: 230000 | EPS: 0.05 | Rew: 74.78 | FPS: 882.1 | Var: dqn
+Step: 240000 | EPS: 0.05 | Rew: 89.70 | FPS: 853.2 | Var: dqn
+Step: 250000 | EPS: 0.05 | Rew: 95.82 | FPS: 856.4 | Var: dqn
+Step: 260000 | EPS: 0.05 | Rew: 136.49 | FPS: 885.8 | Var: dqn
+Step: 270000 | EPS: 0.05 | Rew: 164.34 | FPS: 858.3 | Var: dqn
+Step: 280000 | EPS: 0.05 | Rew: 196.12 | FPS: 854.4 | Var: dqn
+Step: 290000 | EPS: 0.05 | Rew: 184.00 | FPS: 864.7 | Var: dqn
+Step: 300000 | EPS: 0.05 | Rew: 154.79 | FPS: 877.0 | Var: dqn
+Step: 310000 | EPS: 0.05 | Rew: 183.87 | FPS: 892.6 | Var: dqn
+Step: 320000 | EPS: 0.05 | Rew: 250.40 | FPS: 857.1 | Var: dqn
+Step: 330000 | EPS: 0.05 | Rew: 300.75 | FPS: 843.3 | Var: dqn
+Step: 340000 | EPS: 0.05 | Rew: 333.09 | FPS: 864.0 | Var: dqn
+Step: 350000 | EPS: 0.05 | Rew: 404.75 | FPS: 869.6 | Var: dqn
+Step: 360000 | EPS: 0.05 | Rew: 482.62 | FPS: 862.4 | Var: dqn
+Step: 370000 | EPS: 0.05 | Rew: 545.66 | FPS: 854.8 | Var: dqn
+Step: 380000 | EPS: 0.05 | Rew: 602.36 | FPS: 853.7 | Var: dqn
+Step: 390000 | EPS: 0.05 | Rew: 631.01 | FPS: 846.0 | Var: dqn
+Step: 400000 | EPS: 0.05 | Rew: 635.76 | FPS: 854.9 | Var: dqn
+Step: 410000 | EPS: 0.05 | Rew: 710.03 | FPS: 839.8 | Var: dqn
+Step: 420000 | EPS: 0.05 | Rew: 719.93 | FPS: 849.8 | Var: dqn
+Step: 430000 | EPS: 0.05 | Rew: 728.40 | FPS: 854.7 | Var: dqn
+Step: 440000 | EPS: 0.05 | Rew: 750.31 | FPS: 881.3 | Var: dqn
+Step: 450000 | EPS: 0.05 | Rew: 670.44 | FPS: 828.7 | Var: dqn
+Step: 460000 | EPS: 0.05 | Rew: 717.67 | FPS: 855.2 | Var: dqn
+Step: 470000 | EPS: 0.05 | Rew: 675.61 | FPS: 867.9 | Var: dqn
+Step: 480000 | EPS: 0.05 | Rew: 713.91 | FPS: 858.2 | Var: dqn
+Step: 490000 | EPS: 0.05 | Rew: 728.83 | FPS: 878.5 | Var: dqn
+Step: 500000 | EPS: 0.05 | Rew: 727.12 | FPS: 869.0 | Var: dqn
+>>> [Curriculum] Phase completed successfully.
+
+>>> [Curriculum] Starting Phase: 2. Fine-tuning (Battle Mode) -> agent/checkpoints/dqn_battle.pth
+>>> Command: train_dqn_variants.py --variant dqn --load agent/checkpoints/dqn_pretrain.pth --steps 500000 --save agent/checkpoints/dqn_battle.pth
+>>> [V6.9 Survival-Balanced] Variant: DQN | LR: 0.0001 | GradClip: 1.0
+>>> PHASE 2 (Battle) | Closer: 0.05 | Death: -15.0 | SurvivalBonus: 0.01
+>>> Loading weights from agent/checkpoints/dqn_pretrain.pth...
+>>> Starting DQN Training (V6.7 Omni-Batch)...
+Step: 2000 | EPS: 0.99 | Rew: -14.25 | FPS: 225.5 | Var: dqn
+Step: 4000 | EPS: 0.98 | Rew: -15.24 | FPS: 534.3 | Var: dqn
+Step: 6000 | EPS: 0.97 | Rew: -17.02 | FPS: 289.4 | Var: dqn
+Step: 8000 | EPS: 0.96 | Rew: -16.73 | FPS: 226.6 | Var: dqn
+Step: 10000 | EPS: 0.95 | Rew: -16.85 | FPS: 577.3 | Var: dqn
+Step: 12000 | EPS: 0.94 | Rew: -15.01 | FPS: 581.0 | Var: dqn
+Step: 14000 | EPS: 0.93 | Rew: -15.48 | FPS: 550.1 | Var: dqn
+Step: 16000 | EPS: 0.92 | Rew: -15.98 | FPS: 556.8 | Var: dqn
+Step: 18000 | EPS: 0.91 | Rew: -14.91 | FPS: 554.7 | Var: dqn
+Step: 20000 | EPS: 0.90 | Rew: -15.57 | FPS: 2764.8 | Var: dqn
+Step: 30000 | EPS: 0.85 | Rew: -15.63 | FPS: 551.5 | Var: dqn
+Step: 40000 | EPS: 0.80 | Rew: -13.27 | FPS: 555.0 | Var: dqn
+Step: 50000 | EPS: 0.75 | Rew: -15.88 | FPS: 535.2 | Var: dqn
+Step: 60000 | EPS: 0.70 | Rew: -14.22 | FPS: 546.3 | Var: dqn

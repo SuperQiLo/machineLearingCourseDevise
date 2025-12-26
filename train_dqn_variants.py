@@ -134,7 +134,7 @@ class TrainConfig:
     batch_size: int = 256
     lr: float = 1e-4
     eps_decay: int = 200_000
-    tau: float = 0.005 # Soft update parameter
+    tau: float = 0.005 # V7.9: Restored to 0.005 for faster alignment/convergence
     num_snakes: int = 4
     pool_dir: str = "agent/pool/dqn"
     load_path: Optional[str] = None
@@ -152,39 +152,45 @@ class DQNVariantTrainer:
 
         # Algorithm-Specific Hyperparameters (V6.9 Optim-Matrix)
         if cfg.variant == "dqn":
-            self.lr = 5.0e-5
+            self.lr = 1.0e-4 
+            self.tau = 0.005 # V8.0: Aggressive for vanilla
             self.closer_reward = 0.15
             self.buffer_size = 300_000
             self.grad_clip = 1.0
         elif cfg.variant == "ddqn":
-            self.lr = 1.0e-4
+            self.lr = 1.0e-4 
+            self.tau = 0.005 # V8.0: Aggressive for vanilla
             self.closer_reward = 0.08
             self.buffer_size = 400_000
             self.grad_clip = 1.0
         elif cfg.variant == "per":
-            self.lr = 1.0e-4 # Reduced from 2e-4 for PER stability
+            self.lr = 5.0e-5 
+            self.tau = 0.002 # V8.0: Reverted to smooth for PER stability
             self.closer_reward = 0.05
             self.buffer_size = 300_000
-            self.grad_clip = 0.5 # Tighten clipping for PER
+            self.grad_clip = 0.5 
         elif cfg.variant == "dueling":
-            self.lr = 1.5e-4 if cfg.single_snake else 2.5e-4 # Boost Battle LR for Dueling
+            # V8.0: Re-tuned Dueling for Ph1 (1.5e-4 -> 1.2e-4)
+            self.lr = 1.2e-4 if cfg.single_snake else 2.5e-4 
+            self.tau = 0.002 # V8.0: Reverted to smooth for Dueling stability
             self.closer_reward = 0.05
             self.buffer_size = 400_000
             self.grad_clip = 0.8
         else:
             self.lr = 2.0e-4
+            self.tau = 0.005
             self.closer_reward = 0.01
             self.buffer_size = 250_000
             self.grad_clip = 1.0
 
-        log(f">>> [V6.9 Survival-Balanced] Variant: {cfg.variant.upper()} | LR: {self.lr} | GradClip: {self.grad_clip}")
+        log(f">>> [V8.0 Asymmetric-Tuning] Variant: {cfg.variant.upper()} | LR: {self.lr} | Tau: {self.tau} | GradClip: {self.grad_clip}")
         
         env_cfg = BattleSnakeConfig(num_snakes=cfg.num_snakes, dash_cooldown_steps=15)
         if cfg.num_snakes == 1:
             # Phase 1: High focus on navigation
             env_cfg.closer_reward = self.closer_reward
             env_cfg.food_reward = 25.0
-            env_cfg.death_penalty = -20.0
+            env_cfg.death_penalty = -15.0 # V7.5: More forgiving Ph1 (-20 -> -15)
             log(f">>> PHASE 1 (Single) | Closer: {env_cfg.closer_reward} | Death: {env_cfg.death_penalty}")
         else:
             # Phase 2: Survival & Combat Balance (V6.9)
@@ -265,7 +271,9 @@ class DQNVariantTrainer:
             groups: Dict[Optional[nn.Module], List[Tuple[int, int, Dict]]] = {None: []}
             
             self.steps += self.cfg.num_envs
-            eps = max(0.05, 1.0 - self.steps / self.cfg.eps_decay)
+            # V7.5: Protect PER Ph1 exploration (Min 0.1 if single_snake)
+            eps_min = 0.1 if (self.cfg.variant == "per" and self.cfg.single_snake) else 0.05
+            eps = max(eps_min, 1.0 - self.steps / self.cfg.eps_decay)
             
             all_actions = [ [None]*self.cfg.num_snakes for _ in range(self.cfg.num_envs) ]
             
@@ -342,7 +350,7 @@ class DQNVariantTrainer:
 
             # 5. Soft Update
             for target_param, policy_param in zip(self.target_net.parameters(), self.policy_net.parameters()):
-                target_param.data.copy_(self.cfg.tau * policy_param.data + (1.0 - self.cfg.tau) * target_param.data)
+                target_param.data.copy_(self.tau * policy_param.data + (1.0 - self.tau) * target_param.data)
                 
             # 5. Heartbeat Logging
             log_interval = 2000 if self.steps < 20000 else 10000
