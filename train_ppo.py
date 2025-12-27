@@ -30,17 +30,18 @@ def make_env(num_snakes, grid_size, seed=None):
             dash_cooldown_steps=15 # ENSURE V5.0 MECHANICS
         )
         if num_snakes == 1:
-            # Phase 1: Navigation emphasis
-            env_cfg.closer_reward = 0.08
+            # Phase 1: Navigation emphasis (V9.2 Aligned with DQN)
+            env_cfg.closer_reward = 0.15
+            env_cfg.farther_penalty = -0.10  # V12.0: Explicit alignment with DQN
             env_cfg.food_reward = 25.0
-            env_cfg.death_penalty = -20.0
-        else:
-            # Phase 2: Survival & Combat Balance (V6.9)
-            env_cfg.closer_reward = 0.05
-            env_cfg.step_reward = 0.01 
-            env_cfg.kill_reward = 30.0
             env_cfg.death_penalty = -15.0
-            env_cfg.food_reward = 20.0
+        else:
+            # Phase 2: Aggressive Combat & Survival (V9.0)
+            env_cfg.closer_reward = 0.05
+            env_cfg.step_reward = 0.05   # V9.0: (0.01 -> 0.05)
+            env_cfg.kill_reward = 50.0   # V9.0: (30 -> 50)
+            env_cfg.death_penalty = -15.0
+            env_cfg.food_reward = 30.0   # V9.0: (20 -> 30)
         return BattleSnakeEnv(env_cfg, seed=seed)
     return thunk
 
@@ -55,15 +56,19 @@ class VectorizedEnv:
 
     def _get_model(self, path: str) -> Optional[nn.Module]:
         if path not in self.loaded_models:
+            # V11.2 I/O Shield: Prevent deadlock during disk write collision
             try:
-                model = ActorCritic(vector_dim=25).to(self.device)
+                model = ActorCritic(vector_dim=25).to(self.device).eval()
                 state_dict = torch.load(path, map_location=self.device, weights_only=True)
                 model.load_state_dict(state_dict)
-                model.eval()
+                for p in model.parameters(): p.requires_grad = False
                 self.loaded_models[path] = model
                 if len(self.loaded_models) > 5:
                     del self.loaded_models[next(iter(self.loaded_models))]
-            except Exception: return None
+            except Exception as e:
+                # Log but don't hang/crash
+                log(f"--- [I/O CACHE] Load failed for {Path(path).name}: {e}. Using Random.")
+                return None
         return self.loaded_models.get(path)
 
     def reset(self): return [env.reset() for env in self.envs]
@@ -89,12 +94,12 @@ class VectorizedEnv:
         # 2. Omni-Batch Inference for opponents
         for model, samples in groups.items():
             if not samples or model is None: continue
-            with torch.no_grad():
+            with torch.inference_mode(): # V9.0 Speedup
                 grids = np.array([s[2]['grid'] for s in samples])
                 vecs = np.array([s[2]['vector'] for s in samples])
                 t_g = torch.as_tensor(grids, dtype=torch.float32, device=self.device)
                 t_v = torch.as_tensor(vecs, dtype=torch.float32, device=self.device)
-                logits, _ = model.actor(torch.cat([model.conv(t_g), t_v], dim=1)), None
+                logits, _ = model(t_g, t_v) # Standard AC call
                 acts = logits.argmax(dim=1).cpu().numpy()
                 for idx, (e_idx, s_idx, _) in enumerate(samples):
                     all_actions[e_idx][s_idx] = int(acts[idx])
@@ -109,7 +114,10 @@ def train_ppo(num_envs=8, num_snakes=4, total_timesteps=2_000_000,
               self_play_prob=0.3, lr=2.5e-4):
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log(f">>> [V6.1 FIX] PPO Device: {device} | Snakes: {num_snakes}")
+    # V8.1: Precision smoothing for battle phase
+    if num_snakes > 1:
+        lr = lr * 0.6
+    log(f">>> [V8.1 FIX] PPO Device: {device} | Snakes: {num_snakes} | BaseLR: {lr:.2e}")
     Path("agent/checkpoints").mkdir(parents=True, exist_ok=True)
     sp_manager = SelfPlayManager("agent/pool/ppo")
     
@@ -131,10 +139,11 @@ def train_ppo(num_envs=8, num_snakes=4, total_timesteps=2_000_000,
             sys.exit(1)
         
     optimizer = optim.Adam(agent.parameters(), lr=lr, eps=1e-5)
-    num_steps, batch_size = 128, num_envs * 128
+    # V10.1 A6000 Turbo: Scale up for high-VRAM throughput
+    num_steps, batch_size, mini_batch = 128, num_envs * 128, 512
     
     envs = VectorizedEnv([make_env(num_snakes, 20, i) for i in range(num_envs)], device)
-    log(f">>> Starting PPO Training: {num_envs} Envs | {num_snakes} Snakes.")
+    log(f">>> [A6000 TURBO] Envs: {num_envs} | Batch: {batch_size} | Mini: {mini_batch}")
     obs_list = envs.reset() 
     
     # Verify observation dimension at start
@@ -144,17 +153,29 @@ def train_ppo(num_envs=8, num_snakes=4, total_timesteps=2_000_000,
     current_rewards = np.zeros(num_envs)
 
     while global_step < total_timesteps:
-        # LR Decay and Multi-Stage Precision (V7.0)
-        frac = 1.0 - (global_step / total_timesteps)
-        # Final 20% of frames: Additional precision decay
-        if global_step > total_timesteps * 0.8:
-            frac *= 0.1
-        for g in optimizer.param_groups: g['lr'] = frac * lr
+        # V10.6 Dynamic Cooling: Linearly decay entropy to Lock-in policy
+        # Heartbeat added to track stagnation at 60% (possible Race Condition)
+        frac = max(0.0, 1.0 - (global_step / total_timesteps))
+        min_factor = 0.1 # V11.1: Restored to 10% floor for late stability
+        current_lr = lr * max(min_factor, frac)
+        ent_coef = max(0.01, 0.05 * frac) 
 
+        for g in optimizer.param_groups: 
+            g['lr'] = current_lr
+
+        if global_step % 20480 < num_envs:
+            log(f">>> [HEARTBEAT] Loop Start | Progress: {(global_step/total_timesteps)*100:.1f}%")
+        
+        # V10.8: Restore buffer initialization (Fixed NameError)
         b_grid, b_vector, b_acts, b_logprobs, b_rewards, b_dones, b_values = [], [], [], [], [], [], []
         
+        # --- STAGE 1: Collection ---
         for _ in range(num_steps):
             global_step += num_envs
+            # Sub-Loop Heartbeat for V11.2 (Settle 60% Freeze)
+            if global_step % 2048 == 0:
+                pass # Minimal overhead
+            
             flat_grid, flat_vec = [o[0]['grid'] for o in obs_list], [o[0]['vector'] for o in obs_list]
             t_grid = torch.tensor(np.array(flat_grid), dtype=torch.float32).to(device)
             t_vec = torch.tensor(np.array(flat_vec), dtype=torch.float32).to(device)
@@ -173,14 +194,21 @@ def train_ppo(num_envs=8, num_snakes=4, total_timesteps=2_000_000,
                     # Self-Play Shuffle (V6.8)
                     if num_snakes > 1 and random.random() < self_play_prob:
                          for s_idx in range(1, num_snakes):
-                             m_p = sp_manager.sample_model(chaos_prob=0.1) # V7.0 Diversity
-                             if m_p: envs.opp_model_paths[i][s_idx] = str(m_p)
+                             try:
+                                 m_p = sp_manager.sample_model(chaos_prob=0.1) 
+                                 if m_p: envs.opp_model_paths[i][s_idx] = str(m_p)
+                             except Exception as e:
+                                 log(f"!!! [SP ERROR] Sample failed: {e}. Skipping to avoid deadlock.")
             
             b_grid.append(t_grid); b_vector.append(t_vec); b_acts.append(action)
             b_logprobs.append(logprob); b_values.append(value.flatten())
             b_rewards.append(torch.tensor([r[0] for r in rewards], device=device))
             b_dones.append(torch.tensor([d[0] for d in dones], device=device).float())
             obs_list = next_obs
+        
+        # --- STAGE 2: GAE ---
+        if global_step % 20480 < num_envs:
+            log(f">>> [HEARTBEAT] Advantage Calculation...")
 
         # Advantage (GAE)
         with torch.no_grad():
@@ -199,25 +227,29 @@ def train_ppo(num_envs=8, num_snakes=4, total_timesteps=2_000_000,
             advantages[t] = lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
         returns, b_adv = (advantages + bval).reshape(-1), advantages.reshape(-1)
         
-        # Optimization
+        # --- STAGE 3: Optimization ---
+        if global_step % 20480 < num_envs:
+            log(f">>> [HEARTBEAT] Optimization Phase...")
         inds = np.arange(batch_size)
         for _ in range(4):
             np.random.shuffle(inds)
-            for s in range(0, batch_size, 64):
-                mb = inds[s:s+64]
+            for s in range(0, batch_size, mini_batch):
+                mb = inds[s:s+mini_batch]
                 _, nlp, ent, nv = agent.get_action_and_value(bg[mb], bv[mb], ba[mb])
                 ratio = (nlp - blp[mb]).exp()
                 mb_a = (b_adv[mb] - b_adv[mb].mean())/(b_adv[mb].std() + 1e-8)
-                pg_loss = torch.max(-mb_a * ratio, -mb_a * torch.clamp(ratio, 0.8, 1.2)).mean()
+                # V11.0 Smoothing: Tighter clip_range (0.15) to reduce oscillations
+                pg_loss = torch.max(-mb_a * ratio, -mb_a * torch.clamp(ratio, 0.85, 1.15)).mean()
                 v_loss = 0.5 * ((nv.view(-1) - returns[mb])**2).mean()
-                optimizer.zero_grad(); (pg_loss - 0.03 * ent.mean() + 0.5 * v_loss).backward()
+                # V10.6: Dynamic Entropy to consolidated policy
+                optimizer.zero_grad(); (pg_loss - ent_coef * ent.mean() + 0.5 * v_loss).backward()
                 nn.utils.clip_grad_norm_(agent.parameters(), 0.3); optimizer.step()
                 
         # Logging
         if global_step % 10240 < num_envs:
             avg_rew = np.mean(ep_rewards[-50:]) if ep_rewards else 0
             perc = (global_step/total_timesteps)*100
-            log(f">>> [Progress {perc:.1f}%] Step: {global_step} | Ep_Rew: {avg_rew:.2f} | Info: LR={frac*lr:.2e}")
+            log(f">>> [Progress {perc:.1f}%] Step: {global_step} | Ep_Rew: {avg_rew:.2f} | Info: LR={current_lr:.2e}")
             if global_step % 204800 < num_envs:
                 torch.save(agent.state_dict(), checkpoint_path)
                 sp_manager.add_model(agent.state_dict(), f"ppo_v4_step_{global_step}")
@@ -230,6 +262,11 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--single", action="store_true"); p.add_argument("--load", type=str); p.add_argument("--steps", type=int, default=1000000)
     args = p.parse_args(); num = 1 if args.single else 4
+    # V11.2: num_envs defined by hardware (A6000 scale)
+    # Reduced from 32 to 16 to avoid I/O Deadlock during model loading
+    n_envs = 8 if args.single else 16
+    # V11.2 saturation training: 4.0M steps for Battle Phase
+    steps = args.steps if args.single else 4000000
     ckpt = "agent/checkpoints/ppo_best.pth" if args.single else "agent/checkpoints/ppo_battle_best.pth"
     
-    train_ppo(num_snakes=num, total_timesteps=args.steps, load_path=args.load, checkpoint_path=ckpt)
+    train_ppo(num_envs=n_envs, num_snakes=num, total_timesteps=steps, load_path=args.load, checkpoint_path=ckpt)

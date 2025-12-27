@@ -33,8 +33,8 @@ class ActorCritic(nn.Module):
             nn.Tanh(),
             nn.Linear(512, 256),
             nn.Tanh(),
-            nn.Linear(256, action_dim),
-            nn.Softmax(dim=-1)
+            nn.Linear(256, action_dim)
+            # Softmax removed for Logits-based sampling (V9.2)
         )
         
         # 3. Critic Head
@@ -55,6 +55,10 @@ class ActorCritic(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
+    def forward(self, grid, vector):
+        shared = self.forward_shared(grid, vector)
+        return self.actor(shared), self.critic(shared)
+
     def forward_shared(self, grid, vector):
         cnn_feat = self.conv(grid)
         combined = torch.cat([cnn_feat, vector], dim=1)
@@ -66,8 +70,8 @@ class ActorCritic(nn.Module):
 
     def get_action_and_value(self, grid, vector, action=None):
         shared = self.forward_shared(grid, vector)
-        probs = self.actor(shared)
-        dist = Categorical(probs)
+        logits = self.actor(shared)
+        dist = Categorical(logits=logits) # Stability: Use Logits
         if action is None:
             action = dist.sample()
         return action, dist.log_prob(action), dist.entropy(), self.critic(shared)
@@ -94,5 +98,5 @@ class PPOAgent:
         with torch.no_grad():
             t_grid = torch.as_tensor(obs['grid'], dtype=torch.float32, device=self.device).unsqueeze(0)
             t_vec = torch.as_tensor(obs['vector'], dtype=torch.float32, device=self.device).unsqueeze(0)
-            probs = self.net.actor(self.net.forward_shared(t_grid, t_vec))
-            return int(probs.argmax(dim=1).item())
+            logits = self.net.actor(self.net.forward_shared(t_grid, t_vec))
+            return int(logits.argmax(dim=1).item())

@@ -133,7 +133,7 @@ class TrainConfig:
     num_envs: int = 8
     batch_size: int = 256
     lr: float = 1e-4
-    eps_decay: int = 200_000
+    eps_decay: int = 200_000  # V12.0: Faster exploitation (300k -> 200k)
     tau: float = 0.005 # V7.9: Restored to 0.005 for faster alignment/convergence
     num_snakes: int = 4
     pool_dir: str = "agent/pool/dqn"
@@ -151,34 +151,55 @@ class DQNVariantTrainer:
             cfg.num_snakes = 1
 
         # Algorithm-Specific Hyperparameters (V6.9 Optim-Matrix)
+        # V8.1: Dual-Phase Hyperparameter Matrix
         if cfg.variant == "dqn":
-            self.lr = 1.0e-4 
-            self.tau = 0.005 # V8.0: Aggressive for vanilla
-            self.closer_reward = 0.15
-            self.buffer_size = 300_000
+            if cfg.single_snake:
+                # V11.1 Stability Base: Restore Ph1 (LR 1.0e-4, Closer 0.15)
+                self.lr, self.tau = 1.00e-4, 0.005
+                self.closer_reward = 0.15
+            else:
+                # V11.1 Combat Ph2: Moderated Firepower
+                self.lr, self.tau = 1.20e-4, 0.005
+                self.closer_reward = 0.10
+            self.buffer_size = 400_000 
             self.grad_clip = 1.0
         elif cfg.variant == "ddqn":
-            self.lr = 1.0e-4 
-            self.tau = 0.005 # V8.0: Aggressive for vanilla
-            self.closer_reward = 0.08
+            if cfg.single_snake:
+                # V11.1 DDQN Baseline (LR 1.0e-4)
+                self.lr, self.tau = 1.00e-4, 0.003
+                self.closer_reward = 0.15
+            else:
+                # V11.1 DDQN Combat (LR 1.0e-4)
+                self.lr, self.tau = 1.00e-4, 0.003
+                self.closer_reward = 0.08
             self.buffer_size = 400_000
             self.grad_clip = 1.0
         elif cfg.variant == "per":
-            self.lr = 5.0e-5 
-            self.tau = 0.002 # V8.0: Reverted to smooth for PER stability
-            self.closer_reward = 0.05
-            self.buffer_size = 300_000
+            if cfg.single_snake:
+                # V11.1 PER Precision Ph1 (LR 8e-5)
+                self.lr, self.tau = 8.0e-5, 0.003
+                self.per_alpha = 0.5
+                self.closer_reward = 0.15
+            else:
+                # V11.1 PER Combat (LR 8e-5)
+                self.lr, self.tau = 8.0e-5, 0.003 
+                self.per_alpha = 0.4 
+                self.closer_reward = 0.08
+            self.buffer_size = 400_000 
             self.grad_clip = 0.5 
         elif cfg.variant == "dueling":
-            # V8.0: Re-tuned Dueling for Ph1 (1.5e-4 -> 1.2e-4)
-            self.lr = 1.2e-4 if cfg.single_snake else 2.5e-4 
-            self.tau = 0.002 # V8.0: Reverted to smooth for Dueling stability
-            self.closer_reward = 0.05
+            if cfg.single_snake:
+                # V11.1 Dueling Baseline (LR 1.0e-4)
+                self.lr, self.tau = 1.00e-4, 0.003
+                self.closer_reward = 0.15
+            else:
+                # V11.1 Dueling Combat (LR 1.2e-4)
+                self.lr, self.tau = 1.20e-4, 0.003 
+                self.closer_reward = 0.10
             self.buffer_size = 400_000
             self.grad_clip = 0.8
         else:
-            self.lr = 2.0e-4
-            self.tau = 0.005
+            self.lr, self.tau = 2.0e-4, 0.005
             self.closer_reward = 0.01
             self.buffer_size = 250_000
             self.grad_clip = 1.0
@@ -189,17 +210,20 @@ class DQNVariantTrainer:
         if cfg.num_snakes == 1:
             # Phase 1: High focus on navigation
             env_cfg.closer_reward = self.closer_reward
+            # V12.0 Fix: Restore farther_penalty to -0.10 for proper distance shaping
+            # (V11.1's -0.02 was too weak, breaking all DQN learning)
+            env_cfg.farther_penalty = -0.10
             env_cfg.food_reward = 25.0
             env_cfg.death_penalty = -15.0 # V7.5: More forgiving Ph1 (-20 -> -15)
-            log(f">>> PHASE 1 (Single) | Closer: {env_cfg.closer_reward} | Death: {env_cfg.death_penalty}")
+            log(f">>> PHASE 1 (Single) | Closer: {env_cfg.closer_reward} | Farther: -0.10 | Death: {env_cfg.death_penalty}")
         else:
-            # Phase 2: Survival & Combat Balance (V6.9)
-            env_cfg.closer_reward = 0.05   # Keep some guiding in battle
-            env_cfg.step_reward = 0.01     # Survival incentive
-            env_cfg.death_penalty = -15.0  # Reduced penalty to avoid cowardice
-            env_cfg.kill_reward = 30.0
-            env_cfg.food_reward = 20.0
-            log(f">>> PHASE 2 (Battle) | Closer: {env_cfg.closer_reward} | Death: {env_cfg.death_penalty} | SurvivalBonus: 0.01")
+            # Phase 2: Aggressive Combat & Survival (V9.0)
+            env_cfg.closer_reward = 0.05   
+            env_cfg.step_reward = 0.05     # Strong survival drive (0.01 -> 0.05)
+            env_cfg.death_penalty = -15.0  
+            env_cfg.kill_reward = 50.0     # Massive boost to aggression (30 -> 50)
+            env_cfg.food_reward = 30.0     # More signal in mess (20 -> 30)
+            log(f">>> PHASE 2 (Battle) | Closer: {env_cfg.closer_reward} | Death: {env_cfg.death_penalty} | StepGain: 0.05")
         
         self.envs = [BattleSnakeEnv(env_cfg) for _ in range(cfg.num_envs)]
         
@@ -222,7 +246,9 @@ class DQNVariantTrainer:
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.lr)
         
         if "per" in cfg.variant or "dueling" in cfg.variant:
-            self.memory = PrioritizedReplayBuffer(self.buffer_size, (3, 7, 7), 25, cfg.batch_size, self.device)
+            # V8.1: Support phase-aware alpha
+            alpha = getattr(self, 'per_alpha', 0.6)
+            self.memory = PrioritizedReplayBuffer(self.buffer_size, (3, 7, 7), 25, cfg.batch_size, self.device, alpha=alpha)
         else:
             self.memory = FastReplayBuffer(self.buffer_size, (3, 7, 7), 25, cfg.batch_size, self.device)
             
@@ -271,8 +297,8 @@ class DQNVariantTrainer:
             groups: Dict[Optional[nn.Module], List[Tuple[int, int, Dict]]] = {None: []}
             
             self.steps += self.cfg.num_envs
-            # V7.5: Protect PER Ph1 exploration (Min 0.1 if single_snake)
-            eps_min = 0.1 if (self.cfg.variant == "per" and self.cfg.single_snake) else 0.05
+            # V11.1: Standard eps_min for Phase 1 (0.1)
+            eps_min = 0.1 if self.cfg.single_snake else 0.05
             eps = max(eps_min, 1.0 - self.steps / self.cfg.eps_decay)
             
             all_actions = [ [None]*self.cfg.num_snakes for _ in range(self.cfg.num_envs) ]
@@ -336,17 +362,21 @@ class DQNVariantTrainer:
                 else:
                     next_obs_batch.append(n_obs)
             
+            # V14.0 CRITICAL FIX: Update obs_batch for next iteration!
+            # This was MISSING - old observations were reused indefinitely!
             obs_batch = next_obs_batch
-            
-            if self.memory.size > 2000:
+
+            # 4. Adaptive Learning Rate Decay (V11.1 Anchor)
+            # Restore decay floor to 10% to allow deep convergence
+            frac = max(0.0, 1.0 - (self.steps / self.cfg.total_frames))
+            current_lr = self.lr * max(0.1, frac) 
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = current_lr
+
+            # V13.0 CRITICAL FIX: Actually train the network!
+            # This call was MISSING - DQN weights were NEVER updated!
+            if self.memory.size >= self.cfg.batch_size:
                 self.update()
-            
-            # 4. Multi-Stage Learning Rate Decay (V7.0)
-            # Final 20% of frames: Decay LR to 10% for precision
-            if self.steps > self.cfg.total_frames * 0.8:
-                current_lr = self.lr * 0.1
-                for param_group in self.optimizer.param_groups:
-                    param_group['lr'] = current_lr
 
             # 5. Soft Update
             for target_param, policy_param in zip(self.target_net.parameters(), self.policy_net.parameters()):
@@ -379,7 +409,8 @@ class DQNVariantTrainer:
             else:
                 best_actions = self.policy_net(next_states['grid'], next_states['vector']).argmax(1)
                 q_next = self.target_net(next_states['grid'], next_states['vector']).gather(1, best_actions.unsqueeze(1)).squeeze(1)
-            target = rewards + 0.99 * q_next * (~dones)
+            # V14.0 FIX: Use explicit float conversion instead of bitwise NOT
+            target = rewards + 0.99 * q_next * (1.0 - dones.float())
             
         td_errors = q_curr - target
         if weights is not None:

@@ -35,7 +35,7 @@ class GameWindow(QMainWindow):
             num_snakes=num_snakes,
             min_food=food_count,
             max_steps=2000,
-            dash_cooldown_steps=30
+            dash_cooldown_steps=15
         ))
         
         # 2. Main Layout
