@@ -30,18 +30,20 @@ def make_env(num_snakes, grid_size, seed=None):
             dash_cooldown_steps=15 # ENSURE V5.0 MECHANICS
         )
         if num_snakes == 1:
-            # Phase 1: Navigation emphasis (V9.2 Aligned with DQN)
+            # Phase 1: Navigation emphasis (V6.0 Unified)
             env_cfg.closer_reward = 0.15
-            env_cfg.farther_penalty = -0.10  # V12.0: Explicit alignment with DQN
-            env_cfg.food_reward = 25.0
-            env_cfg.death_penalty = -15.0
+            env_cfg.farther_penalty = -0.10
+            env_cfg.food_reward = 50.0 
+            env_cfg.death_penalty = -20.0 
+            env_cfg.step_penalty = -0.01 
         else:
-            # Phase 2: Aggressive Combat & Survival (V9.0)
-            env_cfg.closer_reward = 0.05
-            env_cfg.step_reward = 0.05   # V9.0: (0.01 -> 0.05)
-            env_cfg.kill_reward = 50.0   # V9.0: (30 -> 50)
-            env_cfg.death_penalty = -15.0
-            env_cfg.food_reward = 30.0   # V9.0: (20 -> 30)
+            # Phase 2: Aggressive Battle (V6.0 Unified)
+            env_cfg.closer_reward = 0.05     
+            env_cfg.farther_penalty = -0.10  
+            env_cfg.step_penalty = -0.02      
+            env_cfg.kill_reward = 30.0       
+            env_cfg.death_penalty = -30.0    
+            env_cfg.food_reward = 50.0       
         return BattleSnakeEnv(env_cfg, seed=seed)
     return thunk
 
@@ -114,9 +116,9 @@ def train_ppo(num_envs=8, num_snakes=4, total_timesteps=2_000_000,
               self_play_prob=0.3, lr=2.5e-4):
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # V8.1: Precision smoothing for battle phase
+    # V19.0: PPO Stability - Lower LR for fine-tuning to prevent "Transfer Shock"
     if num_snakes > 1:
-        lr = lr * 0.6
+        lr = lr * 0.3  # V19.0: 0.6 -> 0.3 (Results in ~7.5e-5)
     log(f">>> [V8.1 FIX] PPO Device: {device} | Snakes: {num_snakes} | BaseLR: {lr:.2e}")
     Path("agent/checkpoints").mkdir(parents=True, exist_ok=True)
     sp_manager = SelfPlayManager("agent/pool/ppo")
@@ -152,13 +154,27 @@ def train_ppo(num_envs=8, num_snakes=4, total_timesteps=2_000_000,
     global_step, ep_rewards = 0, []
     current_rewards = np.zeros(num_envs)
 
+    # V39.0: Async I/O Setup
+    import threading
+    save_thread = None
+    
+    def save_worker(state_dict, path, manager, step):
+        try:
+            torch.save(state_dict, path)
+            if manager: manager.add_model(state_dict, f"ppo_v4_step_{step}")
+        except Exception as e:
+            log(f"!!! [ASYNC SAVE ERROR] Step {step}: {e}")
+
     while global_step < total_timesteps:
         # V10.6 Dynamic Cooling: Linearly decay entropy to Lock-in policy
         # Heartbeat added to track stagnation at 60% (possible Race Condition)
         frac = max(0.0, 1.0 - (global_step / total_timesteps))
-        min_factor = 0.1 # V11.1: Restored to 10% floor for late stability
+        min_factor = 0.25 # V23.0: Boost to 25% floor (from 10%) to prevent late stagnation
         current_lr = lr * max(min_factor, frac)
-        ent_coef = max(0.01, 0.05 * frac) 
+        # V19.0: Lower entropy for fine-tuning to preserve learned navigator skills
+        ent_start = 0.03 if num_snakes > 1 else 0.05
+        # V6.1: Exponential decay for entropy to hold exploration longer
+        ent_coef = max(0.005, ent_start * (frac ** 1.5)) 
 
         for g in optimizer.param_groups: 
             g['lr'] = current_lr
@@ -241,19 +257,29 @@ def train_ppo(num_envs=8, num_snakes=4, total_timesteps=2_000_000,
                 # V11.0 Smoothing: Tighter clip_range (0.15) to reduce oscillations
                 pg_loss = torch.max(-mb_a * ratio, -mb_a * torch.clamp(ratio, 0.85, 1.15)).mean()
                 v_loss = 0.5 * ((nv.view(-1) - returns[mb])**2).mean()
-                # V10.6: Dynamic Entropy to consolidated policy
+                # V6.0: Enhanced stability via slightly more aggressive gradient clipping
                 optimizer.zero_grad(); (pg_loss - ent_coef * ent.mean() + 0.5 * v_loss).backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), 0.3); optimizer.step()
+                nn.utils.clip_grad_norm_(agent.parameters(), 0.25); optimizer.step()
                 
         # Logging
         if global_step % 10240 < num_envs:
             avg_rew = np.mean(ep_rewards[-50:]) if ep_rewards else 0
             perc = (global_step/total_timesteps)*100
             log(f">>> [Progress {perc:.1f}%] Step: {global_step} | Ep_Rew: {avg_rew:.2f} | Info: LR={current_lr:.2e}")
+            
             if global_step % 204800 < num_envs:
-                torch.save(agent.state_dict(), checkpoint_path)
-                sp_manager.add_model(agent.state_dict(), f"ppo_v4_step_{global_step}")
+                # V39.0: Async I/O Guard (Prevent Main Loop Hang)
+                if save_thread is not None and save_thread.is_alive():
+                     log(f"!!! [ASYNC SAVE] Previous save still running at step {global_step}. Skipping to prevent pile-up.")
+                else:
+                    # CPU Copy to avoid race condition with training
+                    cpu_state = {k: v.cpu().clone() for k, v in agent.state_dict().items()}
+                    save_thread = threading.Thread(target=save_worker, args=(cpu_state, checkpoint_path, sp_manager, global_step))
+                    save_thread.start()
+                    log(f">>> [ASYNC SAVE] Snapshot started at step {global_step}")
 
+    # Final Sync Save
+    if save_thread and save_thread.is_alive(): save_thread.join()
     torch.save(agent.state_dict(), checkpoint_path)
     log(f"PPO V4.3 Training Finished. Model: {checkpoint_path}")
 
@@ -262,11 +288,11 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--single", action="store_true"); p.add_argument("--load", type=str); p.add_argument("--steps", type=int, default=1000000)
     args = p.parse_args(); num = 1 if args.single else 4
-    # V11.2: num_envs defined by hardware (A6000 scale)
-    # Reduced from 32 to 16 to avoid I/O Deadlock during model loading
-    n_envs = 8 if args.single else 16
-    # V11.2 saturation training: 4.0M steps for Battle Phase
-    steps = args.steps if args.single else 4000000
+    # V16.1: Increase parallelism for faster Ph2 training
+    # I/O Shield should handle model loading safely now
+    n_envs = 8 if args.single else 24  # V16.1: 16 -> 24
+    # V16.1: Reduced from 4M to 2M for faster iteration
+    steps = args.steps if args.single else 2000000
     ckpt = "agent/checkpoints/ppo_best.pth" if args.single else "agent/checkpoints/ppo_battle_best.pth"
     
     train_ppo(num_envs=n_envs, num_snakes=num, total_timesteps=steps, load_path=args.load, checkpoint_path=ckpt)

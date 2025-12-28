@@ -158,12 +158,17 @@ class BattleSnakeEnv:
                 new_head = (head[0] + dx, head[1] + dy)
                 next_heads.append(new_head)
                 
-                # Distance shaping
+                # Distance shaping (V6.0: Smooth Potential-based Reward)
                 if self.foods:
                     old_min = min(abs(head[0]-fx)+abs(head[1]-fy) for fx, fy in self.foods)
                     new_min = min(abs(new_head[0]-fx)+abs(new_head[1]-fy) for fx, fy in self.foods)
-                    if new_min < old_min: rewards[i] += self.config.closer_reward
-                    elif new_min > old_min: rewards[i] += self.config.farther_penalty
+                    
+                    # V6.2: Definitive Smooth Potential Reward
+                    dist_diff = old_min - new_min
+                    if dist_diff > 0:
+                        rewards[i] += self.config.closer_reward
+                    elif dist_diff < 0:
+                        rewards[i] += self.config.farther_penalty
 
             # Collisions
             alive_indices = [i for i, d in enumerate(self.dead) if not d and next_heads[i] is not None]

@@ -144,7 +144,10 @@ class TrainConfig:
 
 class DQNVariantTrainer:
     def __init__(self, cfg: TrainConfig):
-        self.cfg = cfg
+        self.cfg = cfg  # FIXED: Restored self.cfg assignment
+        # V20.0: Rollback - Restore fast exploration (200k) to fix early slowness
+        self.cfg.eps_decay = 200000
+        
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         if cfg.single_snake:
@@ -154,50 +157,53 @@ class DQNVariantTrainer:
         # V8.1: Dual-Phase Hyperparameter Matrix
         if cfg.variant == "dqn":
             if cfg.single_snake:
-                # V11.1 Stability Base: Restore Ph1 (LR 1.0e-4, Closer 0.15)
-                self.lr, self.tau = 1.00e-4, 0.005
+                # V38.0: DQN Ph1 - Restore Winner Config (LR 8e-5, Tau 0.005)
+                # User Log 18:14 proved 8e-5 works (Rew 268) vs 5e-5
+                self.lr, self.tau = 8.0e-5, 0.005 
                 self.closer_reward = 0.15
             else:
-                # V11.1 Combat Ph2: Moderated Firepower
-                self.lr, self.tau = 1.20e-4, 0.005
-                self.closer_reward = 0.10
-            self.buffer_size = 400_000 
-            self.grad_clip = 1.0
+                # V33.0: DQN Ph2 - Stability Tuning (LR 4e-5, Tau 0.001)
+                self.lr, self.tau = 4.0e-5, 0.001 
+                self.closer_reward = 0.05
+            self.buffer_size = 600_000 
+            self.grad_clip = 0.5 
         elif cfg.variant == "ddqn":
             if cfg.single_snake:
-                # V11.1 DDQN Baseline (LR 1.0e-4)
-                self.lr, self.tau = 1.00e-4, 0.003
+                # V38.0: DDQN Ph1 - Strict Align with DQN (Winner)
+                # GradClip 1.0 -> 0.5 was the likely culprit for failure.
+                self.lr, self.tau = 8.0e-5, 0.005 # V38.0: Match DQN
                 self.closer_reward = 0.15
             else:
-                # V11.1 DDQN Combat (LR 1.0e-4)
-                self.lr, self.tau = 1.00e-4, 0.003
-                self.closer_reward = 0.08
-            self.buffer_size = 400_000
-            self.grad_clip = 1.0
+                # V34.0: DDQN Ph2 - Anti-Camping (LR 5e-5, Tau 0.001)
+                self.lr, self.tau = 5.0e-5, 0.001
+                self.closer_reward = 0.05
+            self.buffer_size = 600_000 
+            self.grad_clip = 0.5 # V38.0: Critical Fix (1.0 -> 0.5) to match DQN stability
         elif cfg.variant == "per":
             if cfg.single_snake:
-                # V11.1 PER Precision Ph1 (LR 8e-5)
-                self.lr, self.tau = 8.0e-5, 0.003
-                self.per_alpha = 0.5
+                # V32.0: PER Ph1 Upgrade - Use Dueling Specs (Net+LR) for stability
+                self.lr, self.tau = 1.0e-4, 0.003 # V32.0: Boost LR to match Dueling
+                self.per_alpha = 0.6 
                 self.closer_reward = 0.15
             else:
-                # V11.1 PER Combat (LR 8e-5)
-                self.lr, self.tau = 8.0e-5, 0.003 
-                self.per_alpha = 0.4 
-                self.closer_reward = 0.08
-            self.buffer_size = 400_000 
+                # V36.0: PER Ph2 Upgrade - Stability Fix (LR 5e-5, Tau 0.001)
+                self.lr, self.tau = 5.0e-5, 0.001 # V36.0: Reduced from 1e-4/0.002
+                self.per_alpha = 0.6  
+                self.closer_reward = 0.05 # V30.0: Dithering Fix
+            self.buffer_size = 600_000 # V32.0: Restore 600k capacity
             self.grad_clip = 0.5 
         elif cfg.variant == "dueling":
             if cfg.single_snake:
-                # V11.1 Dueling Baseline (LR 1.0e-4)
-                self.lr, self.tau = 1.00e-4, 0.003
+                # V40.0: Dueling Ph1 - Stabilization (LR 1e-4 -> 8e-5)
+                # User reported drastic fluctuations (425 -> Crash). Aligned with DQN.
+                self.lr, self.tau = 8.0e-5, 0.005
                 self.closer_reward = 0.15
             else:
-                # V11.1 Dueling Combat (LR 1.2e-4)
-                self.lr, self.tau = 1.20e-4, 0.003 
-                self.closer_reward = 0.10
-            self.buffer_size = 400_000
-            self.grad_clip = 0.8
+                # V36.0: Dueling Ph2 - Stability Fix (LR 5e-5, Tau 0.001)
+                self.lr, self.tau = 5.0e-5, 0.001 # V36.0: Reduced from 1e-4/0.002
+                self.closer_reward = 0.05 # V30.0: Dithering Fix (0.12 -> 0.05)
+            self.buffer_size = 600_000 # V21.0: Prevent late-stage collapse (was 400k)
+            self.grad_clip = 0.5
         else:
             self.lr, self.tau = 2.0e-4, 0.005
             self.closer_reward = 0.01
@@ -208,29 +214,29 @@ class DQNVariantTrainer:
         
         env_cfg = BattleSnakeConfig(num_snakes=cfg.num_snakes, dash_cooldown_steps=15)
         if cfg.num_snakes == 1:
-            # Phase 1: High focus on navigation
+            # Phase 1: High focus on navigation (V6.2 Fixed)
             env_cfg.closer_reward = self.closer_reward
-            # V12.0 Fix: Restore farther_penalty to -0.10 for proper distance shaping
-            # (V11.1's -0.02 was too weak, breaking all DQN learning)
             env_cfg.farther_penalty = -0.10
-            env_cfg.food_reward = 25.0
-            env_cfg.death_penalty = -15.0 # V7.5: More forgiving Ph1 (-20 -> -15)
-            log(f">>> PHASE 1 (Single) | Closer: {env_cfg.closer_reward} | Farther: -0.10 | Death: {env_cfg.death_penalty}")
+            env_cfg.food_reward = 50.0 
+            env_cfg.death_penalty = -20.0 
+            env_cfg.step_penalty = -0.01
+            log(f">>> PHASE 1 (Single) | Closer: {env_cfg.closer_reward} | Penalty: -0.01")
         else:
-            # Phase 2: Aggressive Combat & Survival (V9.0)
-            env_cfg.closer_reward = 0.05   
-            env_cfg.step_reward = 0.05     # Strong survival drive (0.01 -> 0.05)
-            env_cfg.death_penalty = -15.0  
-            env_cfg.kill_reward = 50.0     # Massive boost to aggression (30 -> 50)
-            env_cfg.food_reward = 30.0     # More signal in mess (20 -> 30)
-            log(f">>> PHASE 2 (Battle) | Closer: {env_cfg.closer_reward} | Death: {env_cfg.death_penalty} | StepGain: 0.05")
+            # Phase 2: Aggressive Combat & Survival (V6.2 Fixed)
+            env_cfg.closer_reward = self.closer_reward
+            env_cfg.farther_penalty = -0.10  
+            env_cfg.step_penalty = -0.02      
+            env_cfg.death_penalty = -30.0    
+            env_cfg.kill_reward = 30.0       
+            env_cfg.food_reward = 50.0       
+            log(f">>> PHASE 2 (Battle) | Closer: {env_cfg.closer_reward} | Penalty: -0.02")
         
         self.envs = [BattleSnakeEnv(env_cfg) for _ in range(cfg.num_envs)]
         
         # Select Architecture
         if cfg.variant == "dqn": self.net_cls = DQNNet
         elif cfg.variant == "ddqn": self.net_cls = DDQNNet
-        elif cfg.variant == "per": self.net_cls = PERDQNNet
+        elif cfg.variant == "per": self.net_cls = DuelingDQNNet # V32.0: Upgrade to DuelingNet (SimpleNet collapsed)
         elif cfg.variant == "dueling": self.net_cls = DuelingDQNNet
         else: raise ValueError(f"Unknown variant {cfg.variant}")
         
@@ -261,6 +267,15 @@ class DQNVariantTrainer:
         self.loaded_opp_models: Dict[str, nn.Module] = {}
         
         self.best_reward = -float('inf')
+        
+        # V26.0: Selective Optimization (Dueling Champion)
+        # Statistics show Dueling handles Gamma 0.995 well. DQN/PER/DDQN Collapse.
+        if cfg.variant == "dueling":
+            self.gamma = 0.995 # V28.0: Dueling uses 0.995 GLOBALLY (Ph1 & Ph2) to prevent scale collapse
+            self.updates_per_step = 1 # Keep 1x for stability (PER-safe)
+        else:
+            self.gamma = 0.99 # Revert others to standard horizon
+            self.updates_per_step = 1 # Revert others to standard speed
 
     def save_model(self, path):
         p = Path(path)
@@ -297,7 +312,7 @@ class DQNVariantTrainer:
             groups: Dict[Optional[nn.Module], List[Tuple[int, int, Dict]]] = {None: []}
             
             self.steps += self.cfg.num_envs
-            # V11.1: Standard eps_min for Phase 1 (0.1)
+            # V6.2: Restored Aggressive Epsilon Decay (200k target)
             eps_min = 0.1 if self.cfg.single_snake else 0.05
             eps = max(eps_min, 1.0 - self.steps / self.cfg.eps_decay)
             
@@ -366,17 +381,18 @@ class DQNVariantTrainer:
             # This was MISSING - old observations were reused indefinitely!
             obs_batch = next_obs_batch
 
-            # 4. Adaptive Learning Rate Decay (V11.1 Anchor)
-            # Restore decay floor to 10% to allow deep convergence
+            # 4. V23.0: Active Late-Stage Learning (0.05 floor)
             frac = max(0.0, 1.0 - (self.steps / self.cfg.total_frames))
-            current_lr = self.lr * max(0.1, frac) 
+            lr_floor = 0.05 # V23.0: 0.01 -> 0.05 (Keep ~5e-6 to keep learning)
+            current_lr = self.lr * max(lr_floor, frac) 
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = current_lr
 
             # V13.0 CRITICAL FIX: Actually train the network!
-            # This call was MISSING - DQN weights were NEVER updated!
+            # V24.0: Double Update Frequency for Phase 1 (Ratio 0.25)
             if self.memory.size >= self.cfg.batch_size:
-                self.update()
+                for _ in range(self.updates_per_step):
+                    self.update()
 
             # 5. Soft Update
             for target_param, policy_param in zip(self.target_net.parameters(), self.policy_net.parameters()):
@@ -410,7 +426,8 @@ class DQNVariantTrainer:
                 best_actions = self.policy_net(next_states['grid'], next_states['vector']).argmax(1)
                 q_next = self.target_net(next_states['grid'], next_states['vector']).gather(1, best_actions.unsqueeze(1)).squeeze(1)
             # V14.0 FIX: Use explicit float conversion instead of bitwise NOT
-            target = rewards + 0.99 * q_next * (1.0 - dones.float())
+            # V6.0: Use self.gamma (with N-step extension)
+            target = rewards + self.gamma * q_next * (1.0 - dones.float())
             
         td_errors = q_curr - target
         if weights is not None:
