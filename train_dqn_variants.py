@@ -84,7 +84,7 @@ class PrioritizedReplayBuffer:
         data = (state, action, reward, next_state, done)
         self.tree.add(self.max_priority ** self.alpha, data)
 
-    def sample(self):
+    def sample(self, beta: float):
         idxs, weights, batch = [], [], []
         segment = self.tree.total_priority / self.batch_size
         
@@ -97,7 +97,7 @@ class PrioritizedReplayBuffer:
             batch.append(data)
             
         weights = np.array(weights)
-        weights = (len(batch) * weights) ** (-self.beta) 
+        weights = (len(batch) * weights) ** (-beta) 
         weights /= (weights.max() + 1e-8)
         
         o_grids = np.array([x[0]['grid'] for x in batch])
@@ -181,28 +181,25 @@ class DQNVariantTrainer:
             self.grad_clip = 0.5 # V38.0: Critical Fix (1.0 -> 0.5) to match DQN stability
         elif cfg.variant == "per":
             if cfg.single_snake:
-                # V32.0: PER Ph1 Upgrade - Use Dueling Specs (Net+LR) for stability
-                self.lr, self.tau = 1.0e-4, 0.003 # V32.0: Boost LR to match Dueling
+                # V6.3 Stability: Reduced Tau to lock learned features
+                self.lr, self.tau = 1.0e-4, 0.002 
                 self.per_alpha = 0.6 
                 self.closer_reward = 0.15
             else:
-                # V36.0: PER Ph2 Upgrade - Stability Fix (LR 5e-5, Tau 0.001)
-                self.lr, self.tau = 5.0e-5, 0.001 # V36.0: Reduced from 1e-4/0.002
+                self.lr, self.tau = 5.0e-5, 0.001 
                 self.per_alpha = 0.6  
-                self.closer_reward = 0.05 # V30.0: Dithering Fix
-            self.buffer_size = 600_000 # V32.0: Restore 600k capacity
+                self.closer_reward = 0.05 
+            self.buffer_size = 600_000 
             self.grad_clip = 0.5 
         elif cfg.variant == "dueling":
             if cfg.single_snake:
-                # V40.0: Dueling Ph1 - Stabilization (LR 1e-4 -> 8e-5)
-                # User reported drastic fluctuations (425 -> Crash). Aligned with DQN.
-                self.lr, self.tau = 8.0e-5, 0.005
+                # V6.3 Stability: Significantly reduced Tau (0.005 -> 0.002)
+                self.lr, self.tau = 8.0e-5, 0.002
                 self.closer_reward = 0.15
             else:
-                # V36.0: Dueling Ph2 - Stability Fix (LR 5e-5, Tau 0.001)
-                self.lr, self.tau = 5.0e-5, 0.001 # V36.0: Reduced from 1e-4/0.002
-                self.closer_reward = 0.05 # V30.0: Dithering Fix (0.12 -> 0.05)
-            self.buffer_size = 600_000 # V21.0: Prevent late-stage collapse (was 400k)
+                self.lr, self.tau = 5.0e-5, 0.001 
+                self.closer_reward = 0.05 
+            self.buffer_size = 600_000 
             self.grad_clip = 0.5
         else:
             self.lr, self.tau = 2.0e-4, 0.005
@@ -416,7 +413,15 @@ class DQNVariantTrainer:
         self.save_model(self.cfg.save_path)
 
     def update(self):
-        states, actions, rewards, next_states, dones, weights, idxs = self.memory.sample()
+        # V6.3: Calculate dynamic Beta for PER (Annealing from 0.4 to 1.0)
+        frac = self.steps / self.cfg.total_frames
+        current_beta = min(1.0, 0.4 + frac * (1.0 - 0.4))
+        
+        if "per" in self.cfg.variant or "dueling" in self.cfg.variant:
+            states, actions, rewards, next_states, dones, weights, idxs = self.memory.sample(current_beta)
+        else:
+            states, actions, rewards, next_states, dones, weights, idxs = self.memory.sample()
+            
         q_curr = self.policy_net(states['grid'], states['vector']).gather(1, actions.unsqueeze(1)).squeeze(1)
         
         with torch.no_grad():
