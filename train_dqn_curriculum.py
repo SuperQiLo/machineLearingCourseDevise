@@ -29,9 +29,9 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--variant", type=str, default="dqn", choices=["dqn", "ddqn", "per", "dueling"])
-    # Default to 5,000,000 / 8,000,000 frames per phase (can be overridden).
-    parser.add_argument("--steps1", type=int, default=1_000_000, help="Phase 1 frames")
-    parser.add_argument("--steps2", type=int, default=1_500_000, help="Phase 2 frames")
+    # Default to 5,000,000 frames per phase (can be overridden).
+    parser.add_argument("--steps1", type=int, default=5_000_000, help="Phase 1 frames")
+    parser.add_argument("--steps2", type=int, default=5_000_000, help="Phase 2 frames")
     args = parser.parse_args()
 
     v = args.variant.lower()

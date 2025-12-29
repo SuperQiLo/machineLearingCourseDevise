@@ -149,11 +149,11 @@ class PrioritizedReplayBuffer:
 @dataclass
 class TrainConfig:
     variant: str = "dqn" # dqn, ddqn, per, dueling
-    total_frames: int = 1_000_000
+    total_frames: int = 5_000_000 # V46.0: Increased 1M -> 5M for deep convergence
     num_envs: int = 8
-    batch_size: int = 256
+    batch_size: int = 512 # V46.0: Increased 256 -> 512 for stable gradients
     lr: float = 1e-4
-    eps_decay: int = 0  # 0 = Use Percentage-based Decay (80% of total)
+    eps_decay: int = 0  # 0 = Use Percentage-based Decay (85% of total)
     tau: float = 0.005 
     num_snakes: int = 4
     pool_dir: str = "agent/pool/dqn"
@@ -169,9 +169,9 @@ class DQNVariantTrainer:
         # Use percentage-based decay to adapt to any total_frames count (1M, 5M, etc.)
         total = max(1, int(cfg.total_frames))
         
-        # Decide Decay Duration: 80% of total steps for single, 90% for battle (need more exploration)
+        # Decide Decay Duration: 85% of total steps for single, 90% for battle (need more exploration)
         if cfg.single_snake:
-            decay_ratio = 0.80
+            decay_ratio = 0.85 # V46.0: Extended decay 0.80 -> 0.85
         else:
             decay_ratio = 0.90
             
@@ -211,14 +211,13 @@ class DQNVariantTrainer:
             self.grad_clip = 0.5 # V38.0: Critical Fix (1.0 -> 0.5) to match DQN stability
         elif cfg.variant == "per":
             if cfg.single_snake:
-                # V39.0: PER Ph1 Fix - Combat late-stage collapse (peak@210k then crash)
-                # Root cause: tau=0.002 caused target lag + alpha=0.6 over-prioritized outliers
-                # Fix: tau 0.005 (faster sync), lr 6e-5 (slower), alpha 0.5 (balanced sampling)
-                # NOTE: PER now uses DDQNNet; restore LR to avoid under-training.
-                # Stability is handled via weighted Huber + milder prioritization.
+                # V45.0: PER Ph1 Optimization - Accelerate convergence via aggressive prioritization
+                # Analysis: Current alpha=0.5 too conservative, causing 68w steps to turn positive
+                # Fix: alpha 0.65 (more aggressive TD-error focus), beta_start 0.3 (reduce IS weight noise)
+                # Benchmark: DQN turns positive @52w steps, PER should be faster due to smart sampling
                 self.lr, self.tau = 8.0e-5, 0.005
-                self.per_alpha = 0.5
-                self.per_beta_start = 0.4
+                self.per_alpha = 0.65
+                self.per_beta_start = 0.3
                 self.closer_reward = 0.15
             else:
                 self.lr, self.tau = 6.0e-5, 0.002
@@ -229,12 +228,13 @@ class DQNVariantTrainer:
             self.grad_clip = 0.5 
         elif cfg.variant == "dueling":
             if cfg.single_snake:
-                # V42.0: Dueling Ph1 - Rebalance for V41.0 self_collision_penalty
-                # V40.0+V41.0 result: peak@90k (98) then crash (self_collision too harsh)
-                # Fix: lr 6e-5 (gentler), per_alpha 0.5 (balanced sampling)
-                self.lr, self.tau = 6.0e-5, 0.005
-                self.per_alpha = 0.5
-                self.per_beta_start = 0.4
+                # V45.0: Dueling Ph1 Optimization - Align with DQN winner config + optimize PER
+                # Analysis: lr 6e-5 too low (25% slower than DQN 8e-5), causing 61w step failure
+                # Fix: lr 8e-5 (match DQN), alpha 0.6 (enhance priority), beta_start 0.3 (reduce IS noise)
+                # Theory: Dueling architecture (V/A decomposition) should outperform DQN with proper tuning
+                self.lr, self.tau = 8.0e-5, 0.005
+                self.per_alpha = 0.6
+                self.per_beta_start = 0.3
                 self.closer_reward = 0.15
             else:
                 self.lr, self.tau = 4.0e-5, 0.001 
@@ -245,31 +245,31 @@ class DQNVariantTrainer:
             self.buffer_size = 600_000 
             self.grad_clip = 0.5 
         
-        if cfg.total_frames <= 1_200_000 and cfg.single_snake:
-            # Phase 1 Short Run: 
-            # V44.6: Increase Buffer to 1M (Whole History) to prevent Catastrophic Forgetting.
-            # 200k was too small, causing agent to forget how to handle early/mid game states 
-            # once it reached late game (long snake) states.
+        if cfg.total_frames >= 2_000_000:
+            # V46.0: Massive Buffer for 5M runs to prevent forgetting
+            self.buffer_size = 2_000_000
+        elif cfg.total_frames <= 1_200_000 and cfg.single_snake:
             self.buffer_size = 1_000_000
-        elif cfg.total_frames <= 2_000_000:
-            self.buffer_size = min(self.buffer_size, 400_000)
+        else:
+            self.buffer_size = 600_000
 
-        # V44.6: DDQN specific tuning - Lower LR to stabilize Phase 1
-        if cfg.variant == "ddqn":
-            self.lr = self.lr * 0.5 # 8e-5 -> 4e-5
+        # V45.0: DDQN Fix - Remove LR penalty that caused 26% performance loss
+        # Analysis: V44.6 halved LR (8e-5->4e-5), causing DDQN Ph1 reward=101 vs DQN=136
+        # Fix: Restore full LR 8e-5 to match DQN convergence speed
+        # Removed: if cfg.variant == "ddqn": self.lr = self.lr * 0.5
 
         log(f">>> [V8.0 Asymmetric-Tuning] Variant: {cfg.variant.upper()} | LR: {self.lr} | Tau: {self.tau} | GradClip: {self.grad_clip} | Buf: {self.buffer_size}")
         
         env_cfg = BattleSnakeConfig(num_snakes=cfg.num_snakes, dash_cooldown_steps=15)
         if cfg.num_snakes == 1:
-            # Phase 1: High focus on navigation (V6.2 Fixed)
-            env_cfg.closer_reward = self.closer_reward
-            env_cfg.farther_penalty = -0.10
-            env_cfg.food_reward = 50.0 
-            env_cfg.death_penalty = -20.0 
+            # Phase 1: High focus on navigation (V46.0: Aggressive Reward Tuning)
+            env_cfg.closer_reward = 0.20 # 0.15 -> 0.20
+            env_cfg.farther_penalty = -0.15
+            env_cfg.food_reward = 100.0 # 50 -> 100 (Primary Driver for 300+ reward)
+            env_cfg.death_penalty = -10.0 # -20 -> -10 (Less afraid of edges)
             env_cfg.step_penalty = -0.01
-            env_cfg.self_collision_penalty = -15.0  # V43.0: Reduced from -22 (Prevent timidity)
-            log(f">>> PHASE 1 (Single) | Closer: {env_cfg.closer_reward} | Penalty: -0.01")
+            env_cfg.self_collision_penalty = -8.0  # -15 -> -8 (Don't let fear paralyze late game)
+            log(f">>> [V46.0 Aggressive] PHASE 1 (Single) | Food: {env_cfg.food_reward} | Closer: {env_cfg.closer_reward} | Penalty: -0.01")
         else:
             # Phase 2: Aggressive Combat & Survival (V6.2 Fixed)
             env_cfg.closer_reward = self.closer_reward
@@ -321,10 +321,12 @@ class DQNVariantTrainer:
         # V39.0: Unified Gamma (Dueling was 0.995 -> unstable)
         # All variants now use 0.99 for stable value estimation
         self.gamma = 0.99
-        # V44.2: Global Stability Fix - Force 1 update/step for ALL variants (including PER).
-        # Previous values (PER=3, DDQN=2) caused collapse with high LR.
-        # Stability > Speed.
-        self.updates_per_step = 1
+        # V46.0: Increased Update Frequency (Ratio 1:1 -> 2:1 or 3:1)
+        # Higher density of gradient steps to squeeze 300+ performance out of 5M frames.
+        if "per" in cfg.variant:
+            self.updates_per_step = 3
+        else:
+            self.updates_per_step = 2
 
     def save_model(self, path):
         # V44.4: Atomic Save to prevent file corruption/locking during self-play loading
@@ -385,11 +387,11 @@ class DQNVariantTrainer:
             groups: Dict[Optional[nn.Module], List[Tuple[int, int, Dict]]] = {None: []}
             
             self.steps += self.cfg.num_envs
-            # V43.0: Dynamic Epsilon Decay (Scaled to total_frames)
+            # V46.0: Dynamic Epsilon Decay (Higher Min Epsilon for longer exploration)
             if self.cfg.single_snake:
-                eps_min = 0.05 # V44.0: Increased from 0.02 to prevent overfitting/collapse
+                eps_min = 0.10 # V46.0: Increased 0.05 -> 0.10 to prevent premature convergence in 5M runs
             else:
-                eps_min = 0.05 # Keep exploring in battle
+                eps_min = 0.05
             
             # Linear decay over defined duration
             completion = min(1.0, self.steps / self.decay_steps)
@@ -463,11 +465,11 @@ class DQNVariantTrainer:
             # This was MISSING - old observations were reused indefinitely!
             obs_batch = next_obs_batch
 
-            # 4. V43.0: Standard Linear LR Decay
-            # Remove complex variant-specific floor logic. Just decay to 1% (V44.0).
+            # V46.0: Gentle Linear LR Decay
+            # Stay at 10% floor instead of 1% to keep plasticity in late game.
             progress = self.steps / total_frames
             frac = max(0.0, 1.0 - progress)
-            current_lr = self.lr * (0.01 + 0.99 * frac)
+            current_lr = self.lr * (0.10 + 0.90 * frac)
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = current_lr
 
