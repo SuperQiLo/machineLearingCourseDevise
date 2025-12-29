@@ -29,8 +29,9 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--variant", type=str, default="dqn", choices=["dqn", "ddqn", "per", "dueling"])
-    parser.add_argument("--steps1", type=int, default=500000, help="Phase 1 steps")
-    parser.add_argument("--steps2", type=int, default=500000, help="Phase 2 steps")
+    # Default to 5,000,000 / 8,000,000 frames per phase (can be overridden).
+    parser.add_argument("--steps1", type=int, default=1_000_000, help="Phase 1 frames")
+    parser.add_argument("--steps2", type=int, default=1_500_000, help="Phase 2 frames")
     args = parser.parse_args()
 
     v = args.variant.lower()
@@ -51,7 +52,8 @@ def main():
     run_step(cmd2, f"2. Fine-tuning (Battle Mode) -> {p2_model}")
     
     print("\n=== Curriculum Completed ===")
-    print(f"Final Model: {p2_model}")
+    print(f"Best Model: {p2_model}")
+    print(f"Final Snapshot: {p2_model.with_suffix('.final.pth')}")
     print(f"Test it: python gui_game.py --mode battle --algo {v} --model {p2_model}")
 
 if __name__ == "__main__":

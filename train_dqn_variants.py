@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import sys
+import os
 
 from env.battle_snake_env import BattleSnakeEnv, BattleSnakeConfig
 from agent.dqn import DQNNet, DQNAgent
@@ -69,6 +70,7 @@ class FastReplayBuffer:
 class PrioritizedReplayBuffer:
     def __init__(self, capacity, grid_shape, vector_dim, batch_size, device, alpha=0.5, beta=0.4):
         self.tree = SumTree(capacity)
+        self.capacity = capacity
         self.batch_size = batch_size
         self.device = device
         self.alpha = alpha
@@ -76,13 +78,30 @@ class PrioritizedReplayBuffer:
         self.epsilon = 1e-6
         self.max_priority = 1.0
 
+        # Store transitions in contiguous numpy arrays for speed.
+        # SumTree stores only indices into these arrays.
+        self.grids = np.zeros((capacity, *grid_shape), dtype=np.float32)
+        self.vectors = np.zeros((capacity, vector_dim), dtype=np.float32)
+        self.actions = np.zeros(capacity, dtype=np.int64)
+        self.rewards = np.zeros(capacity, dtype=np.float32)
+        self.next_grids = np.zeros((capacity, *grid_shape), dtype=np.float32)
+        self.next_vectors = np.zeros((capacity, vector_dim), dtype=np.float32)
+        self.dones = np.zeros(capacity, dtype=np.bool_)
+
     @property
     def size(self):
         return self.tree.size
 
     def push(self, state, action, reward, next_state, done):
-        data = (state, action, reward, next_state, done)
-        self.tree.add(self.max_priority ** self.alpha, data)
+        data_idx = self.tree.ptr
+        self.grids[data_idx] = state['grid']
+        self.vectors[data_idx] = state['vector']
+        self.actions[data_idx] = action
+        self.rewards[data_idx] = reward
+        self.next_grids[data_idx] = next_state['grid']
+        self.next_vectors[data_idx] = next_state['vector']
+        self.dones[data_idx] = done
+        self.tree.add(self.max_priority ** self.alpha, int(data_idx))
 
     def sample(self, beta: float):
         idxs, weights, batch = [], [], []
@@ -94,19 +113,20 @@ class PrioritizedReplayBuffer:
             idx, p, data = self.tree.get_leaf(v)
             idxs.append(idx)
             weights.append(p / self.tree.total_priority)
-            batch.append(data)
+            batch.append(int(data))
             
         weights = np.array(weights)
         weights = (len(batch) * weights) ** (-beta) 
         weights /= (weights.max() + 1e-8)
         
-        o_grids = np.array([x[0]['grid'] for x in batch])
-        o_vecs = np.array([x[0]['vector'] for x in batch])
-        acts = np.array([x[1] for x in batch])
-        rews = np.array([x[2] for x in batch])
-        n_grids = np.array([x[3]['grid'] for x in batch])
-        n_vecs = np.array([x[3]['vector'] for x in batch])
-        dones = np.array([x[4] for x in batch])
+        b_idx = np.asarray(batch, dtype=np.int64)
+        o_grids = self.grids[b_idx]
+        o_vecs = self.vectors[b_idx]
+        acts = self.actions[b_idx]
+        rews = self.rewards[b_idx]
+        n_grids = self.next_grids[b_idx]
+        n_vecs = self.next_vectors[b_idx]
+        dones = self.dones[b_idx]
         
         return (
             {"grid": torch.from_numpy(o_grids).to(self.device), "vector": torch.from_numpy(o_vecs).to(self.device)},
@@ -133,8 +153,8 @@ class TrainConfig:
     num_envs: int = 8
     batch_size: int = 256
     lr: float = 1e-4
-    eps_decay: int = 200_000  # V12.0: Faster exploitation (300k -> 200k)
-    tau: float = 0.005 # V7.9: Restored to 0.005 for faster alignment/convergence
+    eps_decay: int = 0  # 0 = Use Percentage-based Decay (80% of total)
+    tau: float = 0.005 
     num_snakes: int = 4
     pool_dir: str = "agent/pool/dqn"
     load_path: Optional[str] = None
@@ -145,8 +165,18 @@ class TrainConfig:
 class DQNVariantTrainer:
     def __init__(self, cfg: TrainConfig):
         self.cfg = cfg  # FIXED: Restored self.cfg assignment
-        # V20.0: Rollback - Restore fast exploration (200k) to fix early slowness
-        self.cfg.eps_decay = 200000
+        # Variant-aware exploration schedule.
+        # Use percentage-based decay to adapt to any total_frames count (1M, 5M, etc.)
+        total = max(1, int(cfg.total_frames))
+        
+        # Decide Decay Duration: 80% of total steps for single, 90% for battle (need more exploration)
+        if cfg.single_snake:
+            decay_ratio = 0.80
+        else:
+            decay_ratio = 0.90
+            
+        self.decay_steps = int(total * decay_ratio)
+        self.cfg.eps_decay = self.decay_steps # Update config for logging
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
@@ -174,40 +204,61 @@ class DQNVariantTrainer:
                 self.lr, self.tau = 8.0e-5, 0.005 # V38.0: Match DQN
                 self.closer_reward = 0.15
             else:
-                # V34.0: DDQN Ph2 - Anti-Camping (LR 5e-5, Tau 0.001)
-                self.lr, self.tau = 5.0e-5, 0.001
+                # DDQN battle is sensitive to self-play non-stationarity; use slightly lower LR.
+                self.lr, self.tau = 4.0e-5, 0.001
                 self.closer_reward = 0.05
             self.buffer_size = 600_000 
             self.grad_clip = 0.5 # V38.0: Critical Fix (1.0 -> 0.5) to match DQN stability
         elif cfg.variant == "per":
             if cfg.single_snake:
-                # V6.3 Stability: Reduced Tau to lock learned features
-                self.lr, self.tau = 1.0e-4, 0.002 
-                self.per_alpha = 0.6 
+                # V39.0: PER Ph1 Fix - Combat late-stage collapse (peak@210k then crash)
+                # Root cause: tau=0.002 caused target lag + alpha=0.6 over-prioritized outliers
+                # Fix: tau 0.005 (faster sync), lr 6e-5 (slower), alpha 0.5 (balanced sampling)
+                # NOTE: PER now uses DDQNNet; restore LR to avoid under-training.
+                # Stability is handled via weighted Huber + milder prioritization.
+                self.lr, self.tau = 8.0e-5, 0.005
+                self.per_alpha = 0.5
+                self.per_beta_start = 0.4
                 self.closer_reward = 0.15
             else:
-                self.lr, self.tau = 5.0e-5, 0.001 
-                self.per_alpha = 0.6  
+                self.lr, self.tau = 6.0e-5, 0.002
+                self.per_alpha = 0.5
+                self.per_beta_start = 0.6
                 self.closer_reward = 0.05 
             self.buffer_size = 600_000 
             self.grad_clip = 0.5 
         elif cfg.variant == "dueling":
             if cfg.single_snake:
-                # V6.3 Stability: Significantly reduced Tau (0.005 -> 0.002)
-                self.lr, self.tau = 8.0e-5, 0.002
+                # V42.0: Dueling Ph1 - Rebalance for V41.0 self_collision_penalty
+                # V40.0+V41.0 result: peak@90k (98) then crash (self_collision too harsh)
+                # Fix: lr 6e-5 (gentler), per_alpha 0.5 (balanced sampling)
+                self.lr, self.tau = 6.0e-5, 0.005
+                self.per_alpha = 0.5
+                self.per_beta_start = 0.4
                 self.closer_reward = 0.15
             else:
-                self.lr, self.tau = 5.0e-5, 0.001 
+                self.lr, self.tau = 4.0e-5, 0.001 
+                self.per_alpha = 0.5
+                self.per_beta_start = 0.6
                 self.closer_reward = 0.05 
             self.buffer_size = 600_000 
-            self.grad_clip = 0.5
-        else:
-            self.lr, self.tau = 2.0e-4, 0.005
-            self.closer_reward = 0.01
-            self.buffer_size = 250_000
-            self.grad_clip = 1.0
+            self.buffer_size = 600_000 
+            self.grad_clip = 0.5 
+        
+        if cfg.total_frames <= 1_200_000 and cfg.single_snake:
+            # Phase 1 Short Run: 
+            # V44.6: Increase Buffer to 1M (Whole History) to prevent Catastrophic Forgetting.
+            # 200k was too small, causing agent to forget how to handle early/mid game states 
+            # once it reached late game (long snake) states.
+            self.buffer_size = 1_000_000
+        elif cfg.total_frames <= 2_000_000:
+            self.buffer_size = min(self.buffer_size, 400_000)
 
-        log(f">>> [V8.0 Asymmetric-Tuning] Variant: {cfg.variant.upper()} | LR: {self.lr} | Tau: {self.tau} | GradClip: {self.grad_clip}")
+        # V44.6: DDQN specific tuning - Lower LR to stabilize Phase 1
+        if cfg.variant == "ddqn":
+            self.lr = self.lr * 0.5 # 8e-5 -> 4e-5
+
+        log(f">>> [V8.0 Asymmetric-Tuning] Variant: {cfg.variant.upper()} | LR: {self.lr} | Tau: {self.tau} | GradClip: {self.grad_clip} | Buf: {self.buffer_size}")
         
         env_cfg = BattleSnakeConfig(num_snakes=cfg.num_snakes, dash_cooldown_steps=15)
         if cfg.num_snakes == 1:
@@ -217,6 +268,7 @@ class DQNVariantTrainer:
             env_cfg.food_reward = 50.0 
             env_cfg.death_penalty = -20.0 
             env_cfg.step_penalty = -0.01
+            env_cfg.self_collision_penalty = -15.0  # V43.0: Reduced from -22 (Prevent timidity)
             log(f">>> PHASE 1 (Single) | Closer: {env_cfg.closer_reward} | Penalty: -0.01")
         else:
             # Phase 2: Aggressive Combat & Survival (V6.2 Fixed)
@@ -225,7 +277,8 @@ class DQNVariantTrainer:
             env_cfg.step_penalty = -0.02      
             env_cfg.death_penalty = -30.0    
             env_cfg.kill_reward = 30.0       
-            env_cfg.food_reward = 50.0       
+            env_cfg.food_reward = 50.0
+            env_cfg.self_collision_penalty = -20.0  # V43.0: Reduced from -35
             log(f">>> PHASE 2 (Battle) | Closer: {env_cfg.closer_reward} | Penalty: -0.02")
         
         self.envs = [BattleSnakeEnv(env_cfg) for _ in range(cfg.num_envs)]
@@ -233,7 +286,7 @@ class DQNVariantTrainer:
         # Select Architecture
         if cfg.variant == "dqn": self.net_cls = DQNNet
         elif cfg.variant == "ddqn": self.net_cls = DDQNNet
-        elif cfg.variant == "per": self.net_cls = DuelingDQNNet # V32.0: Upgrade to DuelingNet (SimpleNet collapsed)
+        elif cfg.variant == "per": self.net_cls = DDQNNet 
         elif cfg.variant == "dueling": self.net_cls = DuelingDQNNet
         else: raise ValueError(f"Unknown variant {cfg.variant}")
         
@@ -265,19 +318,29 @@ class DQNVariantTrainer:
         
         self.best_reward = -float('inf')
         
-        # V26.0: Selective Optimization (Dueling Champion)
-        # Statistics show Dueling handles Gamma 0.995 well. DQN/PER/DDQN Collapse.
-        if cfg.variant == "dueling":
-            self.gamma = 0.995 # V28.0: Dueling uses 0.995 GLOBALLY (Ph1 & Ph2) to prevent scale collapse
-            self.updates_per_step = 1 # Keep 1x for stability (PER-safe)
-        else:
-            self.gamma = 0.99 # Revert others to standard horizon
-            self.updates_per_step = 1 # Revert others to standard speed
+        # V39.0: Unified Gamma (Dueling was 0.995 -> unstable)
+        # All variants now use 0.99 for stable value estimation
+        self.gamma = 0.99
+        # V44.2: Global Stability Fix - Force 1 update/step for ALL variants (including PER).
+        # Previous values (PER=3, DDQN=2) caused collapse with high LR.
+        # Stability > Speed.
+        self.updates_per_step = 1
 
     def save_model(self, path):
+        # V44.4: Atomic Save to prevent file corruption/locking during self-play loading
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(self.policy_net.state_dict(), p)
+        tmp_path = p.with_suffix(p.suffix + ".tmp")
+        torch.save(self.policy_net.state_dict(), tmp_path)
+        if os.path.exists(p):
+            try:
+                os.replace(tmp_path, p)
+            except OSError:
+                # Windows atomic replace retry fallback
+                os.remove(p)
+                os.rename(tmp_path, p)
+        else:
+            os.rename(tmp_path, p)
 
     def _get_opp_model(self, path: str) -> nn.Module:
         """Get model from cache or load from disk"""
@@ -289,7 +352,9 @@ class DQNVariantTrainer:
                 model.eval()
                 self.loaded_opp_models[path] = model
                 # Limit cache size to prevent memory leak
-                if len(self.loaded_opp_models) > 5:
+                # V44.3: Increase Cache to 50 (was 5). 8 envs * 3 opps = 24 models needed.
+                # 5 was causing severe IO thrashing -> 3 FPS.
+                if len(self.loaded_opp_models) > 50:
                     key_to_del = next(iter(self.loaded_opp_models))
                     del self.loaded_opp_models[key_to_del]
             except Exception:
@@ -302,16 +367,34 @@ class DQNVariantTrainer:
         ep_rewards = [0.0] * self.cfg.num_envs
         recent_rewards = []
         last_log_time = time.time()
+        saved_best = False
         
-        while self.steps < self.cfg.total_frames:
+        total_frames = max(1, int(self.cfg.total_frames))
+        # Scale key schedule points with training length.
+        # For 20M runs, linear warmup(10%/30%) is too long. Use sqrt scaling + clamps.
+        scale = math.sqrt(total_frames / 1_000_000)
+        warmup1 = int(max(50_000, min(int(total_frames * 0.10), 100_000 * scale)))
+        warmup2 = int(max(150_000, min(int(total_frames * 0.30), 300_000 * scale)))
+        # Late-stage throttling (reduce update pressure / tau / self-play churn).
+        late_half = int(total_frames * 0.50)
+        late_40 = int(total_frames * 0.40)
+
+        while self.steps < total_frames:
             # 1. Group all snakes by model for Omni-Batch Inference
             # { model_ptr: [(env_idx, snake_idx, obs)] }
             groups: Dict[Optional[nn.Module], List[Tuple[int, int, Dict]]] = {None: []}
             
             self.steps += self.cfg.num_envs
-            # V6.2: Restored Aggressive Epsilon Decay (200k target)
-            eps_min = 0.1 if self.cfg.single_snake else 0.05
-            eps = max(eps_min, 1.0 - self.steps / self.cfg.eps_decay)
+            # V43.0: Dynamic Epsilon Decay (Scaled to total_frames)
+            if self.cfg.single_snake:
+                eps_min = 0.05 # V44.0: Increased from 0.02 to prevent overfitting/collapse
+            else:
+                eps_min = 0.05 # Keep exploring in battle
+            
+            # Linear decay over defined duration
+            completion = min(1.0, self.steps / self.decay_steps)
+            eps = 1.0 - completion * (1.0 - eps_min)
+            eps = max(eps_min, eps)
             
             all_actions = [ [None]*self.cfg.num_snakes for _ in range(self.cfg.num_envs) ]
             
@@ -341,7 +424,7 @@ class DQNVariantTrainer:
                 if not samples: continue
                 if model is None: continue # Handled by random
                 
-                with torch.no_grad():
+                with torch.inference_mode():
                     grids = np.array([s[2]['grid'] for s in samples])
                     vecs = np.array([s[2]['vector'] for s in samples])
                     t_g = torch.as_tensor(grids, dtype=torch.float32, device=self.device)
@@ -366,7 +449,9 @@ class DQNVariantTrainer:
                     next_obs_batch.append(self.envs[e_idx].reset())
                     
                     # Self-Play Shuffle
-                    if self.cfg.num_snakes > 1 and random.random() < self.cfg.self_play_prob:
+                    sp_prob = self.cfg.self_play_prob
+                    # Gradual reduction of shuffle rate? No, keep it dynamic for Battle.
+                    if self.cfg.num_snakes > 1 and random.random() < sp_prob:
                         opp_idx = random.randint(1, self.cfg.num_snakes-1)
                         m_p = self.sp_manager.sample_model()
                         if m_p:
@@ -378,22 +463,50 @@ class DQNVariantTrainer:
             # This was MISSING - old observations were reused indefinitely!
             obs_batch = next_obs_batch
 
-            # 4. V23.0: Active Late-Stage Learning (0.05 floor)
-            frac = max(0.0, 1.0 - (self.steps / self.cfg.total_frames))
-            lr_floor = 0.05 # V23.0: 0.01 -> 0.05 (Keep ~5e-6 to keep learning)
-            current_lr = self.lr * max(lr_floor, frac) 
+            # 4. V43.0: Standard Linear LR Decay
+            # Remove complex variant-specific floor logic. Just decay to 1% (V44.0).
+            progress = self.steps / total_frames
+            frac = max(0.0, 1.0 - progress)
+            current_lr = self.lr * (0.01 + 0.99 * frac)
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = current_lr
 
             # V13.0 CRITICAL FIX: Actually train the network!
             # V24.0: Double Update Frequency for Phase 1 (Ratio 0.25)
             if self.memory.size >= self.cfg.batch_size:
-                for _ in range(self.updates_per_step):
+                # Warm-up: avoid overfitting noisy early experience for PER/Dueling.
+                if self.cfg.variant in ("per", "dueling"):
+                    if self.steps < warmup1:
+                        updates = 1
+                    elif self.steps < warmup2:
+                        updates = min(2, self.updates_per_step)
+                    else:
+                        updates = self.updates_per_step
+                elif self.cfg.variant == "ddqn":
+                    # DDQN often peaks mid-training then regresses; reduce update pressure late.
+                    late_cut = late_half if self.cfg.single_snake else late_40
+                    updates = self.updates_per_step if self.steps < late_cut else 1
+                elif self.cfg.variant == "per":
+                    # PER can become unstable after it starts exploiting; reduce update pressure late.
+                    updates = self.updates_per_step if self.steps < late_half else 1
+                else:
+                    updates = self.updates_per_step
+
+                for _ in range(updates):
                     self.update()
 
             # 5. Soft Update
+            tau_eff = self.tau
+            if self.cfg.variant == "ddqn":
+                late_cut = late_half if self.cfg.single_snake else late_40
+                if self.steps >= late_cut:
+                    tau_eff = self.tau * 0.5
+            if self.cfg.variant == "dqn" and (not self.cfg.single_snake) and self.steps >= late_half:
+                tau_eff = self.tau * 0.5
+            if self.cfg.variant == "per" and self.steps >= late_half:
+                tau_eff = self.tau * 0.5
             for target_param, policy_param in zip(self.target_net.parameters(), self.policy_net.parameters()):
-                target_param.data.copy_(self.tau * policy_param.data + (1.0 - self.tau) * target_param.data)
+                target_param.data.copy_(tau_eff * policy_param.data + (1.0 - tau_eff) * target_param.data)
                 
             # 5. Heartbeat Logging
             log_interval = 2000 if self.steps < 20000 else 10000
@@ -406,16 +519,25 @@ class DQNVariantTrainer:
                 if avg_r > self.best_reward and len(recent_rewards) >= 20:
                     self.best_reward = avg_r
                     self.save_model(self.cfg.save_path)
+                    saved_best = True
             
-            if self.steps % 150000 < self.cfg.num_envs:
+            pool_interval = max(150_000, int(total_frames * 0.03))
+            if self.steps % pool_interval < self.cfg.num_envs:
                 self.sp_manager.add_model(self.policy_net.state_dict(), f"{self.cfg.variant}_step_{self.steps}")
         
-        self.save_model(self.cfg.save_path)
+        # IMPORTANT: many variants can peak and then regress late.
+        # Keep `save_path` as the best checkpoint; avoid overwriting it with a worse final model.
+        if not saved_best:
+            self.save_model(self.cfg.save_path)
+        else:
+            final_path = str(Path(self.cfg.save_path).with_suffix(".final.pth"))
+            self.save_model(final_path)
 
     def update(self):
         # V6.3: Calculate dynamic Beta for PER (Annealing from 0.4 to 1.0)
         frac = self.steps / self.cfg.total_frames
-        current_beta = min(1.0, 0.4 + frac * (1.0 - 0.4))
+        beta_start = getattr(self, "per_beta_start", 0.4)
+        current_beta = min(1.0, beta_start + frac * (1.0 - beta_start))
         
         if "per" in self.cfg.variant or "dueling" in self.cfg.variant:
             states, actions, rewards, next_states, dones, weights, idxs = self.memory.sample(current_beta)
@@ -436,8 +558,10 @@ class DQNVariantTrainer:
             
         td_errors = q_curr - target
         if weights is not None:
-            loss = (weights * (td_errors ** 2)).mean()
-            self.memory.update_priorities(idxs, td_errors.detach().cpu().numpy())
+            # Weighted Huber loss is significantly more stable than weighted MSE under PER.
+            per_sample = nn.SmoothL1Loss(reduction="none")(q_curr, target)
+            loss = (weights * per_sample).mean()
+            self.memory.update_priorities(idxs, td_errors.detach().abs().cpu().numpy())
         else:
             loss = nn.SmoothL1Loss()(q_curr, target)
             

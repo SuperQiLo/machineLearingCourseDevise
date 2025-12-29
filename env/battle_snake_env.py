@@ -46,6 +46,7 @@ class BattleSnakeConfig:
     closer_reward: float = 0.3
     farther_penalty: float = -0.2
     step_penalty: float = -0.05
+    self_collision_penalty: float = -20.0  # V43.0: Reduced from -25 (Prevent timidity)
 
 class BattleSnakeEnv:
     """Multi-Agent Snake Environment with Multiple Foods."""
@@ -145,6 +146,12 @@ class BattleSnakeEnv:
 
         # Run moves
         for sub_step in range(2):
+            # Precompute body occupancy (exclude tail) for fast collision checks.
+            # This matches the previous logic `pos in self.snakes[j][:-1]` but avoids O(length) scans.
+            body_sets = [
+                (set(self.snakes[i][:-1]) if (not self.dead[i] and self.snakes[i]) else set())
+                for i in range(self.config.num_snakes)
+            ]
             next_heads = []
             for i in range(self.config.num_snakes):
                 if self.dead[i] or move_repeats[i] <= sub_step:
@@ -175,12 +182,21 @@ class BattleSnakeEnv:
             dying_now = set()
             for i in alive_indices:
                 nh = next_heads[i]
+                # Wall collision
                 if not (0 <= nh[0] < self.width and 0 <= nh[1] < self.height):
                     dying_now.add(i); rewards[i] += self.config.death_penalty
+                # Body collision (V41.0: Distinguish self vs other)
                 for j in range(self.config.num_snakes):
-                    if not self.dead[j] and nh in self.snakes[j][:-1]:
-                        dying_now.add(i); rewards[i] += self.config.death_penalty
-                        if i != j: rewards[j] += self.config.kill_reward
+                    if not self.dead[j] and nh in body_sets[j]:
+                        dying_now.add(i)
+                        if i == j:
+                            # Self-collision: heavier penalty to teach self-avoidance
+                            rewards[i] += self.config.self_collision_penalty
+                        else:
+                            # Hit opponent body: standard death penalty
+                            rewards[i] += self.config.death_penalty
+                            rewards[j] += self.config.kill_reward
+                # Head-on collision
                 for j in alive_indices:
                     if i != j and nh == next_heads[j]:
                         if len(self.snakes[i]) <= len(self.snakes[j]):
@@ -214,9 +230,29 @@ class BattleSnakeEnv:
                 self.foods.append(segment)
 
     def _get_observations(self) -> List[ObservationDict]:
-        return [self._get_agent_obs(i) for i in range(self.config.num_snakes)]
+        cache = self._build_obs_cache()
+        return [self._get_agent_obs_cached(i, cache) for i in range(self.config.num_snakes)]
+
+    def _build_obs_cache(self):
+        """Build reusable O(1) lookup tables for observation construction."""
+        occupied_all = set()
+        head_map: Dict[Tuple[int, int], int] = {}
+        for i in range(self.config.num_snakes):
+            if self.dead[i] or not self.snakes[i]:
+                continue
+            occupied_all.update(self.snakes[i])
+            head_map[self.snakes[i][0]] = i
+        food_set = set(self.foods)
+        return occupied_all, head_map, food_set
 
     def _get_agent_obs(self, agent_idx: int) -> ObservationDict:
+        # Keep API stable (used by net/game_client.py). This path is slower than
+        # `_get_observations()` but fine for occasional calls.
+        cache = self._build_obs_cache()
+        return self._get_agent_obs_cached(agent_idx, cache)
+
+    def _get_agent_obs_cached(self, agent_idx: int, cache) -> ObservationDict:
+        occupied_all, head_map, food_set = cache
         if self.dead[agent_idx]:
              return {
                  "vector": np.zeros(self.obs_dim, dtype=np.float32),
@@ -229,7 +265,16 @@ class BattleSnakeEnv:
         # 1. Vector Features
         food_up, food_down, food_left, food_right = 0.0, 0.0, 0.0, 0.0
         if self.foods:
-            closest_food = min(self.foods, key=lambda f: abs(head[0]-f[0]) + abs(head[1]-f[1]))
+            # Deterministic tie-break: when two foods are equidistant, always pick the same one
+            # to avoid observation jitter that can cause limit-cycles.
+            closest_food = min(
+                self.foods,
+                key=lambda f: (
+                    abs(head[0] - f[0]) + abs(head[1] - f[1]),
+                    f[0],
+                    f[1],
+                ),
+            )
             dy = head[1] - closest_food[1]
             if dy > 0: food_up = max(0, 1.0 - dy / self.height)
             elif dy < 0: food_down = max(0, 1.0 - abs(dy) / self.height)
@@ -241,12 +286,13 @@ class BattleSnakeEnv:
         danger_1, danger_2, radar = [], [], []
         for d in dirs:
             p1 = self._get_next_pos(head, d)
-            danger_1.append(float(self._is_danger(agent_idx, p1)))
+            danger_1.append(float(self._is_danger_cached(p1, occupied_all)))
             p2 = self._get_next_pos(p1, d)
-            danger_2.append(float(self._is_danger(agent_idx, p2)))
+            danger_2.append(float(self._is_danger_cached(p2, occupied_all)))
             dist, cur = 1, p1
             while 0 <= cur[0] < self.width and 0 <= cur[1] < self.height:
-                if self._is_danger(agent_idx, cur): break
+                if self._is_danger_cached(cur, occupied_all):
+                    break
                 dist += 1; cur = self._get_next_pos(cur, d)
             radar.append(1.0 / dist)
             
@@ -288,19 +334,25 @@ class BattleSnakeEnv:
                 if not (0 <= x < self.width and 0 <= y < self.height):
                     grid[0, gy, gx] = 1.0
                 else:
-                    for j in range(self.config.num_snakes):
-                        if not self.dead[j] and (x, y) in self.snakes[j]:
-                            grid[0, gy, gx] = 1.0
-                            if (x, y) == self.snakes[j][0] and j != agent_idx: grid[2, gy, gx] = 1.0
-                    if (x, y) in self.foods: grid[1, gy, gx] = 1.0
+                    pos = (x, y)
+                    if pos in occupied_all:
+                        grid[0, gy, gx] = 1.0
+                        head_owner = head_map.get(pos)
+                        if head_owner is not None and head_owner != agent_idx:
+                            grid[2, gy, gx] = 1.0
+                    if pos in food_set:
+                        grid[1, gy, gx] = 1.0
         return {"vector": vector, "grid": grid}
+
+    @staticmethod
+    def _is_danger_cached(pos: Tuple[int, int], occupied_all: set) -> bool:
+        return pos in occupied_all
 
     def _is_danger(self, agent_idx: int, pos: Tuple[int, int]) -> bool:
         x, y = pos
         if not (0 <= x < self.width and 0 <= y < self.height): return True
-        for i in range(self.config.num_snakes):
-            if not self.dead[i] and pos in self.snakes[i]: return True
-        return False
+        occupied_all, _, _ = self._build_obs_cache()
+        return pos in occupied_all
 
     def _get_next_pos(self, head: Tuple[int, int], direction: Direction) -> Tuple[int, int]:
         dx, dy = self.DIR_DELTA[direction]

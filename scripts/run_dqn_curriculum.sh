@@ -1,8 +1,10 @@
 #!/bin/bash
 # run_dqn_curriculum.sh
-# Usage: ./scripts/run_dqn_curriculum.sh [dqn|ddqn|per|dueling]
+# Usage: ./scripts/run_dqn_curriculum.sh [dqn|ddqn|per|dueling] [steps1] [steps2]
 
 VARIANT=${1:-"dueling"} # Improved: Default to Dueling-DQN in V7.0
+STEPS1=${2:-""}
+STEPS2=${3:-""}
 
 # 1. Setup directories
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,7 +24,13 @@ echo ">>> Log file: $LOG_FILE"
 PY_CMD="python"
 if ! command -v $PY_CMD &> /dev/null; then PY_CMD="python3"; fi
 
-nohup $PY_CMD -u "$PROJECT_ROOT/train_dqn_curriculum.py" --variant "${VARIANT}" > "$LOG_FILE" 2>&1 &
+# Optional: override curriculum steps
+# Example: ./scripts/run_dqn_curriculum.sh ddqn 5000000 8000000
+if [[ -n "$STEPS1" && -n "$STEPS2" ]]; then
+	nohup $PY_CMD -u "$PROJECT_ROOT/train_dqn_curriculum.py" --variant "${VARIANT}" --steps1 "$STEPS1" --steps2 "$STEPS2" > "$LOG_FILE" 2>&1 &
+else
+	nohup $PY_CMD -u "$PROJECT_ROOT/train_dqn_curriculum.py" --variant "${VARIANT}" > "$LOG_FILE" 2>&1 &
+fi
 
 # 4. Save PID
 NEW_PID=$!

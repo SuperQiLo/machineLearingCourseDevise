@@ -8,13 +8,19 @@ echo ">>> Targeted stop: $TARGET"
 
 case $TARGET in
     dqn)
-        # Kill any DQN variant training or curriculum
-        PATTERNS=("train_dqn_variants.py" "train_dqn_curriculum.py")
+        # Stop ONLY DQN (do not kill ddqn/per/dueling)
+        PATTERNS=(
+            "train_dqn_variants.py .*--variant dqn"
+            "train_dqn_curriculum.py .*--variant dqn"
+        )
         ;;
     ddqn|per|dueling)
-        # Kill specific variant training
+        # Kill specific variant training (and its curriculum runner)
         # pkill -f matches full command line including "--variant variant_name"
-        PATTERNS=("train_dqn_variants.py .*--variant $TARGET")
+        PATTERNS=(
+            "train_dqn_variants.py .*--variant $TARGET"
+            "train_dqn_curriculum.py .*--variant $TARGET"
+        )
         ;;
     ppo)
         PATTERNS=("train_ppo.py" "train_ppo_curriculum.py")

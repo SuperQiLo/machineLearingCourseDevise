@@ -43,6 +43,15 @@ def _discover_agents():
 # Run discovery on import
 _discover_agents()
 
+# V42.0: Add aliases for convenience (matches train_dqn_variants.py naming)
+AGENT_ALIASES = {
+    "dueling": "duelingdqn",
+    "per": "perdqn",
+}
+for alias, target in AGENT_ALIASES.items():
+    if target in AGENTS and alias not in AGENTS:
+        AGENTS[alias] = AGENTS[target]
+
 def get_agent(name: str, input_dim: int, model_path: str = None, **kwargs):
     """
     Factory to create agent instance.
