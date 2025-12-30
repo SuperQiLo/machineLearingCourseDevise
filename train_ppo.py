@@ -48,20 +48,21 @@ def make_env(num_snakes: int, grid_size: int, seed: Optional[int] = None):
             dash_cooldown_steps=15,
         )
         if num_snakes == 1:
-            env_cfg.closer_reward = 0.15
-            env_cfg.farther_penalty = -0.10
-            env_cfg.food_reward = 20.0 # V45.0: Reduced from 50
-            env_cfg.death_penalty = -40.0 # V45.0: Increased
+            env_cfg.closer_reward = 0.20
+            env_cfg.farther_penalty = -0.15
+            env_cfg.food_reward = 100.0 # V46.0: Aligned with DQN aggressive plan
+            env_cfg.death_penalty = -10.0 # V46.0: Reduced fear
             env_cfg.step_penalty = -0.01
-            env_cfg.self_collision_penalty = -50.0 # V45.0: Severe
+            env_cfg.self_collision_penalty = -10.0 # V46.0: Reduced fear
         else:
-            env_cfg.closer_reward = 0.05
-            env_cfg.farther_penalty = -0.10
+            # V47.0: Kill-Focused Combat + Anti-Self-Collision (Fix late-game wall/self crashes)
+            env_cfg.closer_reward = 0.10  # V47.0: Smoother transition
+            env_cfg.farther_penalty = -0.08
             env_cfg.step_penalty = -0.02
-            env_cfg.kill_reward = 40.0
-            env_cfg.death_penalty = -40.0
-            env_cfg.food_reward = 20.0 # V45.0: Reduced from 50
-            env_cfg.self_collision_penalty = -50.0 # V45.0: Severe
+            env_cfg.kill_reward = 80.0    # V47.0: Aligned with user preference for kills
+            env_cfg.death_penalty = -35.0 # V47.0: Higher penalty to prevent reckless play
+            env_cfg.food_reward = 50.0    # V47.0: Balanced with kill focus
+            env_cfg.self_collision_penalty = -50.0  # V47.0: CRITICAL - High penalty to fix self-crash bug
         return BattleSnakeEnv(env_cfg, seed=seed)
 
     return thunk
@@ -214,10 +215,10 @@ def train_ppo(
     update_epochs = 4
     gamma = 0.99
     gae_lambda = 0.95
-    clip_coef = 0.15 if num_snakes > 1 else 0.20
+    clip_coef = 0.20 # V46.0: Stable exploration
     vf_coef = 0.5
-    ent_start = 0.02 if num_snakes > 1 else 0.05
-    ent_min = 0.005
+    ent_start = 0.08 if num_snakes > 1 else 0.10 # V46.0: Stronger exploration
+    ent_min = 0.015 # V46.0: Prevent policy collapse
     max_grad_norm = 0.5
 
     batch_size = num_envs * num_steps
@@ -256,8 +257,8 @@ def train_ppo(
 
     while global_step < total_timesteps:
         progress = min(1.0, global_step / max(1, total_timesteps))
-        # LR schedule (linear decay to 25%)
-        lr_now = lr * max(0.25, 1.0 - progress)
+        # LR schedule (linear decay to 40%)
+        lr_now = lr * max(0.40, 1.0 - progress)
         for pg in optimizer.param_groups:
             pg["lr"] = lr_now
         # Entropy schedule (hold exploration earlier, tighten later)

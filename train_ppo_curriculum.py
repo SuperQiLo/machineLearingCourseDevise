@@ -26,8 +26,9 @@ def run_step(cmd, desc):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--steps1", type=int, default=1_000_000, help="Phase 1 frames")
-    parser.add_argument("--steps2", type=int, default=1_500_000, help="Phase 2 frames")
+    # V47.0: Default to 5,000,000 frames per phase for better convergence.
+    parser.add_argument("--steps1", type=int, default=5_000_000, help="Phase 1 frames")
+    parser.add_argument("--steps2", type=int, default=5_000_000, help="Phase 2 frames")
     args = parser.parse_args()
 
     print("=== Snake PPO Curriculum Training ===")

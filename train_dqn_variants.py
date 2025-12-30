@@ -161,6 +161,8 @@ class TrainConfig:
     save_path: str = "agent/checkpoints/dqn_best.pth"
     single_snake: bool = False
     self_play_prob: float = 0.5
+    # V47.0: Epsilon Warm Start for Phase 2 to prevent catastrophic forgetting
+    eps_start: float = 1.0  # Will be overridden to 0.3 for Phase 2
 
 class DQNVariantTrainer:
     def __init__(self, cfg: TrainConfig):
@@ -171,7 +173,7 @@ class DQNVariantTrainer:
         
         # Decide Decay Duration: 85% of total steps for single, 90% for battle (need more exploration)
         if cfg.single_snake:
-            decay_ratio = 0.85 # V46.0: Extended decay 0.80 -> 0.85
+            decay_ratio = 0.80 # V46.3: Compressed for 300W run
         else:
             decay_ratio = 0.90
             
@@ -192,9 +194,9 @@ class DQNVariantTrainer:
                 self.lr, self.tau = 8.0e-5, 0.005 
                 self.closer_reward = 0.15
             else:
-                # V33.0: DQN Ph2 - Stability Tuning (LR 4e-5, Tau 0.001)
-                self.lr, self.tau = 4.0e-5, 0.001 
-                self.closer_reward = 0.05
+                # V47.0: DQN Ph2 - Higher LR/Tau for faster adaptation
+                self.lr, self.tau = 6.0e-5, 0.003 
+                self.closer_reward = 0.10  # V47.0: Smoother transition from 0.20
             self.buffer_size = 600_000 
             self.grad_clip = 0.5 
         elif cfg.variant == "ddqn":
@@ -204,9 +206,9 @@ class DQNVariantTrainer:
                 self.lr, self.tau = 8.0e-5, 0.005 # V38.0: Match DQN
                 self.closer_reward = 0.15
             else:
-                # DDQN battle is sensitive to self-play non-stationarity; use slightly lower LR.
-                self.lr, self.tau = 4.0e-5, 0.001
-                self.closer_reward = 0.05
+                # V47.0: DDQN Ph2 - Higher LR/Tau for faster adaptation
+                self.lr, self.tau = 6.0e-5, 0.003
+                self.closer_reward = 0.10  # V47.0: Smoother transition
             self.buffer_size = 600_000 
             self.grad_clip = 0.5 # V38.0: Critical Fix (1.0 -> 0.5) to match DQN stability
         elif cfg.variant == "per":
@@ -220,10 +222,11 @@ class DQNVariantTrainer:
                 self.per_beta_start = 0.3
                 self.closer_reward = 0.15
             else:
-                self.lr, self.tau = 6.0e-5, 0.002
-                self.per_alpha = 0.5
-                self.per_beta_start = 0.6
-                self.closer_reward = 0.05 
+                # V47.0: PER Ph2 - Higher LR/Tau for faster adaptation
+                self.lr, self.tau = 7.0e-5, 0.003
+                self.per_alpha = 0.55
+                self.per_beta_start = 0.5
+                self.closer_reward = 0.10  # V47.0: Smoother transition
             self.buffer_size = 600_000 
             self.grad_clip = 0.5 
         elif cfg.variant == "dueling":
@@ -237,10 +240,11 @@ class DQNVariantTrainer:
                 self.per_beta_start = 0.3
                 self.closer_reward = 0.15
             else:
-                self.lr, self.tau = 4.0e-5, 0.001 
-                self.per_alpha = 0.5
-                self.per_beta_start = 0.6
-                self.closer_reward = 0.05 
+                # V47.0: Dueling Ph2 - Higher LR/Tau for faster adaptation
+                self.lr, self.tau = 6.0e-5, 0.003 
+                self.per_alpha = 0.55
+                self.per_beta_start = 0.5
+                self.closer_reward = 0.10  # V47.0: Smoother transition
             self.buffer_size = 600_000 
             self.buffer_size = 600_000 
             self.grad_clip = 0.5 
@@ -268,18 +272,18 @@ class DQNVariantTrainer:
             env_cfg.food_reward = 100.0 # 50 -> 100 (Primary Driver for 300+ reward)
             env_cfg.death_penalty = -10.0 # -20 -> -10 (Less afraid of edges)
             env_cfg.step_penalty = -0.01
-            env_cfg.self_collision_penalty = -8.0  # -15 -> -8 (Don't let fear paralyze late game)
+            env_cfg.self_collision_penalty = -10.0  # -15 -> -8 (Don't let fear paralyze late game)
             log(f">>> [V46.0 Aggressive] PHASE 1 (Single) | Food: {env_cfg.food_reward} | Closer: {env_cfg.closer_reward} | Penalty: -0.01")
         else:
-            # Phase 2: Aggressive Combat & Survival (V6.2 Fixed)
-            env_cfg.closer_reward = self.closer_reward
-            env_cfg.farther_penalty = -0.10  
+            # Phase 2: V47.0 Kill-Focused Combat (User Preference: Prioritize Kills)
+            env_cfg.closer_reward = 0.10  # V47.0: Smoother transition from 0.20
+            env_cfg.farther_penalty = -0.08  
             env_cfg.step_penalty = -0.02      
-            env_cfg.death_penalty = -30.0    
-            env_cfg.kill_reward = 30.0       
-            env_cfg.food_reward = 50.0
-            env_cfg.self_collision_penalty = -20.0  # V43.0: Reduced from -35
-            log(f">>> PHASE 2 (Battle) | Closer: {env_cfg.closer_reward} | Penalty: -0.02")
+            env_cfg.death_penalty = -25.0    # V47.0: Reduced fear of death
+            env_cfg.kill_reward = 80.0       # V47.0: 60 -> 80 (User wants more kills)
+            env_cfg.food_reward = 50.0       # V47.0: 40 -> 50 (Smoother transition)
+            env_cfg.self_collision_penalty = -15.0  # V47.0: Reduced to encourage aggression
+            log(f">>> [V47.0 Kill-Focus] PHASE 2 (Battle) | Kill: {env_cfg.kill_reward} | Food: {env_cfg.food_reward} | Closer: {env_cfg.closer_reward}")
         
         self.envs = [BattleSnakeEnv(env_cfg) for _ in range(cfg.num_envs)]
         
@@ -387,15 +391,18 @@ class DQNVariantTrainer:
             groups: Dict[Optional[nn.Module], List[Tuple[int, int, Dict]]] = {None: []}
             
             self.steps += self.cfg.num_envs
-            # V46.0: Dynamic Epsilon Decay (Higher Min Epsilon for longer exploration)
+            # V47.0: Epsilon Warm Start for Phase 2 to prevent catastrophic forgetting
             if self.cfg.single_snake:
-                eps_min = 0.10 # V46.0: Increased 0.05 -> 0.10 to prevent premature convergence in 5M runs
+                eps_min = 0.10
+                eps_start = 1.0  # Phase 1: Start from full exploration
             else:
                 eps_min = 0.05
+                # V47.0: Phase 2 starts from 0.3 to preserve learned policy
+                eps_start = 0.30 if self.cfg.load_path else 1.0
             
             # Linear decay over defined duration
             completion = min(1.0, self.steps / self.decay_steps)
-            eps = 1.0 - completion * (1.0 - eps_min)
+            eps = eps_start - completion * (eps_start - eps_min)
             eps = max(eps_min, eps)
             
             all_actions = [ [None]*self.cfg.num_snakes for _ in range(self.cfg.num_envs) ]
