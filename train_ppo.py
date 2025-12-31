@@ -23,6 +23,15 @@ import torch.optim as optim
 import gymnasium as gym
 from torch.amp import autocast, GradScaler
 
+# V18.3: Silence CUDAGraph dynamic shape warnings for grouped inference
+if hasattr(torch, '_inductor'):
+    import torch._inductor.config as inductor_config
+    inductor_config.triton.cudagraph_skip_dynamic_graphs = True
+
+# V18.4: Enable TF32 for Tensor Core acceleration (Ampere+)
+if torch.cuda.is_available():
+    torch.set_float32_matmul_precision('high')
+
 from agent.ppo import ActorCritic
 from env.gymnasium_wrapper import make_gymnasium_env
 from utils.self_play import SelfPlayManager
@@ -94,18 +103,18 @@ def train_ppo(
 
     # PPO hyperparams (Optimized for Throughput)
     num_steps = 512 if num_snakes == 1 else 1024 
-    update_epochs = 2 # Reduced from 3 to speed up cycle
+    update_epochs = 4 # V18.2: Increased to 4 for better sample reuse
     gamma = 0.99
     gae_lambda = 0.95
     clip_coef = 0.20
-    vf_coef = 0.5
-    ent_start = 0.20 if num_snakes == 1 else 0.12 
+    vf_coef = 1.0 
+    ent_start = 0.08 if num_snakes == 1 else 0.12 # V18.3: Slightly reduced for precise nav
     ent_min = 0.02
     lr_init = lr
-    target_kl = 0.05
+    target_kl = 0.015 
 
     batch_size = num_envs * num_steps
-    minibatch_size = 4096 
+    minibatch_size = 2048 
     if minibatch_size > batch_size:
         minibatch_size = batch_size
 
@@ -116,12 +125,14 @@ def train_ppo(
         reward_cfg = {}
         if num_snakes == 1:
             reward_cfg = {
-                "closer_reward": 0.25,
-                "farther_penalty": -0.20,
-                "food_reward": 120.0,
-                "death_penalty": -10.0,
-                "step_penalty": -0.02,
-                "self_collision_penalty": -100.0,
+                "width": 20, "height": 20, "num_snakes": 1,
+                "min_food": 5, # V18.3: Increased density for better signal
+                "closer_reward": 0.15, # V18.3: Stronger guidance
+                "farther_penalty": -0.12,
+                "food_reward": 50.0, # V18.3: Stronger positive reinforcement
+                "death_penalty": -50.0,
+                "step_penalty": -0.05, # V18.3: Discourage idling/looping
+                "self_collision_penalty": -60.0,
             }
         else:
             reward_cfg = {
@@ -135,7 +146,11 @@ def train_ppo(
                 "death_penalty": -30.0,
                 "self_collision_penalty": -50.0,
             }
-        return make_gymnasium_env(num_snakes=num_snakes, grid_size=20, **reward_cfg)
+        # Unpack reward_cfg to avoid conflicts with make_gymnasium_env defaults
+        mfn = reward_cfg.pop("min_food", 2)
+        gs = reward_cfg.pop("width", 20)
+        ns = reward_cfg.pop("num_snakes", num_snakes) # Ensure no double-passing
+        return make_gymnasium_env(num_snakes=ns, grid_size=gs, min_food=mfn, **reward_cfg)
 
     # Use AsyncVectorEnv for true multi-process parallelism
     envs = gym.vector.AsyncVectorEnv([env_creator for _ in range(num_envs)])
@@ -294,10 +309,13 @@ def train_ppo(
         lastgaelam = 0
         for t in reversed(range(num_steps)):
             if t == num_steps - 1:
+                # V18.2: Use next_terminated (the done flag associated with the bootstrap state next_obs)
                 nextnonterminal = 1.0 - torch.as_tensor(next_terminated, dtype=torch.float32, device=device)
                 nextvalues = next_value
             else:
-                nextnonterminal = 1.0 - b_dones[t + 1]
+                # V18.2 FIX: Use b_dones[t] which corresponds to the state transition at step t
+                # Old code used b_dones[t+1], which was off-by-one
+                nextnonterminal = 1.0 - b_dones[t]
                 nextvalues = b_values[t + 1]
             delta = b_rewards[t] + gamma * nextvalues * nextnonterminal - b_values[t]
             advantages[t] = lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
@@ -381,7 +399,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--single", action="store_true")
     p.add_argument("--load", type=str, default=None)
-    p.add_argument("--steps", type=int, default=5_000_000)
+    p.add_argument("--steps", type=int, default=10_000_000) # V18.3: 10M for deep mastery
     args = p.parse_args()
 
     # V18.0: Turbo Hyperparams

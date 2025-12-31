@@ -17,6 +17,15 @@ import torch.optim as optim
 import sys
 import os
 
+# V18.3: Silence CUDAGraph dynamic shape warnings for grouped inference
+if hasattr(torch, '_inductor'):
+    import torch._inductor.config as inductor_config
+    inductor_config.triton.cudagraph_skip_dynamic_graphs = True
+
+# V18.4: Enable TF32 for Tensor Core acceleration (Ampere+)
+if torch.cuda.is_available():
+    torch.set_float32_matmul_precision('high')
+
 from env.battle_snake_env import BattleSnakeEnv, BattleSnakeConfig
 from env.gymnasium_wrapper import make_gymnasium_env
 import gymnasium as gym
@@ -254,30 +263,47 @@ class DQNVariantTrainer:
         
         env_cfg = BattleSnakeConfig(width=20, height=20, num_snakes=cfg.num_snakes)
         if cfg.num_snakes == 1:
-            # Phase 1: High focus on navigation (V46.0: Aggressive Reward Tuning)
-            env_cfg.closer_reward = 0.25      # Stronger pull to food
-            env_cfg.farther_penalty = -0.20   # Stronger penalty for going away
-            env_cfg.food_reward = 120.0
-            env_cfg.death_penalty = -30.0     # V16.0: Encouraging exploration on 20x20
-            env_cfg.step_penalty = -0.02      
-            env_cfg.self_collision_penalty = -50.0  # V16.0: Early Survival Awareness
-            log(f">>> [V16.0 Turbo] PHASE 1 (Single) | Batch: {self.batch_size} | Food: {env_cfg.food_reward} | Self-Penalty: {env_cfg.self_collision_penalty}")
+            # Phase 1: High focus on navigation (V18.3 Turbo Sync)
+            env_cfg.closer_reward = 0.15
+            env_cfg.farther_penalty = -0.12
+            env_cfg.food_reward = 50.0 # Match PPO V18.3
+            env_cfg.death_penalty = -50.0
+            env_cfg.step_penalty = -0.05
+            env_cfg.self_collision_penalty = -60.0
+            env_cfg.min_food = 5 # Add min_food to env_cfg
+            log(f">>> [V18.3 Turbo] PHASE 1 (Single) | FoodDensity: {env_cfg.min_food} | FoodRew: {env_cfg.food_reward}")
         else:
             # Phase 2: V9.0 Combat (High Aggression)
             env_cfg.closer_reward = 0.15 
             env_cfg.farther_penalty = -0.10  
             env_cfg.step_penalty = -0.05      
-            env_cfg.death_penalty = -100.0    # V15.0: Penalize environment death heavily in Battle
-            env_cfg.kill_reward = 150.0      # Aligned with PPO V7.0
-            env_cfg.food_reward = 80.0       # V10.0: Re-aligned with survival (Old 40 caused starvation)
-            env_cfg.self_collision_penalty = -150.0 # V15.0: Crucial fix for long-snake self-collision
-            log(f">>> [V9.0 Battle] PHASE 2 | Kill: {env_cfg.kill_reward} | Food: {env_cfg.food_reward} | Stable LR/Tau")
+            env_cfg.death_penalty = -100.0    
+            env_cfg.kill_reward = 150.0      
+            env_cfg.food_reward = 80.0       
+            env_cfg.self_collision_penalty = -150.0 
+            env_cfg.min_food = 2
+            log(f">>> [V9.0 Battle] PHASE 2 | Kill: {env_cfg.kill_reward} | FoodDensity: {env_cfg.min_food}")
         
-        log(f">>> [V18.0 Turbo] Initializing {cfg.num_envs} Parallel Battle Environments...")
+        log(f">>> [V18.3 Turbo] Initializing {cfg.num_envs} Parallel Environments...")
         def env_fn():
-             return make_gymnasium_env(num_snakes=cfg.num_snakes, grid_size=20)
+             # Convert BattleSnakeConfig to gymnasium wrapper keywords
+             return make_gymnasium_env(
+                 num_snakes=cfg.num_snakes, 
+                 grid_size=20,
+                 min_food=env_cfg.min_food,
+                 closer_reward=env_cfg.closer_reward,
+                 farther_penalty=env_cfg.farther_penalty,
+                 food_reward=env_cfg.food_reward,
+                 death_penalty=env_cfg.death_penalty,
+                 step_penalty=env_cfg.step_penalty,
+                 self_collision_penalty=env_cfg.self_collision_penalty,
+                 # Only passed if present in BattleSnakeConfig
+                 kill_reward=getattr(env_cfg, 'kill_reward', 150.0),
+                 win_reward=getattr(env_cfg, 'win_reward', 800.0),
+                 loss_penalty=getattr(env_cfg, 'loss_penalty', -200.0)
+             )
         self.envs = gym.vector.AsyncVectorEnv([env_fn for _ in range(cfg.num_envs)])
-        log(">>> [V18.0 Turbo] Environments Ready.")
+        log(">>> [V18.3 Turbo] Environments Ready.")
         
         # Select Architecture
         if cfg.variant == "dqn": self.net_cls = DQNNet
