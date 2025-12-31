@@ -2,3 +2,4 @@ numpy
 torch
 pygame
 PyQt6
+gymnasium

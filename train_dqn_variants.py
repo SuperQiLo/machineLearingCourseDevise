@@ -18,11 +18,17 @@ import sys
 import os
 
 from env.battle_snake_env import BattleSnakeEnv, BattleSnakeConfig
+from env.gymnasium_wrapper import make_gymnasium_env
+import gymnasium as gym
+
 from agent.dqn import DQNNet, DQNAgent
 from agent.ddqn import DDQNNet, DDQNAgent
 from agent.per_dqn import PERDQNNet, PERDQNAgent, SumTree
 from agent.dueling_dqn import DuelingDQNNet, DuelingDQNAgent
 from utils.self_play import SelfPlayManager
+
+# V17.4: AMP for faster GPU training (Updated API for PyTorch 2.x)
+from torch.amp import autocast, GradScaler
 
 def log(msg):
     print(msg, flush=True)
@@ -34,17 +40,19 @@ class FastReplayBuffer:
         self.capacity = capacity
         self.batch_size = batch_size
         self.device = device
-        self.grids = np.zeros((capacity, 5, 20, 20), dtype=np.float32)
+        # V17.0: Use uint8 for grids to save 75% memory (45GB -> 11GB for 3M capacity)
+        self.grids = np.zeros((capacity, *grid_shape), dtype=np.uint8)
         self.vectors = np.zeros((capacity, vector_dim), dtype=np.float32)
         self.actions = np.zeros(capacity, dtype=np.int64)
         self.rewards = np.zeros(capacity, dtype=np.float32)
-        self.next_grids = np.zeros((capacity, 5, 20, 20), dtype=np.float32)
+        self.next_grids = np.zeros((capacity, *grid_shape), dtype=np.uint8)
         self.next_vectors = np.zeros((capacity, vector_dim), dtype=np.float32)
         self.dones = np.zeros(capacity, dtype=np.bool_)
         self.ptr = 0
         self.size = 0
 
     def push(self, state, action, reward, next_state, done):
+        # V17.2: Direct assignment - numpy handles the type conversion automatically
         self.grids[self.ptr] = state['grid']
         self.vectors[self.ptr] = state['vector']
         self.actions[self.ptr] = action
@@ -57,15 +65,31 @@ class FastReplayBuffer:
 
     def sample(self):
         idxs = np.random.randint(0, self.size, size=self.batch_size)
+        
+        # Pinned memory transfer for faster CPU->GPU throughput
+        def to_device(numpy_array, dtype=None):
+            t = torch.as_tensor(numpy_array, dtype=dtype)
+            if self.device.type == 'cuda':
+                return t.pin_memory().to(self.device, non_blocking=True)
+            return t.to(self.device)
+
         return (
-            {"grid": torch.from_numpy(self.grids[idxs]).to(self.device), "vector": torch.from_numpy(self.vectors[idxs]).to(self.device)},
-            torch.from_numpy(self.actions[idxs]).to(self.device),
-            torch.from_numpy(self.rewards[idxs]).to(self.device),
-            {"grid": torch.from_numpy(self.next_grids[idxs]).to(self.device), "vector": torch.from_numpy(self.next_vectors[idxs]).to(self.device)},
-            torch.from_numpy(self.dones[idxs]).to(self.device),
+            {
+                "grid": to_device(self.grids[idxs], torch.float32), 
+                "vector": to_device(self.vectors[idxs])
+            },
+            to_device(self.actions[idxs]),
+            to_device(self.rewards[idxs]),
+            {
+                "grid": to_device(self.next_grids[idxs], torch.float32), 
+                "vector": to_device(self.next_vectors[idxs])
+            },
+            to_device(self.dones[idxs]),
             None, # weights
             None  # indices
         )
+
+
 
 class PrioritizedReplayBuffer:
     def __init__(self, capacity, grid_shape, vector_dim, batch_size, device, alpha=0.5, beta=0.4):
@@ -78,13 +102,12 @@ class PrioritizedReplayBuffer:
         self.epsilon = 1e-6
         self.max_priority = 1.0
 
-        # Store transitions in contiguous numpy arrays for speed.
-        # SumTree stores only indices into these arrays.
-        self.grids = np.zeros((capacity, *grid_shape), dtype=np.float32)
+        # V17.0: Use uint8 for grids (20x20x5)
+        self.grids = np.zeros((capacity, *grid_shape), dtype=np.uint8)
         self.vectors = np.zeros((capacity, vector_dim), dtype=np.float32)
         self.actions = np.zeros(capacity, dtype=np.int64)
         self.rewards = np.zeros(capacity, dtype=np.float32)
-        self.next_grids = np.zeros((capacity, *grid_shape), dtype=np.float32)
+        self.next_grids = np.zeros((capacity, *grid_shape), dtype=np.uint8)
         self.next_vectors = np.zeros((capacity, vector_dim), dtype=np.float32)
         self.dones = np.zeros(capacity, dtype=np.bool_)
 
@@ -94,6 +117,7 @@ class PrioritizedReplayBuffer:
 
     def push(self, state, action, reward, next_state, done):
         data_idx = self.tree.ptr
+        # V17.2: Direct assignment - numpy handles the type conversion
         self.grids[data_idx] = state['grid']
         self.vectors[data_idx] = state['vector']
         self.actions[data_idx] = action
@@ -104,38 +128,45 @@ class PrioritizedReplayBuffer:
         self.tree.add(self.max_priority ** self.alpha, int(data_idx))
 
     def sample(self, beta: float):
-        idxs, weights, batch = [], [], []
         segment = self.tree.total_priority / self.batch_size
+        v = np.random.uniform(segment * np.arange(self.batch_size), segment * np.arange(1, self.batch_size + 1))
         
-        for i in range(self.batch_size):
-            a, b = segment * i, segment * (i + 1)
-            v = random.uniform(a, b)
-            idx, p, data = self.tree.get_leaf(v)
+        idxs = []
+        priorities = []
+        batch_data_idxs = []
+        
+        for val in v:
+            idx, p, data_idx = self.tree.get_leaf(val)
             idxs.append(idx)
-            weights.append(p / self.tree.total_priority)
-            batch.append(int(data))
+            priorities.append(p)
+            batch_data_idxs.append(int(data_idx))
             
-        weights = np.array(weights)
-        weights = (len(batch) * weights) ** (-beta) 
+        idxs = np.array(idxs)
+        batch = np.array(batch_data_idxs)
+        
+        probs = np.array(priorities) / (self.tree.total_priority + 1e-8)
+        weights = (self.size * probs) ** (-beta)
         weights /= (weights.max() + 1e-8)
         
-        # Proper batch indexing
-        batch = np.array(batch)
-        o_grids = self.grids[batch]
-        o_vecs = self.vectors[batch]
-        acts = self.actions[batch]
-        rews = self.rewards[batch]
-        n_grids = self.next_grids[batch]
-        n_vecs = self.next_vectors[batch]
-        dones = self.dones[batch]
-        
+        def to_device(numpy_array, dtype=None):
+            t = torch.as_tensor(numpy_array, dtype=dtype)
+            if self.device.type == 'cuda':
+                return t.pin_memory().to(self.device, non_blocking=True)
+            return t.to(self.device)
+
         return (
-            {"grid": torch.from_numpy(o_grids).to(self.device), "vector": torch.from_numpy(o_vecs).to(self.device)},
-            torch.from_numpy(acts).to(self.device),
-            torch.from_numpy(rews).to(self.device),
-            {"grid": torch.from_numpy(n_grids).to(self.device), "vector": torch.from_numpy(n_vecs).to(self.device)},
-            torch.from_numpy(dones).to(self.device),
-            torch.from_numpy(weights.astype(np.float32)).to(self.device),
+            {
+                "grid": to_device(self.grids[batch], torch.float32), 
+                "vector": to_device(self.vectors[batch])
+            },
+            to_device(self.actions[batch]),
+            to_device(self.rewards[batch]),
+            {
+                "grid": to_device(self.next_grids[batch], torch.float32), 
+                "vector": to_device(self.next_vectors[batch])
+            },
+            to_device(self.dones[batch]),
+            to_device(weights.astype(np.float32)),
             idxs
         )
 
@@ -150,21 +181,20 @@ class PrioritizedReplayBuffer:
 @dataclass
 class TrainConfig:
     variant: str = "dqn" # dqn, ddqn, per, dueling
-    total_frames: int = 5_000_000 # V46.0: Increased 1M -> 5M for deep convergence
-    num_envs: int = 32 # V12.0 A6000 Turbo: 8 -> 32
-    batch_size: int = 2048 # V12.0 A6000 Turbo: 512 -> 2048
+    total_frames: int = 5_000_000 
+    num_envs: int = 64 # V18.0: Increased to 64 with AsyncVectorEnv
+    batch_size: int = 512 
     lr: float = 1e-4
-    eps_decay: int = 0  # 0 = Use Percentage-based Decay (85% of total)
+    eps_decay: int = 0  
     tau: float = 0.005 
     num_snakes: int = 4
     pool_dir: str = "agent/pool/dqn"
     save_path: str = "agent/checkpoints/dqn_best.pth"
     load_path: Optional[str] = None
     self_play_prob: float = 0.5
-    buffer_size: int = 3_000_000 # V12.0 A6000 Turbo: 1M -> 3M (Utilize 48GB VRAM)
+    buffer_size: int = 200_000 # V17.4: Reduced to 200k for much faster sampling
     single_snake: bool = False
-    # V47.0: Epsilon Warm Start for Phase 2 to prevent catastrophic forgetting
-    eps_start: float = 1.0  # Will be overridden to 0.3 for Phase 2
+    eps_start: float = 1.0  
 
 class DQNVariantTrainer:
     def __init__(self, cfg: TrainConfig):
@@ -193,20 +223,16 @@ class DQNVariantTrainer:
             # Phase 1: High Exploration & Robust Learning
             self.eps_start, self.eps_min = 1.0, 0.1
             if v == "dqn":
-                # Only DQN gets specialized V9.1 tuning
-                self.lr, self.tau, self.batch_size = 1.5e-4, 0.002, 2048 # V16.0: Turbo Batch
+                self.lr, self.tau, self.batch_size = 1.5e-4, 0.002, 512 # V17.3: Fixed batch
             else:
-                # Restore original stable defaults for advanced variants
-                self.lr, self.tau, self.batch_size = 2.0e-4, 0.005, 2048 # V16.0: Turbo Batch
+                self.lr, self.tau, self.batch_size = 2.0e-4, 0.005, 512 # V17.3: Fixed batch
         else:
             # Phase 2: High Stability & Combat Precision
             self.eps_start, self.eps_min = 0.3, 0.05
             if v == "dqn":
-                # Only DQN gets specialized tuning
-                self.lr, self.tau, self.batch_size = 1.0e-4, 0.002, 512
+                self.lr, self.tau, self.batch_size = 1.0e-4, 0.002, 512 # V17.3: Fixed batch
             else:
-                # V11.0: Lower LR (8e-5) to prevent Ph2 collapse in Adv algorithms
-                self.lr, self.tau, self.batch_size = 8.0e-5, 0.005, 512
+                self.lr, self.tau, self.batch_size = 8.0e-5, 0.005, 512 # V17.3: Fixed batch
             
         self.grad_clip = 0.5 
         
@@ -247,9 +273,11 @@ class DQNVariantTrainer:
             env_cfg.self_collision_penalty = -150.0 # V15.0: Crucial fix for long-snake self-collision
             log(f">>> [V9.0 Battle] PHASE 2 | Kill: {env_cfg.kill_reward} | Food: {env_cfg.food_reward} | Stable LR/Tau")
         
-        log(f">>> [V12.0 A6000] Initializing {cfg.num_envs} Parallel Battle Environments...")
-        self.envs = [BattleSnakeEnv(env_cfg) for _ in range(cfg.num_envs)]
-        log(">>> [V12.0 A6000] Environments Ready.")
+        log(f">>> [V18.0 Turbo] Initializing {cfg.num_envs} Parallel Battle Environments...")
+        def env_fn():
+             return make_gymnasium_env(num_snakes=cfg.num_snakes, grid_size=20)
+        self.envs = gym.vector.AsyncVectorEnv([env_fn for _ in range(cfg.num_envs)])
+        log(">>> [V18.0 Turbo] Environments Ready.")
         
         # Select Architecture
         if cfg.variant == "dqn": self.net_cls = DQNNet
@@ -262,6 +290,15 @@ class DQNVariantTrainer:
         
         self.policy_net = self.net_cls(vector_dim=28).to(self.device)
         self.target_net = self.net_cls(vector_dim=28).to(self.device)
+        
+        # V18.0: torch.compile for massive throughput boost
+        if hasattr(torch, 'compile') and os.name != 'nt':
+            try:
+                self.policy_net = torch.compile(self.policy_net, mode='reduce-overhead')
+                self.target_net = torch.compile(self.target_net, mode='reduce-overhead')
+                log(">>> [DQN-Turbo] torch.compile() enabled.")
+            except Exception as e:
+                log(f">>> [DQN-Turbo] torch.compile() failed: {e}")
         
         if cfg.load_path and Path(cfg.load_path).exists():
             log(f">>> Loading weights from {cfg.load_path}...")
@@ -292,12 +329,12 @@ class DQNVariantTrainer:
         # V39.0: Unified Gamma (Dueling was 0.995 -> unstable)
         # All variants now use 0.99 for stable value estimation
         self.gamma = 0.99
-        # V46.0: Increased Update Frequency (Ratio 1:1 -> 2:1 or 3:1)
-        # Higher density of gradient steps to squeeze 300+ performance out of 5M frames.
-        if "per" in cfg.variant:
-            self.updates_per_step = 3
-        else:
-            self.updates_per_step = 2
+        # V17.2: Reduced Update Frequency to 1
+        self.updates_per_step = 1
+        
+        # V17.4: AMP Scaler for mixed precision training
+        self.scaler = GradScaler('cuda')
+        self.use_amp = True
 
     def save_model(self, path):
         # V44.4: Atomic Save to prevent file corruption/locking during self-play loading
@@ -335,45 +372,33 @@ class DQNVariantTrainer:
         return self.loaded_opp_models.get(path)
 
     def train(self):
-        log(f">>> Starting {self.cfg.variant.upper()} Training (V6.7 Omni-Batch)...")
-        obs_batch = [env.reset() for env in self.envs]
+        log(f">>> Starting {self.cfg.variant.upper()} Training (V18.1 Turbo Battle)...")
+        obs_dict, info = self.envs.reset()
         ep_rewards = [0.0] * self.cfg.num_envs
         recent_rewards = []
         last_log_time = time.time()
-        saved_best = False
         
         total_frames = max(1, int(self.cfg.total_frames))
-        # Scale key schedule points with training length.
-        # For 20M runs, linear warmup(10%/30%) is too long. Use sqrt scaling + clamps.
-        scale = math.sqrt(total_frames / 1_000_000)
-        warmup1 = int(max(50_000, min(int(total_frames * 0.10), 100_000 * scale)))
-        warmup2 = int(max(150_000, min(int(total_frames * 0.30), 300_000 * scale)))
-        # Late-stage throttling (reduce update pressure / tau / self-play churn).
-        late_half = int(total_frames * 0.50)
-        late_40 = int(total_frames * 0.40)
-
+        
         while self.steps < total_frames:
             # 1. Group all snakes by model for Omni-Batch Inference
-            # { model_ptr: [(env_idx, snake_idx, obs)] }
             groups: Dict[Optional[nn.Module], List[Tuple[int, int, Dict]]] = {None: []}
             
             self.steps += self.cfg.num_envs
-            # Linear decay over defined duration (V16.0: 10% Floor)
             completion = min(1.0, self.steps / self.decay_steps)
-            eps = self.eps_start - completion * (self.eps_start - self.eps_min)
-            eps = max(self.eps_min, eps)
-            # V16.0: Ensure 10% floor for exploration on long runs
-            eps = max(eps, 0.10)
+            eps = max(0.10, self.eps_start - completion * (self.eps_start - self.eps_min))
             
-            all_actions = [ [None]*self.cfg.num_snakes for _ in range(self.cfg.num_envs) ]
+            all_actions = np.zeros((self.cfg.num_envs, self.cfg.num_snakes), dtype=np.int32)
+            all_full_obs = info["full_obs"]
             
             for e_idx in range(self.cfg.num_envs):
                 # Learner Agent (0)
                 if random.random() < eps:
-                    all_actions[e_idx][0] = random.randint(0, 3)
+                    all_actions[e_idx, 0] = random.randint(0, 3)
                 else:
                     groups[self.policy_net] = groups.get(self.policy_net, [])
-                    groups[self.policy_net].append((e_idx, 0, obs_batch[e_idx][0]))
+                    # obs_dict['grid'][e_idx] is the obs for snake 0
+                    groups[self.policy_net].append((e_idx, 0, {"grid": obs_dict["grid"][e_idx], "vector": obs_dict["vector"][e_idx]}))
                 
                 # Opponent Agents (1+)
                 for s_idx in range(1, self.cfg.num_snakes):
@@ -382,55 +407,51 @@ class DQNVariantTrainer:
                         model = self._get_opp_model(m_path)
                         if model:
                             groups[model] = groups.get(model, [])
-                            groups[model].append((e_idx, s_idx, obs_batch[e_idx][s_idx]))
+                            groups[model].append((e_idx, s_idx, all_full_obs[e_idx][s_idx]))
                         else:
-                            all_actions[e_idx][s_idx] = random.randint(0, 3)
+                            all_actions[e_idx, s_idx] = random.randint(0, 3)
                     else:
-                        all_actions[e_idx][s_idx] = random.randint(0, 3)
+                        all_actions[e_idx, s_idx] = random.randint(0, 3)
 
             # 2. Execute Omni-Batch Inference
             for model, samples in groups.items():
-                if not samples: continue
-                if model is None: continue # Handled by random
-                
+                if not samples or model is None: continue
                 with torch.inference_mode():
-                    grids = np.array([s[2]['grid'] for s in samples])
-                    vecs = np.array([s[2]['vector'] for s in samples])
+                    grids = np.asarray([s[2]['grid'] for s in samples])
+                    vecs = np.asarray([s[2]['vector'] for s in samples])
                     t_g = torch.as_tensor(grids, dtype=torch.float32, device=self.device)
                     t_v = torch.as_tensor(vecs, dtype=torch.float32, device=self.device)
                     q_vals = model(t_g, t_v)
                     acts = q_vals.argmax(dim=1).cpu().numpy()
                     for i, (env_idx, snake_idx, _) in enumerate(samples):
-                        all_actions[env_idx][snake_idx] = int(acts[i])
+                        all_actions[env_idx, snake_idx] = int(acts[i])
             
-            # 3. Env Step
-            next_obs_batch = []
+            # 3. Env Step (Batched)
+            next_obs_dict, rews, terminated, truncated, next_info = self.envs.step(all_actions)
+            
             for e_idx in range(self.cfg.num_envs):
-                n_obs, rews, dones, _ = self.envs[e_idx].step(all_actions[e_idx])
+                # Only push snake 0 (learner) to memory
+                # Note: We need the single-agent observation for memory
+                state = {"grid": obs_dict["grid"][e_idx], "vector": obs_dict["vector"][e_idx]}
+                n_state = {"grid": next_obs_dict["grid"][e_idx], "vector": next_obs_dict["vector"][e_idx]}
                 
-                self.memory.push(obs_batch[e_idx][0], all_actions[e_idx][0], rews[0], n_obs[0], dones[0])
-                ep_rewards[e_idx] += rews[0]
+                self.memory.push(state, all_actions[e_idx, 0], rews[e_idx], n_state, terminated[e_idx])
+                ep_rewards[e_idx] += rews[e_idx]
                 
-                if dones[0]:
+                if terminated[e_idx] or truncated[e_idx]:
                     recent_rewards.append(ep_rewards[e_idx])
                     if len(recent_rewards) > 100: recent_rewards.pop(0)
                     ep_rewards[e_idx] = 0.0
-                    next_obs_batch.append(self.envs[e_idx].reset())
                     
                     # Self-Play Shuffle
-                    sp_prob = self.cfg.self_play_prob
-                    # Gradual reduction of shuffle rate? No, keep it dynamic for Battle.
-                    if self.cfg.num_snakes > 1 and random.random() < sp_prob:
+                    if self.cfg.num_snakes > 1 and random.random() < self.cfg.self_play_prob:
                         opp_idx = random.randint(1, self.cfg.num_snakes-1)
                         m_p = self.sp_manager.sample_model()
                         if m_p:
                             self.opp_model_paths[e_idx][opp_idx] = str(m_p)
-                else:
-                    next_obs_batch.append(n_obs)
             
-            # V14.0 CRITICAL FIX: Update obs_batch for next iteration!
-            # This was MISSING - old observations were reused indefinitely!
-            obs_batch = next_obs_batch
+            obs_dict, info = next_obs_dict, next_info
+
 
             # V16.0: 10% LR annealing floor
             progress = self.steps / total_frames
@@ -501,7 +522,7 @@ class DQNVariantTrainer:
         self.save_model(final_path)
 
     def update(self):
-        # V6.3: Calculate dynamic Beta for PER (Annealing from 0.4 to 1.0)
+        # V6.3: Calculate dynamic Beta for PER
         frac = self.steps / self.cfg.total_frames
         beta_start = getattr(self, "per_beta_start", 0.4)
         current_beta = min(1.0, beta_start + frac * (1.0 - beta_start))
@@ -510,32 +531,35 @@ class DQNVariantTrainer:
             states, actions, rewards, next_states, dones, weights, idxs = self.memory.sample(current_beta)
         else:
             states, actions, rewards, next_states, dones, weights, idxs = self.memory.sample()
-            
-        q_curr = self.policy_net(states['grid'], states['vector']).gather(1, actions.unsqueeze(1)).squeeze(1)
         
-        with torch.no_grad():
-            if self.cfg.variant == "dqn":
-                q_next = self.target_net(next_states['grid'], next_states['vector']).max(1)[0]
+        # V17.4: AMP Mixed Precision Training
+        with autocast('cuda', enabled=self.use_amp):
+            q_curr = self.policy_net(states['grid'], states['vector']).gather(1, actions.unsqueeze(1)).squeeze(1)
+            
+            with torch.no_grad():
+                if self.cfg.variant == "dqn":
+                    q_next = self.target_net(next_states['grid'], next_states['vector']).max(1)[0]
+                else:
+                    best_actions = self.policy_net(next_states['grid'], next_states['vector']).argmax(1)
+                    q_next = self.target_net(next_states['grid'], next_states['vector']).gather(1, best_actions.unsqueeze(1)).squeeze(1)
+                target = rewards + self.gamma * q_next * (1.0 - dones.float())
+                
+            td_errors = q_curr - target
+            if weights is not None:
+                per_sample = nn.SmoothL1Loss(reduction="none")(q_curr, target)
+                loss = (weights * per_sample).mean()
             else:
-                best_actions = self.policy_net(next_states['grid'], next_states['vector']).argmax(1)
-                q_next = self.target_net(next_states['grid'], next_states['vector']).gather(1, best_actions.unsqueeze(1)).squeeze(1)
-            # V14.0 FIX: Use explicit float conversion instead of bitwise NOT
-            # V6.0: Use self.gamma (with N-step extension)
-            target = rewards + self.gamma * q_next * (1.0 - dones.float())
-            
-        td_errors = q_curr - target
-        if weights is not None:
-            # Weighted Huber loss is significantly more stable than weighted MSE under PER.
-            per_sample = nn.SmoothL1Loss(reduction="none")(q_curr, target)
-            loss = (weights * per_sample).mean()
-            self.memory.update_priorities(idxs, td_errors.detach().abs().cpu().numpy())
-        else:
-            loss = nn.SmoothL1Loss()(q_curr, target)
-            
+                loss = nn.SmoothL1Loss()(q_curr, target)
+        
         self.optimizer.zero_grad()
-        loss.backward()
+        self.scaler.scale(loss).backward()
+        self.scaler.unscale_(self.optimizer)
         nn.utils.clip_grad_norm_(self.policy_net.parameters(), self.grad_clip)
-        self.optimizer.step()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        
+        if weights is not None:
+            self.memory.update_priorities(idxs, td_errors.detach().abs().cpu().numpy())
 
 if __name__ == "__main__":
     from argparse import ArgumentParser
