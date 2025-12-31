@@ -26,7 +26,7 @@ class GameWindow(QMainWindow):
         self.resize(1100, 750)
         self.setStyleSheet("background-color: #1e1e2e; color: #cdd6f4; font-family: 'Segoe UI', sans-serif;")
         
-        # 1. Setup Env (V5: 25D)
+        # 1. Setup Env (V11.0: 28D)
         num_snakes = 1 if mode == "single" else 4
         if food_count is None: food_count = max(2, num_snakes)
             
@@ -35,7 +35,6 @@ class GameWindow(QMainWindow):
             num_snakes=num_snakes,
             min_food=food_count,
             max_steps=2000,
-            dash_cooldown_steps=15
         ))
         
         # 2. Main Layout
@@ -95,8 +94,8 @@ class GameWindow(QMainWindow):
         for i in range(num_snakes):
             if not self.is_human[i] and model_path:
                 try:
-                    # V5 baseline is 25D
-                    self.agents[i] = get_agent(algo, 25, str(model_path))
+                    # V11.0: Updated to 28D vector
+                    self.agents[i] = get_agent(algo, 28, str(model_path))
                 except Exception as e:
                     print(f"Error loading agent for P{i}: {e}")
 
@@ -106,9 +105,12 @@ class GameWindow(QMainWindow):
         self.timer.start(int(1000/fps))
         self.obs_list = self.env.reset()
         self.human_target: Optional[Direction | str] = None
+        self.is_resetting = False # 新增：重置状态锁
         
     def reset_game(self):
         self.obs_list = self.env.reset()
+        self.is_resetting = False
+        self.timer.start(int(1000/self.fps)) # 重启计时器
         self.status_label.setText("Restarted")
 
     def keyPressEvent(self, event):
@@ -151,13 +153,37 @@ class GameWindow(QMainWindow):
         for i, idx in enumerate(ranked_indices):
             status = "DEAD" if self.env.dead[idx] else f"LEN: {len(self.env.snakes[idx])}"
             self.rank_labels[idx].setText(f"P{idx}: {scores[idx]} ({status})")
-            # Update Cooldown Bar (V5)
-            cd_pct = 100 - (self.env.dash_cooldowns[idx] / self.env.config.dash_cooldown_steps * 100)
-            self.cooldown_bars[idx].setValue(int(cd_pct))
+            # Update Dashboard Bar (V6: Duration or Cooldown)
+            if self.env.dash_durations[idx] > 0:
+                # 冲刺中：显示金色/亮色表示持续时间
+                val = int(self.env.dash_durations[idx] / self.env.config.dash_duration_steps * 100)
+                self.cooldown_bars[idx].setValue(val)
+                self.cooldown_bars[idx].setStyleSheet(f"""
+                    QProgressBar {{ background-color: #1e1e2e; border-radius: 4px; }}
+                    QProgressBar::chunk {{ background-color: #f9e2af; border-radius: 4px; }}
+                """)
+            else:
+                # 非冲刺：根据长度显示是否满足冲刺条件
+                can_dash = not self.env.dead[idx] and len(self.env.snakes[idx]) > 3
+                val = 100 if can_dash else 20
+                self.cooldown_bars[idx].setValue(val)
+                # 就绪显示蓝色，长度不足显示深灰
+                chunk_color = "#89b4fa" if can_dash else "#45475a"
+                self.cooldown_bars[idx].setStyleSheet(f"""
+                    QProgressBar {{ background-color: #1e1e2e; border-radius: 4px; }}
+                    QProgressBar::chunk {{ background-color: {chunk_color}; border-radius: 4px; }}
+                """)
             
-        if all(dones):
-            self.status_label.setText("Game Over!")
-            QTimer.singleShot(2000, self.reset_game)
+        if all(dones) and not self.is_resetting:
+            self.is_resetting = True
+            self.timer.stop() # 停止计时器，防止多次进入此逻辑
+            # 找到最长的蛇（或得分最高，根据需求是结束前最长的蛇）
+            lengths = [len(s) if s else 0 for s in self.env.snakes]
+            winner_idx = np.argmax(lengths)
+            winner_msg = f"Winner: P{winner_idx} (Len: {lengths[winner_idx]})"
+            self.status_label.setText(f"Game Over! {winner_msg}")
+            print(f"Game Over! Final Scores: {scores}, {winner_msg}")
+            QTimer.singleShot(5000, self.reset_game)
 
 if __name__ == "__main__":
     import argparse

@@ -29,9 +29,10 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--variant", type=str, default="dqn", choices=["dqn", "ddqn", "per", "dueling"])
-    # V47.0: Default to 5,000,000 frames per phase for better convergence.
+    # User-Defined Training Steps (V16.0: 5M/3M to saturate 1024-width net)
     parser.add_argument("--steps1", type=int, default=5_000_000, help="Phase 1 frames")
-    parser.add_argument("--steps2", type=int, default=5_000_000, help="Phase 2 frames")
+    parser.add_argument("--steps2", type=int, default=3_000_000, help="Phase 2 frames")
+    parser.add_argument("--force", action="store_true", help="Force restart from Phase 1")
     args = parser.parse_args()
 
     v = args.variant.lower()
@@ -44,11 +45,16 @@ def main():
     print(f"=== Snake AI Curriculum Training [{v.upper()}] ===")
     
     # Phase 1: Pre-train on Single Snake
-    cmd1 = f"train_dqn_variants.py --variant {v} --single --steps {args.steps1} --save {p1_model}"
-    run_step(cmd1, f"1. Pre-training (Single Snake) -> {p1_model}")
+    p1_final = p1_model.with_suffix(".final.pth")
+    if p1_final.exists() and not args.force:
+        print(f"\n>>> [Curriculum] Phase 1 already completed ({p1_final} found). Skipping...")
+    else:
+        cmd1 = f"train_dqn_variants.py --variant {v} --single --steps {args.steps1} --save {p1_model}"
+        run_step(cmd1, f"1. Pre-training (Single Snake) -> {p1_model}")
     
     # Phase 2: Fine-tune on Multi Snake (Battle)
-    cmd2 = f"train_dqn_variants.py --variant {v} --load {p1_model} --steps {args.steps2} --save {p2_model}"
+    p1_final = p1_model.with_suffix(".final.pth")
+    cmd2 = f"train_dqn_variants.py --variant {v} --load {p1_final} --steps {args.steps2} --save {p2_model}"
     run_step(cmd2, f"2. Fine-tuning (Battle Mode) -> {p2_model}")
     
     print("\n=== Curriculum Completed ===")

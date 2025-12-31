@@ -25,8 +25,8 @@ class Action(IntEnum):
 
 class ObservationDict(TypedDict):
     """V3+ Hybrid Observation Format"""
-    grid: np.ndarray    # (3, 7, 7) Local view
-    vector: np.ndarray  # (25,) Global features
+    grid: np.ndarray    # (5, H, W) Full view
+    vector: np.ndarray  # (28,) Global features
 
 @dataclass
 class BattleSnakeConfig:
@@ -37,7 +37,8 @@ class BattleSnakeConfig:
     max_steps: int = 1000
     
     # Mechanics
-    dash_cooldown_steps: int = 30 # New in V5.0
+    # 延长冲刺持续时间
+    dash_duration_steps: int = 15
     
     # Rewards
     food_reward: float = 20.0
@@ -46,7 +47,9 @@ class BattleSnakeConfig:
     closer_reward: float = 0.3
     farther_penalty: float = -0.2
     step_penalty: float = -0.05
-    self_collision_penalty: float = -20.0  # V43.0: Reduced from -25 (Prevent timidity)
+    self_collision_penalty: float = -15.0  # V43.0: Reduced from -25 (Prevent timidity)
+    win_reward: float = 500.0   # V11.0: Huge jackpot for winners
+    loss_penalty: float = -200.0 # V11.0: Severe penalty for losing
 
 class BattleSnakeEnv:
     """Multi-Agent Snake Environment with Multiple Foods."""
@@ -71,7 +74,7 @@ class BattleSnakeEnv:
         self.directions: List[Direction] = []
         self.dead: List[bool] = []
         self.scores: List[int] = []
-        self.dash_cooldowns: List[int] = [] # New: Track cooldown
+        self.dash_durations: List[int] = [] # 新增：冲刺持续步数
         self.foods: List[Tuple[int, int]] = []
         self.steps = 0
         
@@ -81,7 +84,7 @@ class BattleSnakeEnv:
         
     @property
     def obs_dim(self) -> int:
-        return 25 # V5.0: Added cooldown (24 -> 25)
+        return 28 # V11.0: +Time awareness (steps_left)
 
     @property
     def action_dim(self) -> int:
@@ -92,7 +95,7 @@ class BattleSnakeEnv:
         self.directions = []
         self.dead = []
         self.scores = []
-        self.dash_cooldowns = []
+        self.dash_durations = []
         self.steps = 0
         self.foods = []
         
@@ -113,7 +116,7 @@ class BattleSnakeEnv:
             self.snakes.append([(x, y), (x - dx, y - dy), (x - 2*dx, y - 2*dy)])
             self.dead.append(False)
             self.scores.append(0)
-            self.dash_cooldowns.append(0)
+            self.dash_durations.append(0)
             
         self._spawn_food()
         return self._get_observations()
@@ -130,18 +133,20 @@ class BattleSnakeEnv:
                 rewards[i] = 0.0
                 continue
             
-            # Update Cooldown
-            if self.dash_cooldowns[i] > 0:
-                self.dash_cooldowns[i] -= 1
+            # Update Duration
+            if self.dash_durations[i] > 0:
+                self.dash_durations[i] -= 1
+                move_repeats[i] = 2 # 处于冲刺状态，移动两次
                 
             if actions[i] == Action.DASH:
-                if self.dash_cooldowns[i] == 0 and len(self.snakes[i]) > 3:
+                # 仅在非冲刺状态且长度大于 3 (初始长度) 时触发
+                if self.dash_durations[i] == 0 and len(self.snakes[i]) > 3:
                     move_repeats[i] = 2
-                    self.snakes[i].pop() # Tactical cost
-                    self.dash_cooldowns[i] = self.config.dash_cooldown_steps # Trigger cooldown
+                    self.snakes[i].pop() # 消耗一个长度
+                    self.dash_durations[i] = self.config.dash_duration_steps - 1
                     rewards[i] -= 0.1
                 else:
-                    # Cooldown active or length too short -> FALLBACK
+                    # 无法触发 DASH 时，强制转为 STRAIGHT
                     actions[i] = Action.STRAIGHT
 
         # Run moves
@@ -218,8 +223,22 @@ class BattleSnakeEnv:
                         self.snakes[i].pop()
 
         if len(self.foods) < self.config.min_food: self._spawn_food()
-        if self.steps >= self.config.max_steps:
+        
+        # 修改游戏结束规则：全灭或达到最大步数
+        game_over = all(self.dead) or self.steps >= self.config.max_steps
+        if game_over:
             for i in range(self.config.num_snakes): dones[i] = True
+            
+            # V10.0: Inject Terminal Tournament Rewards
+            if self.config.num_snakes > 1:
+                lengths = [len(s) for s in self.snakes]
+                max_len = max(lengths) if lengths else 0
+                if max_len > 0:
+                    for i in range(self.config.num_snakes):
+                        if lengths[i] == max_len:
+                            rewards[i] += self.config.win_reward
+                        else:
+                            rewards[i] += self.config.loss_penalty
         
         return self._get_observations(), rewards, dones, {"scores": self.scores}
 
@@ -256,7 +275,7 @@ class BattleSnakeEnv:
         if self.dead[agent_idx]:
              return {
                  "vector": np.zeros(self.obs_dim, dtype=np.float32),
-                 "grid": np.zeros((3, 7, 7), dtype=np.float32)
+                 "grid": np.zeros((5, self.height, self.width), dtype=np.float32)
              }
              
         head = self.snakes[agent_idx][0]
@@ -312,8 +331,24 @@ class BattleSnakeEnv:
         tail_rel = [(tail[0] - head[0]) / self.width, (tail[1] - head[1]) / self.height]
         len_pct = [len(self.snakes[agent_idx]) / (self.width * self.height)]
         
-        # New in V5.0: Cooldown Obs (1-dim)
-        cd_val = [self.dash_cooldowns[agent_idx] / self.config.dash_cooldown_steps]
+        # Updated Vector features: Remaining Dash steps vs Can Dash
+        can_dash_val = [1.0 if (self.dash_durations[agent_idx] == 0 and len(self.snakes[agent_idx]) > 3) else 0.0]
+        
+        # V10.0: Relative Standing Features (Crucial for rule awareness)
+        is_leader = 0.0
+        rel_len = 1.0
+        if self.config.num_snakes > 1:
+            lengths = [len(s) for s in self.snakes]
+            max_other = max([lengths[j] for j in range(self.config.num_snakes) if j != agent_idx] + [0])
+            my_len = lengths[agent_idx]
+            is_leader = 1.0 if my_len >= max_other and my_len > 0 else 0.0
+            if max_other > 0:
+                rel_len = my_len / max_other
+            else:
+                rel_len = 2.0 # Way ahead
+        
+        # V11.0: Time Management Feature (Crucial for tournament strategy)
+        steps_left = [(self.config.max_steps - self.steps) / self.config.max_steps]
             
         vector = np.concatenate([
             [food_up, food_down, food_left, food_right],
@@ -322,26 +357,45 @@ class BattleSnakeEnv:
             enemy_vec,
             tail_rel,
             len_pct,
-            cd_val
+            can_dash_val,
+            [is_leader, rel_len],
+            steps_left
         ]).astype(np.float32)
+        # V11.0: Maintain full 28-dimensional vector
+        if len(vector) > 28: vector = vector[:28]
+        elif len(vector) < 28: vector = np.pad(vector, (0, 28 - len(vector)))
 
-        # 2. Grid (Local 7x7)
-        grid = np.zeros((3, 7, 7), dtype=np.float32)
-        view_r = 3
-        for dy in range(-view_r, view_r + 1):
-            for dx in range(-view_r, view_r + 1):
-                x, y, gx, gy = head[0] + dx, head[1] + dy, dx + view_r, dy + view_r
-                if not (0 <= x < self.width and 0 <= y < self.height):
-                    grid[0, gy, gx] = 1.0
-                else:
-                    pos = (x, y)
-                    if pos in occupied_all:
-                        grid[0, gy, gx] = 1.0
-                        head_owner = head_map.get(pos)
-                        if head_owner is not None and head_owner != agent_idx:
-                            grid[2, gy, gx] = 1.0
-                    if pos in food_set:
-                        grid[1, gy, gx] = 1.0
+        # 2. Grid (Full Map Encoding - 5 channels)
+        # Channel 0: Food
+        # Channel 1: Self Body
+        # Channel 2: Enemy Heads
+        # Channel 3: Enemy Bodies
+        # Channel 4: Obstacles (Walls are implicit by grid boundaries, here we mark them as 1 if outside)
+        grid = np.zeros((5, self.height, self.width), dtype=np.float32)
+        
+        # Food
+        for fx, fy in self.foods:
+            grid[0, fy, fx] = 1.0
+            
+        # Snakes
+        for i in range(self.config.num_snakes):
+            if self.dead[i] or not self.snakes[i]: continue
+            
+            if i == agent_idx:
+                # Self Body
+                for bx, by in self.snakes[i]:
+                    grid[1, by, bx] = 1.0
+            else:
+                # Enemy Head
+                hx, hy = self.snakes[i][0]
+                grid[2, hy, hx] = 1.0
+                # Enemy Body
+                for bx, by in self.snakes[i][1:]:
+                    grid[3, by, bx] = 1.0
+        
+        # Channel 4 could be used for static obstacles if any, or specialized features. 
+        # Here we leave it or fill with boundaries if needed (though CNN handles coords fine).
+        
         return {"vector": vector, "grid": grid}
 
     @staticmethod

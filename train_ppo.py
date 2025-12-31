@@ -44,25 +44,27 @@ def make_env(num_snakes: int, grid_size: int, seed: Optional[int] = None):
             height=grid_size,
             num_snakes=num_snakes,
             min_food=max(2, num_snakes // 2),
-            max_steps=500,
-            dash_cooldown_steps=15,
+            max_steps=1000, # V7.0: Longer games for battle
         )
         if num_snakes == 1:
-            env_cfg.closer_reward = 0.20
-            env_cfg.farther_penalty = -0.15
-            env_cfg.food_reward = 100.0 # V46.0: Aligned with DQN aggressive plan
-            env_cfg.death_penalty = -10.0 # V46.0: Reduced fear
-            env_cfg.step_penalty = -0.01
-            env_cfg.self_collision_penalty = -10.0 # V46.0: Reduced fear
-        else:
-            # V47.0: Kill-Focused Combat + Anti-Self-Collision (Fix late-game wall/self crashes)
-            env_cfg.closer_reward = 0.10  # V47.0: Smoother transition
-            env_cfg.farther_penalty = -0.08
+            # Phase 1: High focus on navigation (V46.0: Aggressive Reward Tuning)
+            env_cfg.closer_reward = 0.25
+            env_cfg.farther_penalty = -0.20
+            env_cfg.food_reward = 120.0
+            env_cfg.death_penalty = -10.0
             env_cfg.step_penalty = -0.02
-            env_cfg.kill_reward = 80.0    # V47.0: Aligned with user preference for kills
-            env_cfg.death_penalty = -35.0 # V47.0: Higher penalty to prevent reckless play
-            env_cfg.food_reward = 50.0    # V47.0: Balanced with kill focus
-            env_cfg.self_collision_penalty = -50.0  # V47.0: CRITICAL - High penalty to fix self-crash bug
+            env_cfg.self_collision_penalty = -100.0 # V17.0: Absolute body awareness
+        else:
+            # V9.2: Smooth Transition & High Survival
+            env_cfg.closer_reward = 0.15
+            env_cfg.farther_penalty = -0.10
+            env_cfg.step_penalty = -0.05
+            env_cfg.kill_reward = 250.0 # V13.0: Aggressive killing incentive
+            env_cfg.food_reward = 80.0
+            env_cfg.win_reward = 800.0 # V13.0: Professional leader mindset
+            env_cfg.loss_penalty = -200.0
+            env_cfg.death_penalty = -30.0 # V9.2: Increased to discourage reckless play
+            env_cfg.self_collision_penalty = -50.0 
         return BattleSnakeEnv(env_cfg, seed=seed)
 
     return thunk
@@ -96,20 +98,25 @@ class VectorizedEnv:
             return cached[1]
 
         try:
-            model = ActorCritic(vector_dim=25).to(self.device).eval()
+            # V11.0: Dynamic Dimension Check to prevent crash on old models
+            dummy_model = ActorCritic(vector_dim=28, grid_shape=(5, 20, 20), action_dim=self.envs[0].action_dim).to(self.device).eval()
             state_dict = torch.load(path, map_location=self.device, weights_only=True)
-            model.load_state_dict(state_dict)
-            for p in model.parameters():
+            
+            # Check for dimension mismatch before loading
+            if "actor.0.weight" in state_dict:
+                ckpt_dim = state_dict["actor.0.weight"].shape[1]
+                model_dim = dummy_model.actor[0].weight.shape[1]
+                if ckpt_dim != model_dim:
+                    return None # Silently skip incompatible models
+            
+            dummy_model.load_state_dict(state_dict)
+            for p in dummy_model.parameters():
                 p.requires_grad = False
-            self._model_cache[path] = (mtime, model)
-            self._model_cache[path] = (mtime, model)
-            # V44.5: PPO runs 24 envs x 3 opponents = 72 models needed.
-            # Cache of 8 is severely insufficient -> Thrashing.
+            self._model_cache[path] = (mtime, dummy_model)
             if len(self._model_cache) > 80:
                 del self._model_cache[next(iter(self._model_cache))]
-            return model
-        except Exception as e:
-            log(f"--- [PPO] Opponent load failed: {Path(path).name}: {e}. Using Random.")
+            return dummy_model
+        except Exception:
             return None
 
     def step(self, learning_actions, current_obs):
@@ -196,7 +203,7 @@ def train_ppo(
     Path("agent/checkpoints").mkdir(parents=True, exist_ok=True)
     sp_manager = SelfPlayManager(pool_dir)
 
-    model = ActorCritic(vector_dim=25).to(device)
+    model = ActorCritic(vector_dim=28, grid_shape=(5, 20, 20), action_dim=4).to(device)
     if load_path:
         p = Path(load_path)
         if not p.exists():
@@ -210,31 +217,41 @@ def train_ppo(
 
     optimizer = optim.Adam(model.parameters(), lr=lr, eps=1e-5)
 
-    # Rollout / PPO hyperparams
-    num_steps = 256 if num_snakes > 1 else 128
-    update_epochs = 4
+    # Rollout / PPO hyperparams (User Adjusted)
+    # V12.0 A6000 Turbo: Increased num_steps for longer GPU residency
+    # V13.5: Reduced num_steps (512->256) for Phase 1 to double update frequency
+    # Phase 2 remains 1024 for high-throughput GPU saturation
+    num_steps = 1024 if num_snakes > 1 else 256 
+    # V17.0: Deep convergence for 1024-width net. Increased 4 -> 10
+    update_epochs = 10
     gamma = 0.99
-    gae_lambda = 0.95
-    clip_coef = 0.20 # V46.0: Stable exploration
+    # V9.3: Adaptive Hyperparams for Phase 1 vs Phase 2
+    gae_lambda = 0.95 if num_snakes == 1 else 0.92 
+    clip_coef = 0.20
     vf_coef = 0.5
-    ent_start = 0.08 if num_snakes > 1 else 0.10 # V46.0: Stronger exploration
-    ent_min = 0.015 # V46.0: Prevent policy collapse
-    max_grad_norm = 0.5
+    ent_start = 0.20 if num_snakes == 1 else 0.12 # V11.0: More exploration for 20x20
+    ent_min = 0.01
+    lr_init = lr
+    # V17.0: KL Relaxed (0.08) for Battle to allow radical strategy shifts
+    target_kl = 0.02 if num_snakes == 1 else 0.08 
 
     batch_size = num_envs * num_steps
-    minibatch_size = 1024 if num_snakes > 1 else 512
+    # V12.0 A6000 Turbo: Massive minibatches to saturate thousands of CUDA cores
+    minibatch_size = 8192 if num_snakes > 1 else 4096 
     if minibatch_size > batch_size:
         minibatch_size = batch_size
 
+    log(f">>> [PPO] Initializing {num_envs} Parallel Environments...")
     envs = VectorizedEnv([make_env(num_snakes, 20, seed + i) for i in range(num_envs)], device)
+    log(f">>> [PPO] Environments Ready. Resetting...")
     obs_list = envs.reset()
     # Initialize opponents for each env
     for i in range(num_envs):
         _assign_self_play_opponents(envs, i, num_snakes, sp_manager, self_play_prob)
 
-    # Pre-allocate rollout buffers (on device)
-    obs_grid = torch.zeros((num_steps, num_envs, 3, 7, 7), device=device)
-    obs_vec = torch.zeros((num_steps, num_envs, 25), device=device)
+    # Pre-allocate rollout buffers (on device) - Updated for 5x20x20 28D
+    obs_grid = torch.zeros((num_steps, num_envs, 5, 20, 20), device=device)
+    obs_vec = torch.zeros((num_steps, num_envs, 28), device=device)
     actions = torch.zeros((num_steps, num_envs), dtype=torch.long, device=device)
     logprobs = torch.zeros((num_steps, num_envs), device=device)
     rewards = torch.zeros((num_steps, num_envs), device=device)
@@ -244,7 +261,6 @@ def train_ppo(
     ep_returns: List[float] = []
     running_return = np.zeros(num_envs, dtype=np.float32)
 
-    best_avg = -1e9
     # For long runs (e.g., 20M), fixed 200k snapshots can create too many files.
     # Scale intervals with total timesteps and keep disk usage bounded.
     save_every = max(200_000, int(total_timesteps * 0.05))
@@ -254,16 +270,21 @@ def train_ppo(
 
     global_step = 0
     last_done = torch.zeros(num_envs, device=device)
+    update = 0 # Track updates for LR/entropy decay
 
+    log(f">>> [PPO] Setup finished. Starting training loop (update_steps={num_envs * num_steps})...")
     while global_step < total_timesteps:
-        progress = min(1.0, global_step / max(1, total_timesteps))
-        # LR schedule (linear decay to 40%)
-        lr_now = lr * max(0.40, 1.0 - progress)
+        update += 1
+        # Anneal learning rate and entropy (V14.0: 10% / 5% Floor to prevent brain-death)
+        frac = 1.0 - (update - 1) / (total_timesteps / (num_envs * num_steps))
+        frac = max(0.0, frac)
+        lr_now = lr_init * (0.1 + 0.9 * frac) 
         for pg in optimizer.param_groups:
             pg["lr"] = lr_now
-        # Entropy schedule (hold exploration earlier, tighten later)
-        # V43.0: Linear decay (power 1.0) instead of 1.5 to maintain exploration longer in mid-game
-        ent_coef = max(ent_min, ent_start * ((1.0 - progress) ** 1.0))
+        
+        # V17.0: 2% Entropy floor buffer to maintain strategic unpredictability
+        ent_coef = ent_min + (ent_start - ent_min) * (0.10 + 0.90 * frac)
+        ent_coef = max(ent_coef, 0.02)
 
         model.eval()
         for step in range(num_steps):
@@ -320,8 +341,8 @@ def train_ppo(
         returns = advantages + values
 
         # Flatten
-        b_obs_grid = obs_grid.reshape((-1, 3, 7, 7))
-        b_obs_vec = obs_vec.reshape((-1, 25))
+        b_obs_grid = obs_grid.reshape((-1, 5, 20, 20))
+        b_obs_vec = obs_vec.reshape((-1, 28))
         b_actions = actions.reshape((-1,))
         b_logprobs = logprobs.reshape((-1,))
         b_advantages = advantages.reshape((-1,))
@@ -356,50 +377,30 @@ def train_ppo(
                 loss = pg_loss + vf_coef * v_loss - ent_coef * ent_loss
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                nn.utils.clip_grad_norm_(model.parameters(), 0.3) # V9: Tighter grad clip
                 optimizer.step()
 
-        # Logging / checkpoint
-        if len(ep_returns) >= 10:
-            avg100 = float(np.mean(ep_returns[-100:]))
-        else:
-            avg100 = float(np.mean(ep_returns)) if ep_returns else 0.0
+                with torch.no_grad():
+                    approx_kl = ((ratio - 1) - logratio).mean()
+                    if approx_kl > target_kl:
+                        break # KL too high, skip further epochs for this update
+        
+        if update == 1:
+            log(f">>> [PPO] First update cycle finished. Thruput test passed.")
 
-        if global_step % (num_envs * 2048) == 0:
-            log(
-                f">>> [PPO] {global_step}/{total_timesteps} ({progress*100:.1f}%) "
-                f"avg_ep={avg100:.2f} lr={lr_now:.2e} ent={ent_coef:.4f}"
-            )
+        # Logging (V13.2: Early high-frequency feedback to eliminate "stuck" illusion)
+        if update <= 10 or update % 2 == 0:
+            avg_ret = np.mean(ep_returns[-50:]) if ep_returns else 0
+            log(f">>> [PPO] Update {update} | {global_step}/{total_timesteps} ({global_step/total_timesteps:.1%}) avg_ep={avg_ret:.2f} lr={lr_now:.2e}")
+            # No "best_avg" saving logic here as per instruction.
 
-        # Save best
-        if avg100 > best_avg and len(ep_returns) >= 20:
-            best_avg = avg100
-            cpu_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-            _atomic_torch_save(cpu_state, Path(checkpoint_path))
-            log(f">>> [PPO] New best avg_ep={best_avg:.2f} saved: {checkpoint_path}")
-
-        # Periodic snapshot + pool update
-        if global_step >= next_save:
-            cpu_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-            snap = Path(checkpoint_path).with_suffix(f".step_{global_step}.pth")
-            _atomic_torch_save(cpu_state, snap)
-
-            # Prune old step snapshots (keep last 5) to avoid disk blow-up.
-            try:
-                parent = Path(checkpoint_path).parent
-                stem = Path(checkpoint_path).stem
-                snaps = sorted(parent.glob(f"{stem}.step_*.pth"), key=lambda p: p.stat().st_mtime)
-                for old in snaps[:-5]:
-                    old.unlink(missing_ok=True)
-            except Exception as e:
-                log(f"--- [PPO] Snapshot prune failed: {e}")
-
-            next_save += save_every
+        # No periodic snapshots as per user request (Only final saved)
 
         if global_step >= next_pool:
             cpu_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            # V9.0: Keep quiet, only pool update if we have meaningful progress
             sp_manager.add_model(cpu_state, name=f"ppo_step_{global_step}")
-            next_pool += pool_every
+            next_pool += 500_000 # Relaxed to 500k to reduce noise/disk usage
 
     # Final save (doesn't override best filename unless user points it there)
     cpu_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
@@ -418,12 +419,11 @@ if __name__ == "__main__":
     args = p.parse_args()
 
     num_snakes = 1 if args.single else 4
-    num_envs = 8 if args.single else 24
+    # V12.0 A6000 Turbo: Doubled parallel envs
+    num_envs = 64 
     ckpt = "agent/checkpoints/ppo_best.pth" if args.single else "agent/checkpoints/ppo_battle_best.pth"
-    base_lr = 2.5e-4
-    # Battle fine-tuning tends to be more unstable; use a smaller default LR for long runs.
-    if num_snakes > 1:
-        base_lr *= 0.8  # V43.0: Increased from 0.2 to 0.8 to prevent stagnation in short runs
+    # V13.0: Higher LR for Battle Phase due to larger network capacity
+    base_lr = 2.0e-4 if args.single else 1.5e-4 
 
     train_ppo(
         num_envs=num_envs,

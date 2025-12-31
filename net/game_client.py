@@ -236,7 +236,7 @@ class MainWindow(QMainWindow):
             algo = self.algo_combo.currentText().lower()
             if not algo.endswith("agent"): algo += "agent"
             try:
-                self.agent = get_agent(algo, 25, str(path))
+                self.agent = get_agent(algo, 28, str(path))
                 self.ai_timer.start(50)
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Load failed: {e}"); return

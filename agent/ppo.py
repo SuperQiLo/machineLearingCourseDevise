@@ -13,35 +13,39 @@ from typing import Optional, Tuple, Dict
 
 class ActorCritic(nn.Module):
     """Hybrid CNN-MLP Architecture for PPO (V6.1 FIX)"""
-    def __init__(self, vector_dim: int = 25, grid_shape: tuple = (3, 7, 7), action_dim: int = 4):
+    def __init__(self, vector_dim: int = 28, grid_shape: tuple = (5, 20, 20), action_dim: int = 4):
         super().__init__()
         
-        # 1. Feature Extractor (CNN for Grid)
+        # 1. Feature Extractor (CNN for Global Grid)
         self.conv = nn.Sequential(
-            nn.Conv2d(grid_shape[0], 16, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(grid_shape[0], 32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=2, stride=1),
+            nn.MaxPool2d(2), # 20x20 -> 10x10
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2), # 10x10 -> 5x5
+            nn.Conv2d(64, 128, kernel_size=2, stride=1), # 5x5 -> 4x4
             nn.ReLU(),
             nn.Flatten()
         )
-        # 32 * 6 * 6 = 1152
-        cnn_out_dim = 32 * 6 * 6
+        # 128 * 4 * 4 = 2048
+        cnn_out_dim = 2048
         
-        # 2. Actor Head
+        # 2. Actor Head (V13.0: Widened to 1024)
         self.actor = nn.Sequential(
-            nn.Linear(vector_dim + cnn_out_dim, 512),
+            nn.Linear(vector_dim + cnn_out_dim, 1024),
             nn.Tanh(),
-            nn.Linear(512, 256),
+            nn.Linear(1024, 256),
             nn.Tanh(),
             nn.Linear(256, action_dim)
             # Softmax removed for Logits-based sampling (V9.2)
         )
         
-        # 3. Critic Head
+        # 3. Critic Head (V13.0: Widened to 1024)
         self.critic = nn.Sequential(
-            nn.Linear(vector_dim + cnn_out_dim, 512),
+            nn.Linear(vector_dim + cnn_out_dim, 1024),
             nn.Tanh(),
-            nn.Linear(512, 256),
+            nn.Linear(1024, 256),
             nn.Tanh(),
             nn.Linear(256, 1)
         )
@@ -78,7 +82,7 @@ class ActorCritic(nn.Module):
 
 class PPOAgent:
     """Helper class for PPO inference in V4.3 (V6.1 FIX)"""
-    def __init__(self, input_dim=25, model_path: Optional[str] = None):
+    def __init__(self, input_dim=28, model_path: Optional[str] = None):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.net = ActorCritic(vector_dim=input_dim).to(self.device)
         self.net.eval()

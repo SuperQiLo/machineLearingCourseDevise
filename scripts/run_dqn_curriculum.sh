@@ -24,13 +24,14 @@ echo ">>> Log file: $LOG_FILE"
 PY_CMD="python"
 if ! command -v $PY_CMD &> /dev/null; then PY_CMD="python3"; fi
 
-# Optional: override curriculum steps
-# Example: ./scripts/run_dqn_curriculum.sh ddqn 5000000 8000000
-if [[ -n "$STEPS1" && -n "$STEPS2" ]]; then
-	nohup $PY_CMD -u "$PROJECT_ROOT/train_dqn_curriculum.py" --variant "${VARIANT}" --steps1 "$STEPS1" --steps2 "$STEPS2" > "$LOG_FILE" 2>&1 &
-else
-	nohup $PY_CMD -u "$PROJECT_ROOT/train_dqn_curriculum.py" --variant "${VARIANT}" > "$LOG_FILE" 2>&1 &
+# 3. Process variant argument then pass remaining to python
+# If the first argument is a variant name (e.g. 'ddqn'), we use it and shift.
+if [[ "$VARIANT" == "dqn" || "$VARIANT" == "ddqn" || "$VARIANT" == "per" || "$VARIANT" == "dueling" ]]; then
+    # If the user provided the variant as the first argument, we shift it so "$@" remains only extra flags
+    shift
 fi
+
+nohup $PY_CMD -u "$PROJECT_ROOT/train_dqn_curriculum.py" --variant "${VARIANT}" "$@" > "$LOG_FILE" 2>&1 &
 
 # 4. Save PID
 NEW_PID=$!

@@ -12,26 +12,30 @@ from typing import Optional, Dict
 
 class DQNNet(nn.Module):
     """Hybrid CNN-MLP Architecture for Snake AI"""
-    def __init__(self, vector_dim: int = 25, grid_shape: tuple = (3, 7, 7), action_dim: int = 4):
+    def __init__(self, vector_dim: int = 28, grid_shape: tuple = (5, 20, 20), action_dim: int = 4):
         super().__init__()
         
-        # 1. CNN for Local Grid (7x7x3)
+        # 1. CNN for Full Grid (20x20x5)
         self.conv = nn.Sequential(
             nn.Conv2d(grid_shape[0], 16, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=2, stride=1),
+            nn.MaxPool2d(2), # 20x20 -> 10x10
+            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2), # 10x10 -> 5x5
+            nn.Conv2d(32, 128, kernel_size=2, stride=1), # 5x5 -> 4x4
             nn.ReLU(),
             nn.Flatten()
         )
         
-        # Calculate CNN output size (32 * 6 * 6 = 1152)
-        cnn_out_dim = 32 * 6 * 6
+        # Calculate CNN output size (128 * 4 * 4 = 2048)
+        cnn_out_dim = 2048
         
-        # 2. MLP for Global Features
+        # 2. MLP for Combined Features (V15.0: Widened to 1024)
         self.fc = nn.Sequential(
-            nn.Linear(vector_dim + cnn_out_dim, 512),
+            nn.Linear(vector_dim + cnn_out_dim, 1024),
             nn.ReLU(),
-            nn.Linear(512, 256),
+            nn.Linear(1024, 256),
             nn.ReLU(),
             nn.Linear(256, action_dim)
         )
@@ -51,7 +55,7 @@ class DQNNet(nn.Module):
 
 class DQNAgent:
     """Helper class for DQN inference in V3"""
-    def __init__(self, input_dim: int = 25, model_path: Optional[str] = None):
+    def __init__(self, input_dim: int = 28, model_path: Optional[str] = None):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.net = DQNNet(vector_dim=input_dim).to(self.device)
         self.net.eval()

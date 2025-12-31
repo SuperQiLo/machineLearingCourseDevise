@@ -19,7 +19,7 @@ echo ">>> Log file: $LOG_FILE"
 PY_CMD="python"
 if ! command -v $PY_CMD &> /dev/null; then PY_CMD="python3"; fi
 
-nohup $PY_CMD -u "$PROJECT_ROOT/train_ppo_curriculum.py" > "$LOG_FILE" 2>&1 &
+nohup $PY_CMD -u "$PROJECT_ROOT/train_ppo_curriculum.py" "$@" > "$LOG_FILE" 2>&1 &
 
 # 4. Save PID
 NEW_PID=$!
