@@ -44,6 +44,27 @@ bash scripts/run_ppo_curriculum.sh
 bash scripts/stop_training.sh
 ```
 
+### 2.1 常用性能/训练旋钮（建议先从这些开始）
+
+```bash
+# 限制 CPU 线程：减少 AsyncVectorEnv 多进程互抢
+export DQN_CPU_THREADS=1
+
+# 降低对手刷新频率：减少 I/O/加载抖动
+export RIVAL_UPDATE_INTERVAL=100000
+
+# 自博弈池大小：更大更稳，但别过大
+export SELF_PLAY_POOL_SIZE=30
+```
+
+Battle 额外推荐（DQN/DDQN）：
+
+```bash
+python train_dqn_variants.py --variant dqn --steps 3000000 \
+  --eps-start 0.5 --eps-min 0.05 \
+  --sp-prob-start 0.7 --sp-prob-end 0.4 --sp-prob-frac 0.3
+```
+
 ### 3. 本地演示
 ```bash
 # 观看 PPO 冠军模型博弈

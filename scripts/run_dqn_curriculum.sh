@@ -1,10 +1,11 @@
 #!/bin/bash
 # run_dqn_curriculum.sh
-# Usage: ./scripts/run_dqn_curriculum.sh [dqn|ddqn|per|dueling] [steps1] [steps2]
+# Usage:
+#   ./scripts/run_dqn_curriculum.sh [dqn|ddqn|per|dueling] [steps1] [steps2] [extra flags...]
+#
+# Extra flags are forwarded to train_dqn_curriculum.py (and then to train_dqn_variants.py).
 
 VARIANT=${1:-"dueling"} # Improved: Default to Dueling-DQN in V7.0
-STEPS1=${2:-""}
-STEPS2=${3:-""}
 
 # 1. Setup directories
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,14 +25,28 @@ echo ">>> Log file: $LOG_FILE"
 PY_CMD="python"
 if ! command -v $PY_CMD &> /dev/null; then PY_CMD="python3"; fi
 
-# 3. Process variant argument then pass remaining to python
-# If the first argument is a variant name (e.g. 'ddqn'), we use it and shift.
-if [[ "$VARIANT" == "dqn" || "$VARIANT" == "ddqn" || "$VARIANT" == "per" || "$VARIANT" == "dueling" ]]; then
-    # If the user provided the variant as the first argument, we shift it so "$@" remains only extra flags
+# 3. Process variant + optional positional steps then forward remaining flags
+ARGS=("--variant" "${VARIANT}")
+
+# If the user provided the variant as the first argument, shift it so we can parse steps
+if [[ "$1" == "dqn" || "$1" == "ddqn" || "$1" == "per" || "$1" == "dueling" ]]; then
     shift
 fi
 
-nohup $PY_CMD -u "$PROJECT_ROOT/train_dqn_curriculum.py" --variant "${VARIANT}" "$@" > "$LOG_FILE" 2>&1 &
+# Optional positional steps1/steps2 (integers)
+if [[ "$1" =~ ^[0-9]+$ ]]; then
+    ARGS+=("--steps1" "$1")
+    shift
+fi
+if [[ "$1" =~ ^[0-9]+$ ]]; then
+    ARGS+=("--steps2" "$1")
+    shift
+fi
+
+# Forward remaining flags
+ARGS+=("$@")
+
+nohup $PY_CMD -u "$PROJECT_ROOT/train_dqn_curriculum.py" "${ARGS[@]}" > "$LOG_FILE" 2>&1 &
 
 # 4. Save PID
 NEW_PID=$!

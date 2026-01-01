@@ -7,6 +7,8 @@ Features: Omni-Batch Inference (Massive FPS boost), Soft Updates, Algorithm-Spec
 import math
 import random
 import time
+import threading
+import queue
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
@@ -17,7 +19,29 @@ import torch.optim as optim
 import sys
 import os
 
-# V18.3: Silence CUDAGraph dynamic shape warnings for grouped inference
+# cuDNN autotune for fixed-shape conv nets (20x20 grid)
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
+
+# Optional CPU thread caps to reduce AsyncVectorEnv worker contention.
+# Recommended: 1 (or 2) on typical multi-process rollouts.
+_cpu_threads_env = os.getenv("DQN_CPU_THREADS")
+if _cpu_threads_env:
+    try:
+        _n = max(1, int(_cpu_threads_env))
+        torch.set_num_threads(_n)
+        # Inter-op threads can be smaller to reduce oversubscription
+        try:
+            torch.set_num_interop_threads(min(4, _n))
+        except Exception:
+            pass
+        # Best-effort for libraries used in workers; user can still override in shell.
+        os.environ.setdefault("OMP_NUM_THREADS", str(_n))
+        os.environ.setdefault("MKL_NUM_THREADS", str(_n))
+    except Exception:
+        pass
+
+# V31.1: Align with PPO - Skip CUDAGraphs for dynamic opponent batches
 if hasattr(torch, '_inductor'):
     import torch._inductor.config as inductor_config
     inductor_config.triton.cudagraph_skip_dynamic_graphs = True
@@ -32,7 +56,7 @@ import gymnasium as gym
 
 from agent.dqn import DQNNet, DQNAgent
 from agent.ddqn import DDQNNet, DDQNAgent
-from agent.per_dqn import PERDQNNet, PERDQNAgent, SumTree
+from agent.per_dqn import PERDQNNet, PERDQNAgent
 from agent.dueling_dqn import DuelingDQNNet, DuelingDQNAgent
 from utils.self_play import SelfPlayManager
 
@@ -49,141 +73,183 @@ class FastReplayBuffer:
         self.capacity = capacity
         self.batch_size = batch_size
         self.device = device
-        # V17.0: Use uint8 for grids to save 75% memory (45GB -> 11GB for 3M capacity)
-        self.grids = np.zeros((capacity, *grid_shape), dtype=np.uint8)
-        self.vectors = np.zeros((capacity, vector_dim), dtype=np.float32)
-        self.actions = np.zeros(capacity, dtype=np.int64)
-        self.rewards = np.zeros(capacity, dtype=np.float32)
-        self.next_grids = np.zeros((capacity, *grid_shape), dtype=np.uint8)
-        self.next_vectors = np.zeros((capacity, vector_dim), dtype=np.float32)
-        self.dones = np.zeros(capacity, dtype=np.bool_)
-        self.ptr = 0
-        self.size = 0
+        
+        # V28.0: Full GPU Zero-Sync Buffer for Standard DQN
+        self.grids = torch.zeros((capacity, *grid_shape), dtype=torch.uint8, device=device)
+        self.vectors = torch.zeros((capacity, vector_dim), dtype=torch.float32, device=device)
+        self.actions = torch.zeros(capacity, dtype=torch.long, device=device)
+        self.rewards = torch.zeros(capacity, dtype=torch.float32, device=device)
+        self.next_grids = torch.zeros((capacity, *grid_shape), dtype=torch.uint8, device=device)
+        self.next_vectors = torch.zeros((capacity, vector_dim), dtype=torch.float32, device=device)
+        self.dones = torch.zeros(capacity, dtype=torch.bool, device=device)
+        
+        # GPU state trackers
+        self.register_buffer("_ptr_val", torch.zeros(1, dtype=torch.long, device=device))
+        self.register_buffer("_size_val", torch.zeros(1, dtype=torch.long, device=device))
+        
+        # CPU Shadow variables for zero-sync indexing
+        self._ptr = 0
+        self._size = 0
 
-    def push(self, state, action, reward, next_state, done):
-        # V17.2: Direct assignment - numpy handles the type conversion automatically
-        self.grids[self.ptr] = state['grid']
-        self.vectors[self.ptr] = state['vector']
-        self.actions[self.ptr] = action
-        self.rewards[self.ptr] = reward
-        self.next_grids[self.ptr] = next_state['grid']
-        self.next_vectors[self.ptr] = next_state['vector']
-        self.dones[self.ptr] = done
-        self.ptr = (self.ptr + 1) % self.capacity
-        self.size = min(self.size + 1, self.capacity)
+    def register_buffer(self, name, tensor):
+        setattr(self, name, tensor)
+
+    @property
+    def ptr(self): return self._ptr
+
+    @property
+    def size(self): return self._size
+
+    def push_batch(self, grids, vecs, actions, rewards, next_grids, next_vecs, dones):
+        num = len(grids)
+        idx_range = (torch.arange(self._ptr, self._ptr + num, device=self.device) % self.capacity)
+        
+        self.grids[idx_range] = torch.as_tensor(grids, dtype=torch.uint8, device=self.device)
+        self.vectors[idx_range] = torch.as_tensor(vecs, dtype=torch.float32, device=self.device)
+        self.actions[idx_range] = torch.as_tensor(actions, dtype=torch.long, device=self.device)
+        self.rewards[idx_range] = torch.as_tensor(rewards, dtype=torch.float32, device=self.device)
+        self.next_grids[idx_range] = torch.as_tensor(next_grids, dtype=torch.uint8, device=self.device)
+        self.next_vectors[idx_range] = torch.as_tensor(next_vecs, dtype=torch.float32, device=self.device)
+        self.dones[idx_range] = torch.as_tensor(dones, dtype=torch.bool, device=self.device)
+        
+        # Update trackers (Shadowed)
+        self._ptr = (self._ptr + num) % self.capacity
+        self._size = min(self._size + num, self.capacity)
+        self._ptr_val[0] = self._ptr
+        self._size_val[0] = self._size
 
     def sample(self):
-        idxs = np.random.randint(0, self.size, size=self.batch_size)
+        # V28.0: Pure indexing on GPU with Zero-Sync
+        batch = torch.randint(0, self._size, (self.batch_size,), device=self.device)
         
-        # Pinned memory transfer for faster CPU->GPU throughput
-        def to_device(numpy_array, dtype=None):
-            t = torch.as_tensor(numpy_array, dtype=dtype)
-            if self.device.type == 'cuda':
-                return t.pin_memory().to(self.device, non_blocking=True)
-            return t.to(self.device)
-
         return (
-            {
-                "grid": to_device(self.grids[idxs], torch.float32), 
-                "vector": to_device(self.vectors[idxs])
-            },
-            to_device(self.actions[idxs]),
-            to_device(self.rewards[idxs]),
-            {
-                "grid": to_device(self.next_grids[idxs], torch.float32), 
-                "vector": to_device(self.next_vectors[idxs])
-            },
-            to_device(self.dones[idxs]),
+            { "grid": self.grids[batch].float(), "vector": self.vectors[batch] },
+            self.actions[batch], self.rewards[batch],
+            { "grid": self.next_grids[batch].float(), "vector": self.next_vectors[batch] },
+            self.dones[batch],
             None, # weights
             None  # indices
         )
 
+    def update_priorities(self, idxs, td_errors):
+        # Optional: Standard DQN ignores this, but we keep it for API compatibility
+        pass
 
+
+
+# V25.0 DEPRECATED: TorchSumTree removed for O(1) linear GPU priorities
 
 class PrioritizedReplayBuffer:
     def __init__(self, capacity, grid_shape, vector_dim, batch_size, device, alpha=0.5, beta=0.4):
-        self.tree = SumTree(capacity)
         self.capacity = capacity
         self.batch_size = batch_size
         self.device = device
         self.alpha = alpha
         self.beta = beta
         self.epsilon = 1e-6
-        self.max_priority = 1.0
+        
+        # Buffers on GPU
+        self.grids = torch.zeros((capacity, *grid_shape), dtype=torch.uint8, device=device)
+        self.vectors = torch.zeros((capacity, vector_dim), dtype=torch.float32, device=device)
+        self.actions = torch.zeros(capacity, dtype=torch.long, device=device)
+        self.rewards = torch.zeros(capacity, dtype=torch.float32, device=device)
+        self.next_grids = torch.zeros((capacity, *grid_shape), dtype=torch.uint8, device=device)
+        self.next_vectors = torch.zeros((capacity, vector_dim), dtype=torch.float32, device=device)
+        self.dones = torch.zeros(capacity, dtype=torch.bool, device=device)
+        self.priorities = torch.zeros(capacity, dtype=torch.float32, device=device)
 
-        # V17.0: Use uint8 for grids (20x20x5)
-        self.grids = np.zeros((capacity, *grid_shape), dtype=np.uint8)
-        self.vectors = np.zeros((capacity, vector_dim), dtype=np.float32)
-        self.actions = np.zeros(capacity, dtype=np.int64)
-        self.rewards = np.zeros(capacity, dtype=np.float32)
-        self.next_grids = np.zeros((capacity, *grid_shape), dtype=np.uint8)
-        self.next_vectors = np.zeros((capacity, vector_dim), dtype=np.float32)
-        self.dones = np.zeros(capacity, dtype=np.bool_)
+        # Maintain running sum of priorities on GPU to avoid O(capacity) reductions during sampling.
+        self.register_buffer("_total_priority", torch.zeros(1, dtype=torch.float32, device=device))
+        
+        # GPU state trackers
+        self.register_buffer("_ptr_val", torch.zeros(1, dtype=torch.long, device=device))
+        self.register_buffer("_size_val", torch.zeros(1, dtype=torch.long, device=device))
+        self.register_buffer("_max_pri_tensor", torch.ones(1, dtype=torch.float32, device=device))
+        
+        # V25.2: CPU Shadow variables for zero-sync indexing
+        self._ptr = 0
+        self._size = 0
+
+    def register_buffer(self, name, tensor):
+        setattr(self, name, tensor)
+
+    @property
+    def ptr(self):
+        return self._ptr
 
     @property
     def size(self):
-        return self.tree.size
+        return self._size
 
-    def push(self, state, action, reward, next_state, done):
-        data_idx = self.tree.ptr
-        # V17.2: Direct assignment - numpy handles the type conversion
-        self.grids[data_idx] = state['grid']
-        self.vectors[data_idx] = state['vector']
-        self.actions[data_idx] = action
-        self.rewards[data_idx] = reward
-        self.next_grids[data_idx] = next_state['grid']
-        self.next_vectors[data_idx] = next_state['vector']
-        self.dones[data_idx] = done
-        self.tree.add(self.max_priority ** self.alpha, int(data_idx))
-
-    def sample(self, beta: float):
-        segment = self.tree.total_priority / self.batch_size
-        v = np.random.uniform(segment * np.arange(self.batch_size), segment * np.arange(1, self.batch_size + 1))
+    def push_batch(self, grids, vecs, actions, rewards, next_grids, next_vecs, dones):
+        num = len(grids)
+        idx_range = (torch.arange(self._ptr, self._ptr + num, device=self.device) % self.capacity)
         
-        idxs = []
-        priorities = []
-        batch_data_idxs = []
+        self.grids[idx_range] = torch.as_tensor(grids, dtype=torch.uint8, device=self.device)
+        self.vectors[idx_range] = torch.as_tensor(vecs, dtype=torch.float32, device=self.device)
+        self.actions[idx_range] = torch.as_tensor(actions, dtype=torch.long, device=self.device)
+        self.rewards[idx_range] = torch.as_tensor(rewards, dtype=torch.float32, device=self.device)
+        self.next_grids[idx_range] = torch.as_tensor(next_grids, dtype=torch.uint8, device=self.device)
+        self.next_vectors[idx_range] = torch.as_tensor(next_vecs, dtype=torch.float32, device=self.device)
+        self.dones[idx_range] = torch.as_tensor(dones, dtype=torch.bool, device=self.device)
         
-        for val in v:
-            idx, p, data_idx = self.tree.get_leaf(val)
-            idxs.append(idx)
-            priorities.append(p)
-            batch_data_idxs.append(int(data_idx))
-            
-        idxs = np.array(idxs)
-        batch = np.array(batch_data_idxs)
+        # O(1) GPU Priority Update (No host sync)
+        old_sum = self.priorities[idx_range].sum()
+        new_p = self._max_pri_tensor[0].pow(self.alpha)
+        self.priorities[idx_range] = new_p
+        self._total_priority[0] += (new_p * num) - old_sum
         
-        probs = np.array(priorities) / (self.tree.total_priority + 1e-8)
-        weights = (self.size * probs) ** (-beta)
-        weights /= (weights.max() + 1e-8)
-        
-        def to_device(numpy_array, dtype=None):
-            t = torch.as_tensor(numpy_array, dtype=dtype)
-            if self.device.type == 'cuda':
-                return t.pin_memory().to(self.device, non_blocking=True)
-            return t.to(self.device)
-
-        return (
-            {
-                "grid": to_device(self.grids[batch], torch.float32), 
-                "vector": to_device(self.vectors[batch])
-            },
-            to_device(self.actions[batch]),
-            to_device(self.rewards[batch]),
-            {
-                "grid": to_device(self.next_grids[batch], torch.float32), 
-                "vector": to_device(self.next_vectors[batch])
-            },
-            to_device(self.dones[batch]),
-            to_device(weights.astype(np.float32)),
-            idxs
-        )
+        # Update trackers (Both GPU and CPU shadow)
+        self._ptr = (self._ptr + num) % self.capacity
+        self._size = min(self._size + num, self.capacity)
+        self._ptr_val[0] = self._ptr
+        self._size_val[0] = self._size
 
     def update_priorities(self, idxs, td_errors):
-        for idx, err in zip(idxs, td_errors):
-            p = (abs(err) + self.epsilon) ** self.alpha
-            self.tree.update(idx, p)
-            self.max_priority = max(self.max_priority, abs(err) + self.epsilon)
+        ps = (td_errors.detach().abs() + self.epsilon).pow(self.alpha)
+
+        # idxs may contain duplicates (sampling with replacement). Aggregate by max priority per index.
+        if hasattr(ps, "scatter_reduce_"):
+            uniq, inv = torch.unique(idxs, return_inverse=True)
+            agg = torch.zeros((uniq.shape[0],), device=self.device, dtype=ps.dtype)
+            agg.scatter_reduce_(0, inv, ps, reduce="amax", include_self=False)
+            old = self.priorities[uniq]
+            self.priorities[uniq] = agg
+            self._total_priority[0] += (agg - old).sum()
+            new_max = agg.max()
+        else:
+            # Fallback: best-effort without exact duplicate handling
+            old = self.priorities[idxs]
+            self.priorities[idxs] = ps
+            self._total_priority[0] += (ps - old).sum()
+            new_max = ps.max()
+
+        # Update max_priority on GPU
+        self._max_pri_tensor[0] = torch.max(self._max_pri_tensor[0], new_max)
+
+    def sample(self, beta: float):
+        # V25.1: Zero-Sync GPU Multinomial Sampling
+        curr_size = self.size
+        # Slicing is okay, but we use the fixed capacity if we want to avoid host-syncing 'size'
+        # pr = self.priorities[:curr_size]
+        # To truly avoid host-sync, one could pad priorities with 0 for unused indices.
+        # But for multinomial, we need a 1D tensor of weights.
+        
+        pr = self.priorities[:curr_size]
+        idxs = torch.multinomial(pr, self.batch_size, replacement=True)
+        
+        # Importance weights calculation
+        total_p = self._total_priority[0]
+        probs = pr[idxs] / (total_p + 1e-8)
+        weights = (curr_size * probs).pow(-beta)
+        weights = weights / (weights.max() + 1e-8)
+        
+        return (
+            { "grid": self.grids[idxs].float(), "vector": self.vectors[idxs] },
+            self.actions[idxs], self.rewards[idxs],
+            { "grid": self.next_grids[idxs].float(), "vector": self.next_vectors[idxs] },
+            self.dones[idxs], weights, idxs
+        )
 
 # --- Main Trainer ---
 
@@ -191,7 +257,7 @@ class PrioritizedReplayBuffer:
 class TrainConfig:
     variant: str = "dqn" # dqn, ddqn, per, dueling
     total_frames: int = 5_000_000 
-    num_envs: int = 64 # V18.0: Increased to 64 with AsyncVectorEnv
+    num_envs: int = 64 # V26.0: Optimal IPC for A6000 Phase 2
     batch_size: int = 512 
     lr: float = 1e-4
     eps_decay: int = 0  
@@ -203,45 +269,84 @@ class TrainConfig:
     self_play_prob: float = 0.5
     buffer_size: int = 200_000 # V17.4: Reduced to 200k for much faster sampling
     single_snake: bool = False
-    eps_start: float = 1.0  
+    # Exploration (can override via CLI)
+    eps_start: Optional[float] = None
+    eps_min: Optional[float] = None
+
+    # Self-play probability schedule (front-high then low)
+    self_play_prob_start: Optional[float] = None
+    self_play_prob_end: Optional[float] = None
+    self_play_prob_frac: float = 0.30
 
 class DQNVariantTrainer:
     def __init__(self, cfg: TrainConfig):
         self.cfg = cfg  # FIXED: Restored self.cfg assignment
+
+        # Curriculum correctness: when running Phase 1 ("single"), force a true single-snake env.
+        # This keeps the observation/action spaces consistent while matching intended training.
+        if cfg.single_snake:
+            self.cfg.num_snakes = 1
         # Variant-aware exploration schedule.
         # Use percentage-based decay to adapt to any total_frames count (1M, 5M, etc.)
         total = max(1, int(cfg.total_frames))
         
         # Decide Decay Duration: 85% of total steps for single, 90% for battle (need more exploration)
-        if cfg.single_snake:
-            decay_ratio = 0.80 # V46.3: Compressed for 300W run
-        else:
-            decay_ratio = 0.90
-            
-        self.decay_steps = int(total * decay_ratio)
-        self.cfg.eps_decay = self.decay_steps # Update config for logging
+        # V35.0: Universal Compile Config - Skip dynamic graphs to stay stable with groups
+        if hasattr(torch, '_inductor'):
+            torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
+        # Restore Decay Steps (V35.1 Fix)
         if cfg.single_snake:
-            cfg.num_snakes = 1
+            decay_ratio = 0.80 
+        else:
+            decay_ratio = 0.90
+        self.decay_steps = int(total * decay_ratio)
+        self.cfg.eps_decay = self.decay_steps
 
-        # Decide Hyperparameters based on Variant and Phase (V9.0 Specialized Tuning)
+        # V35.0 Aggressive Optimization: Reduce overhead
+        if not cfg.single_snake:
+            self.cfg.num_envs = 32 # Reduced from 64 to save CPU/Memory
+            self.active_rivals = [] # Global Active Rival models (paths)
+            # Reduce FPS spikes from frequent model refresh/load.
+            # Can override via env var for experiments.
+            self.rival_update_interval = int(os.getenv("RIVAL_UPDATE_INTERVAL", "50000"))
+            self.next_rival_update = 0
+        else:
+            self.cfg.num_envs = 128
+        
+        # Opponent Grouping Cache
+        self.cached_opp_groups = {}
+        self.opp_model_paths = [] 
+        
         v = cfg.variant
+        num_snakes = cfg.num_snakes
         if cfg.single_snake:
             # Phase 1: High Exploration & Robust Learning
-            self.eps_start, self.eps_min = 1.0, 0.1
+            default_eps_start, default_eps_min = 1.0, 0.1
+            self.batch_size = 1024 # V21.1: Increased for GPU saturation
             if v == "dqn":
-                self.lr, self.tau, self.batch_size = 1.5e-4, 0.002, 512 # V17.3: Fixed batch
+                self.lr, self.tau = 1.5e-4, 0.002
             else:
-                self.lr, self.tau, self.batch_size = 2.0e-4, 0.005, 512 # V17.3: Fixed batch
+                self.lr, self.tau = 2.0e-4, 0.005
         else:
             # Phase 2: High Stability & Combat Precision
-            self.eps_start, self.eps_min = 0.3, 0.05
+            default_eps_start, default_eps_min = 0.3, 0.05
+            self.batch_size = 1024 # V21.1: Increased
             if v == "dqn":
-                self.lr, self.tau, self.batch_size = 1.0e-4, 0.002, 512 # V17.3: Fixed batch
+                self.lr, self.tau = 1.0e-4, 0.002
             else:
-                self.lr, self.tau, self.batch_size = 8.0e-5, 0.005, 512 # V17.3: Fixed batch
+                self.lr, self.tau = 8.0e-5, 0.005
+
+        # Allow overriding eps schedule from config/CLI
+        self.eps_start = float(cfg.eps_start) if cfg.eps_start is not None else float(default_eps_start)
+        self.eps_min = float(cfg.eps_min) if cfg.eps_min is not None else float(default_eps_min)
+
+        # Self-play probability schedule (front-high then low)
+        self.sp_prob_start = float(cfg.self_play_prob_start) if cfg.self_play_prob_start is not None else float(cfg.self_play_prob)
+        self.sp_prob_end = float(cfg.self_play_prob_end) if cfg.self_play_prob_end is not None else float(cfg.self_play_prob)
+        self.sp_prob_frac = float(cfg.self_play_prob_frac) if cfg.self_play_prob_frac is not None else 0.30
             
         self.grad_clip = 0.5 
         
@@ -260,6 +365,7 @@ class DQNVariantTrainer:
         # Removed: if cfg.variant == "ddqn": self.lr = self.lr * 0.5
 
         log(f">>> [V8.0 Asymmetric-Tuning] Variant: {cfg.variant.upper()} | LR: {self.lr} | Tau: {self.tau} | GradClip: {self.grad_clip} | Buf: {self.buffer_size}")
+        log(f">>> [Explore] eps_start={self.eps_start:.2f} eps_min={self.eps_min:.2f} | [SelfPlay] prob={self.sp_prob_start:.2f}->{self.sp_prob_end:.2f} @ {self.sp_prob_frac:.2f}")
         
         env_cfg = BattleSnakeConfig(width=20, height=20, num_snakes=cfg.num_snakes)
         if cfg.num_snakes == 1:
@@ -316,30 +422,45 @@ class DQNVariantTrainer:
         
         self.policy_net = self.net_cls(vector_dim=28).to(self.device)
         self.target_net = self.net_cls(vector_dim=28).to(self.device)
+
+        # Memory format optimization for Conv2d on CUDA
+        if self.device.type == "cuda":
+            self.policy_net = self.policy_net.to(memory_format=torch.channels_last)
+            self.target_net = self.target_net.to(memory_format=torch.channels_last)
         
-        # V18.0: torch.compile for massive throughput boost
-        if hasattr(torch, 'compile') and os.name != 'nt':
+        # 1. Load weights (V37.0: Dynamic stripping of _orig_mod prefixes)
+        if cfg.load_path and Path(cfg.load_path).exists():
+            log(f">>> Loading weights from {cfg.load_path}...")
+            sd = torch.load(cfg.load_path, map_location=self.device, weights_only=True)
+            # Clean Prefix: Handle models saved with torch.compile enabled
+            sd = { k.replace("_orig_mod.", ""): v for k, v in sd.items() }
+            self.policy_net.load_state_dict(sd)
+            self.lr = self.lr * 0.25 
+            log(f">>> [V22.0] Fine-tuning mode: Lowered LR to {self.lr:.2e}")
+            
+        # 2. Sync target net
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        
+        # 3. Initialize Optimizer
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.lr)
+
+        # 4. Final Compilation (Only on Linux, after loading/syncing)
+        if os.name != 'nt' and hasattr(torch, 'compile'):
             try:
                 self.policy_net = torch.compile(self.policy_net, mode='reduce-overhead')
-                self.target_net = torch.compile(self.target_net, mode='reduce-overhead')
                 log(">>> [DQN-Turbo] torch.compile() enabled.")
             except Exception as e:
                 log(f">>> [DQN-Turbo] torch.compile() failed: {e}")
+        else:
+            log(">>> [DQN-Turbo] torch.compile() skipped (Windows/Unsupported).")
         
-        if cfg.load_path and Path(cfg.load_path).exists():
-            log(f">>> Loading weights from {cfg.load_path}...")
-            state_dict = torch.load(cfg.load_path, map_location=self.device, weights_only=True)
-            self.policy_net.load_state_dict(state_dict)
-            
-        self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.lr)
-        
-        if "per" in cfg.variant or "dueling" in cfg.variant:
-            # V8.1: Support phase-aware alpha
+        # V28.0: Revert DQN to vanilla sampling while keeping PER for variants
+        # V28.1: dqn and ddqn use uniform sampling; per and dueling use prioritized
+        if cfg.variant in ["dqn", "ddqn"]:
+            self.memory = FastReplayBuffer(self.buffer_size, (5, 20, 20), 28, self.batch_size, self.device)
+        else:
             alpha = getattr(self, 'per_alpha', 0.6)
             self.memory = PrioritizedReplayBuffer(self.buffer_size, (5, 20, 20), 28, self.batch_size, self.device, alpha=alpha)
-        else:
-            self.memory = FastReplayBuffer(self.buffer_size, (5, 20, 20), 28, self.batch_size, self.device)
             
         self.steps = 0
         log(f">>> [V13.3 Heartbeat] Setup Finished. Buffer: {self.buffer_size} | Device: {self.device}")
@@ -349,6 +470,17 @@ class DQNVariantTrainer:
         # Store model paths for opponents. None means random.
         self.opp_model_paths = [[None]*cfg.num_snakes for _ in range(cfg.num_envs)]
         self.loaded_opp_models: Dict[str, nn.Module] = {}
+
+        # Async prefetch for opponent weights (CPU) to avoid I/O spikes in battle mode.
+        # Main thread will materialize GPU modules lazily when weights are ready.
+        self._prefetch_queue: "queue.SimpleQueue[str]" = queue.SimpleQueue()
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_pending: set[str] = set()
+        self._prefetched_sd: Dict[str, Tuple[float, Dict[str, torch.Tensor]]] = {}
+        self._prefetch_stop = threading.Event()
+        self._prefetch_max_items = int(os.getenv("PREFETCH_MAX_ITEMS", "64"))
+        self._prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
+        self._prefetch_thread.start()
         
         self.best_reward = -float('inf')
         
@@ -363,11 +495,17 @@ class DQNVariantTrainer:
         self.use_amp = True
 
     def save_model(self, path):
-        # V44.4: Atomic Save to prevent file corruption/locking during self-play loading
+        # V37.0: Always save the clean state_dict (stripping torch.compile wrappers)
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = p.with_suffix(p.suffix + ".tmp")
-        torch.save(self.policy_net.state_dict(), tmp_path)
+        
+        # Access the raw module if it's compiled
+        raw_net = self.policy_net._orig_mod if hasattr(self.policy_net, "_orig_mod") else self.policy_net
+        # Save CPU tensors for portability and to avoid serializing CUDA tensors.
+        sd_cpu = {k: v.detach().cpu() for k, v in raw_net.state_dict().items()}
+        torch.save(sd_cpu, tmp_path)
+        
         if os.path.exists(p):
             try:
                 os.replace(tmp_path, p)
@@ -380,101 +518,193 @@ class DQNVariantTrainer:
 
     def _get_opp_model(self, path: str) -> nn.Module:
         """Get model from cache or load from disk"""
-        if path not in self.loaded_opp_models:
-            model = self.net_cls(vector_dim=28).to(self.device)
+        if path in self.loaded_opp_models:
+            return self.loaded_opp_models.get(path)
+
+        # If weights were prefetched on CPU, materialize GPU module fast.
+        try:
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            return None
+
+        cached = self._prefetched_sd.get(path)
+        if cached is not None and cached[0] == mtime:
             try:
-                state_dict = torch.load(path, map_location=self.device, weights_only=True)
-                model.load_state_dict(state_dict)
-                model.eval()
+                model = self.net_cls(vector_dim=28).to(self.device).eval()
+                if self.device.type == "cuda":
+                    model = model.to(memory_format=torch.channels_last)
+                sd = cached[1]
+                model.load_state_dict(sd)
+                for p in model.parameters():
+                    p.requires_grad = False
                 self.loaded_opp_models[path] = model
-                # Limit cache size to prevent memory leak
-                # V44.3: Increase Cache to 50 (was 5). 8 envs * 3 opps = 24 models needed.
-                # 5 was causing severe IO thrashing -> 3 FPS.
-                if len(self.loaded_opp_models) > 50:
+                if len(self.loaded_opp_models) > 500:
                     key_to_del = next(iter(self.loaded_opp_models))
                     del self.loaded_opp_models[key_to_del]
+                return model
             except Exception:
                 return None
-        return self.loaded_opp_models.get(path)
+
+        # Not ready yet: enqueue async prefetch and skip (caller will fallback to random action)
+        self._enqueue_prefetch(path)
+        return None
+
+    def _enqueue_prefetch(self, path: Optional[str]) -> None:
+        if not path:
+            return
+        with self._prefetch_lock:
+            if path in self._prefetch_pending:
+                return
+            self._prefetch_pending.add(path)
+        self._prefetch_queue.put(path)
+
+    def _prefetch_worker(self) -> None:
+        while not self._prefetch_stop.is_set():
+            try:
+                path = self._prefetch_queue.get(timeout=0.5)
+            except Exception:
+                continue
+
+            with self._prefetch_lock:
+                self._prefetch_pending.discard(path)
+
+            try:
+                mtime = os.stat(path).st_mtime
+            except OSError:
+                continue
+
+            cached = self._prefetched_sd.get(path)
+            if cached is not None and cached[0] == mtime:
+                continue
+
+            try:
+                sd = torch.load(path, map_location="cpu", weights_only=True)
+                sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+                self._prefetched_sd[path] = (mtime, sd)
+
+                # simple LRU-ish eviction
+                if len(self._prefetched_sd) > self._prefetch_max_items:
+                    self._prefetched_sd.pop(next(iter(self._prefetched_sd)))
+            except Exception:
+                continue
 
     def train(self):
-        log(f">>> Starting {self.cfg.variant.upper()} Training (V18.1 Turbo Battle)...")
+        log(f">>> Starting {self.cfg.variant.upper()} Training (V21.0 Flash-Batch)...")
         obs_dict, info = self.envs.reset()
         ep_rewards = [0.0] * self.cfg.num_envs
         recent_rewards = []
         last_log_time = time.time()
         
         total_frames = max(1, int(self.cfg.total_frames))
+        num_snakes = self.cfg.num_snakes
+        total_snakes = self.cfg.num_envs * num_snakes
+
+        # Precompute indices and pinned CPU buffer for fast env stepping
+        learner_map = torch.arange(0, total_snakes, num_snakes, device=self.device)
+        actions_cpu = torch.empty((total_snakes,), dtype=torch.int32, device="cpu", pin_memory=True)
+
+        # Reusable tensors to avoid per-step allocations
+        current_actions = torch.empty(total_snakes, dtype=torch.int32, device=self.device)
+        
+        # V26.0 Initialization
+        self.opp_model_paths = [([None] * num_snakes) for _ in range(self.cfg.num_envs)]
+        self._rebuild_opp_groups()
         
         while self.steps < total_frames:
-            # 1. Group all snakes by model for Omni-Batch Inference
-            groups: Dict[Optional[nn.Module], List[Tuple[int, int, Dict]]] = {None: []}
-            
             self.steps += self.cfg.num_envs
             completion = min(1.0, self.steps / self.decay_steps)
-            eps = max(0.10, self.eps_start - completion * (self.eps_start - self.eps_min))
+            eps = max(self.eps_min, self.eps_start - completion * (self.eps_start - self.eps_min))
             
-            all_actions = np.zeros((self.cfg.num_envs, self.cfg.num_snakes), dtype=np.int32)
-            all_full_obs = info["full_obs"]
-            
-            for e_idx in range(self.cfg.num_envs):
-                # Learner Agent (0)
-                if random.random() < eps:
-                    all_actions[e_idx, 0] = random.randint(0, 3)
-                else:
-                    groups[self.policy_net] = groups.get(self.policy_net, [])
-                    # obs_dict['grid'][e_idx] is the obs for snake 0
-                    groups[self.policy_net].append((e_idx, 0, {"grid": obs_dict["grid"][e_idx], "vector": obs_dict["vector"][e_idx]}))
-                
-                # Opponent Agents (1+)
-                for s_idx in range(1, self.cfg.num_snakes):
-                    m_path = self.opp_model_paths[e_idx][s_idx]
-                    if m_path:
-                        model = self._get_opp_model(m_path)
-                        if model:
-                            groups[model] = groups.get(model, [])
-                            groups[model].append((e_idx, s_idx, all_full_obs[e_idx][s_idx]))
-                        else:
-                            all_actions[e_idx, s_idx] = random.randint(0, 3)
-                    else:
-                        all_actions[e_idx, s_idx] = random.randint(0, 3)
+            # 1. Faster batch creation (V34.0)
+            # Transfer grids as uint8 to reduce PCIe bandwidth, then cast on GPU.
+            # `full_obs_grids` is uint8 (0/1) so float conversion is pure overhead on CPU.
+            all_g_u8 = torch.from_numpy(info["full_obs_grids"]).view(total_snakes, 5, 20, 20)
+            all_v_f32 = torch.from_numpy(info["full_obs_vecs"]).view(total_snakes, -1)
 
-            # 2. Execute Omni-Batch Inference
-            for model, samples in groups.items():
-                if not samples or model is None: continue
-                with torch.inference_mode():
-                    grids = np.asarray([s[2]['grid'] for s in samples])
-                    vecs = np.asarray([s[2]['vector'] for s in samples])
-                    t_g = torch.as_tensor(grids, dtype=torch.float32, device=self.device)
-                    t_v = torch.as_tensor(vecs, dtype=torch.float32, device=self.device)
-                    q_vals = model(t_g, t_v)
-                    acts = q_vals.argmax(dim=1).cpu().numpy()
-                    for i, (env_idx, snake_idx, _) in enumerate(samples):
-                        all_actions[env_idx, snake_idx] = int(acts[i])
+            t_all_g_u8 = all_g_u8.to(self.device, non_blocking=True)
+            t_all_v = all_v_f32.to(self.device, non_blocking=True)
             
-            # 3. Env Step (Batched)
+            # 2. Optimized Inference (V34.0: Direct assignment, no clones)
+            with torch.inference_mode(), autocast('cuda', enabled=self.use_amp):
+                # Cast on GPU (prefer fp16 when on CUDA for throughput)
+                grid_dtype = torch.float16 if (self.device.type == "cuda") else torch.float32
+                t_all_g = t_all_g_u8.to(dtype=grid_dtype)
+                if self.device.type == "cuda":
+                    t_all_g = t_all_g.contiguous(memory_format=torch.channels_last)
+
+                # A. Policy Forward
+                q_vals = self.policy_net(t_all_g[learner_map], t_all_v[learner_map])
+                la = q_vals.argmax(dim=1).to(torch.int32)
+                
+                # B. Epsilon-Greedy (One-shot)
+                if eps > 0:
+                    rv = torch.rand(self.cfg.num_envs, device=self.device)
+                    la = torch.where(
+                        rv < eps,
+                        torch.randint(0, 4, (self.cfg.num_envs,), device=self.device, dtype=torch.int32),
+                        la,
+                    )
+                current_actions[learner_map] = la
+                
+                # C. Opponents (V34.0: Batch cache check)
+                for m_path, idxs in self.cached_opp_groups.items():
+                    if m_path is None:
+                        current_actions[idxs] = torch.randint(
+                            0, 4, (len(idxs),), device=self.device, dtype=torch.int32
+                        )
+                    else:
+                        m = self._get_opp_model(m_path)
+                        if m:
+                            current_actions[idxs] = m(t_all_g[idxs], t_all_v[idxs]).argmax(dim=1).to(torch.int32)
+                
+                actions_cpu.copy_(current_actions, non_blocking=True)
+                all_actions_flat_np = actions_cpu.numpy()
+
+            # 3. Step Environment
+            all_actions = all_actions_flat_np.reshape(self.cfg.num_envs, num_snakes)
             next_obs_dict, rews, terminated, truncated, next_info = self.envs.step(all_actions)
             
+            # 4. Global Experience Store
+            self.memory.push_batch(
+                obs_dict["grid"], obs_dict["vector"],
+                all_actions[:, 0], rews,
+                next_obs_dict["grid"], next_obs_dict["vector"],
+                terminated
+            )
+            
+            # 5. Monitor & Self-Play (V35.1: Balanced Update)
+            should_rebuild = False
             for e_idx in range(self.cfg.num_envs):
-                # Only push snake 0 (learner) to memory
-                # Note: We need the single-agent observation for memory
-                state = {"grid": obs_dict["grid"][e_idx], "vector": obs_dict["vector"][e_idx]}
-                n_state = {"grid": next_obs_dict["grid"][e_idx], "vector": next_obs_dict["vector"][e_idx]}
-                
-                self.memory.push(state, all_actions[e_idx, 0], rews[e_idx], n_state, terminated[e_idx])
                 ep_rewards[e_idx] += rews[e_idx]
-                
                 if terminated[e_idx] or truncated[e_idx]:
                     recent_rewards.append(ep_rewards[e_idx])
                     if len(recent_rewards) > 100: recent_rewards.pop(0)
                     ep_rewards[e_idx] = 0.0
-                    
-                    # Self-Play Shuffle
-                    if self.cfg.num_snakes > 1 and random.random() < self.cfg.self_play_prob:
-                        opp_idx = random.randint(1, self.cfg.num_snakes-1)
-                        m_p = self.sp_manager.sample_model()
-                        if m_p:
-                            self.opp_model_paths[e_idx][opp_idx] = str(m_p)
+
+            # Global Rival Update (V35.0)
+            if not self.cfg.single_snake and self.steps >= self.next_rival_update:
+                self.next_rival_update = self.steps + self.rival_update_interval
+                new_rivals = []
+                for _ in range(4):
+                    m = self.sp_manager.sample_model()
+                    if m: new_rivals.append(str(m))
+                if new_rivals:
+                    self.active_rivals = new_rivals
+                    for p in self.active_rivals:
+                        self._enqueue_prefetch(p)
+
+                    # Two-stage self-play probability schedule: early higher, later lower.
+                    prog = self.steps / float(total_frames)
+                    sp_prob = self.sp_prob_start if prog < self.sp_prob_frac else self.sp_prob_end
+
+                    for e in range(self.cfg.num_envs):
+                        for s in range(1, num_snakes):
+                            if random.random() < sp_prob:
+                                self.opp_model_paths[e][s] = random.choice(self.active_rivals)
+                                should_rebuild = True
+                
+            if should_rebuild:
+                self._rebuild_opp_groups()
             
             obs_dict, info = next_obs_dict, next_info
 
@@ -492,30 +722,18 @@ class DQNVariantTrainer:
             late_40 = total_frames * 0.4
             
             # V13.0 CRITICAL FIX: Actually train the network!
-            # V24.0: Double Update Frequency for Phase 1 (Ratio 0.25)
-            if self.memory.size >= self.cfg.batch_size:
-                # Warm-up: avoid overfitting noisy early experience for PER/Dueling.
-                if self.cfg.variant in ("per", "dueling"):
-                    if self.steps < warmup1:
-                        updates = 1
-                    elif self.steps < warmup2:
-                        updates = min(2, self.updates_per_step)
-                    else:
-                        updates = self.updates_per_step
-                elif self.cfg.variant == "ddqn":
-                    # DDQN often peaks mid-training then regresses; reduce update pressure late.
-                    late_cut = late_half if self.cfg.single_snake else late_40
-                    updates = self.updates_per_step if self.steps < late_cut else 1
-                elif self.cfg.variant == "per":
-                    # PER can become unstable after it starts exploiting; reduce update pressure late.
-                    updates = self.updates_per_step if self.steps < late_half else 1
-                else:
-                    updates = self.updates_per_step
-
+            # V22.0: Multi-update to utilize GPU throughput
+            # With num_envs=128, one loop adds 128 samples.
+            # V23.0: 8 updates per 128 transitions (1:16 samples-to-steps ratio)
+            # This is much more balanced than 32 updates.
+            # V25.0: Consistent 1-update ratio to maximize FPS
+            if self.memory.size >= self.batch_size:
+                updates = 1
                 for _ in range(updates):
                     self.update()
 
             # 5. Soft Update
+            # 5. Soft Update (V31.1: Vectorized update - 100x faster than loops)
             tau_eff = self.tau
             if self.cfg.variant == "ddqn":
                 late_cut = late_half if self.cfg.single_snake else late_40
@@ -525,13 +743,15 @@ class DQNVariantTrainer:
                 tau_eff = self.tau * 0.5
             if self.cfg.variant == "per" and self.steps >= late_half:
                 tau_eff = self.tau * 0.5
-            for target_param, policy_param in zip(self.target_net.parameters(), self.policy_net.parameters()):
-                target_param.data.copy_(tau_eff * policy_param.data + (1.0 - tau_eff) * target_param.data)
                 
-            # 5. Heartbeat Logging (V13.3 Enhanced for A6000 mode)
-            log_interval = 400 if self.steps < 10000 else 2000
-            if self.steps % log_interval < self.cfg.num_envs:
-                fps = log_interval / (time.time() - last_log_time)
+            with torch.no_grad():
+                for target_param, policy_param in zip(self.target_net.parameters(), self.policy_net.parameters()):
+                    target_param.mul_(1.0 - tau_eff).add_(policy_param, alpha=tau_eff)
+                
+            # 5. Heartbeat Logging (V25.0: 1024 interval for better visibility)
+            if self.steps % 1024 < self.cfg.num_envs:
+                elapsed = time.time() - last_log_time
+                fps = (1024) / (elapsed + 1e-6)
                 avg_r = np.mean(recent_rewards) if recent_rewards else 0
                 log(f"Step: {self.steps} | EPS: {eps:.2f} | Rew: {avg_r:.2f} | FPS: {fps:.1f} | Var: {self.cfg.variant}")
                 last_log_time = time.time()
@@ -540,12 +760,33 @@ class DQNVariantTrainer:
                 # Keep periodic pool snapshots for self-play diversity
                 pool_interval = max(150_000, int(total_frames * 0.03))
                 if self.steps % pool_interval < self.cfg.num_envs:
-                    self.sp_manager.add_model(self.policy_net.state_dict(), f"{self.cfg.variant}_step_{self.steps}")
+                    raw_net = self.policy_net._orig_mod if hasattr(self.policy_net, "_orig_mod") else self.policy_net
+                    sd_cpu = {k: v.detach().cpu() for k, v in raw_net.state_dict().items()}
+                    self.sp_manager.add_model(sd_cpu, f"{self.cfg.variant}_step_{self.steps}")
             
         # Final Save (Only at the end of total_steps)
         self.save_model(self.cfg.save_path)
         final_path = str(Path(self.cfg.save_path).with_suffix(".final.pth"))
         self.save_model(final_path)
+
+    def _rebuild_opp_groups(self):
+        # V34.0: Pre-compute Tensors to avoid CPU-GPU sync during推断
+        temp_groups = {}
+        for e in range(self.cfg.num_envs):
+            for s in range(1, self.cfg.num_snakes):
+                m_path = self.opp_model_paths[e][s]
+                idx = e * self.cfg.num_snakes + s
+                temp_groups.setdefault(m_path, []).append(idx)
+
+        # Async prefetch any non-random opponent models
+        for m in temp_groups.keys():
+            if m is not None:
+                self._enqueue_prefetch(m)
+        
+        # Convert to cached tensors for constant-time GPU usage
+        self.cached_opp_groups = {
+            m: torch.tensor(idxs, device=self.device) for m, idxs in temp_groups.items()
+        }
 
     def update(self):
         # V6.3: Calculate dynamic Beta for PER
@@ -585,7 +826,8 @@ class DQNVariantTrainer:
         self.scaler.update()
         
         if weights is not None:
-            self.memory.update_priorities(idxs, td_errors.detach().abs().cpu().numpy())
+            # V24.0: Async priority update
+            self.memory.update_priorities(idxs, td_errors.detach())
 
 if __name__ == "__main__":
     from argparse import ArgumentParser
@@ -596,6 +838,15 @@ if __name__ == "__main__":
     p.add_argument("--load", type=str, default=None)
     p.add_argument("--save", type=str, default="agent/checkpoints/dqn_best.pth")
     p.add_argument("--sp-prob", type=float, default=0.5)
+
+    # Optional knobs (battle/single)
+    p.add_argument("--eps-start", type=float, default=None, help="Override epsilon start (default depends on phase)")
+    p.add_argument("--eps-min", type=float, default=None, help="Override epsilon min (default depends on phase)")
+
+    # Self-play probability schedule: early high then low
+    p.add_argument("--sp-prob-start", type=float, default=None, help="Self-play prob in early phase (defaults to --sp-prob)")
+    p.add_argument("--sp-prob-end", type=float, default=None, help="Self-play prob after switch (defaults to --sp-prob)")
+    p.add_argument("--sp-prob-frac", type=float, default=0.30, help="Switch point as fraction of total steps (default 0.30)")
     args = p.parse_args()
     
     p_dir = f"agent/pool/{args.variant}"
@@ -607,6 +858,11 @@ if __name__ == "__main__":
         load_path=args.load,
         save_path=args.save,
         self_play_prob=args.sp_prob,
+        eps_start=args.eps_start,
+        eps_min=args.eps_min,
+        self_play_prob_start=args.sp_prob_start,
+        self_play_prob_end=args.sp_prob_end,
+        self_play_prob_frac=args.sp_prob_frac,
         pool_dir=p_dir
     )
     DQNVariantTrainer(cfg).train()

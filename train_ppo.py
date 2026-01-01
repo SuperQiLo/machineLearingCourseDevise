@@ -107,11 +107,28 @@ def train_ppo(
     gamma = 0.99
     gae_lambda = 0.95
     clip_coef = 0.20
-    vf_coef = 1.0 
-    ent_start = 0.08 if num_snakes == 1 else 0.12 # V18.3: Slightly reduced for precise nav
+    ent_start = 0.08 if num_snakes == 1 else 0.12 
     ent_min = 0.02
     lr_init = lr
     target_kl = 0.015 
+    vf_coef = 0.5            # Value function coefficient
+    ent_coef_weight = 0.01   # Policy entropy coefficient weight
+    max_grad_norm = 0.5      # Gradient clipping
+    norm_adv = True          # Advantage normalization
+
+    # V29.0: Auto-tune for fine-tuning mode (--load)
+    # Prevent Policy Collapse in Phase 2 by boosting entropy and relaxing KL
+    is_finetune = load_path is not None
+    if is_finetune:
+        lr_init = lr * 0.25      # Lower LR for stable fine-tuning
+        ent_start = 0.12         # V29.0: Boosted from 0.05 to force exploration in Battle Mode
+        target_kl = 0.030        # V29.0: Relaxed from 0.010 to allow adaptation to new dynamics
+        log(f">>> [PPO-Turbo] Fine-tuning mode: LR={lr_init:.2e}, Ent={ent_start}, KL={target_kl}")
+
+    # V19.0: Increase num_envs for multi-snake to boost FPS
+    if num_snakes > 1:
+        num_envs = 96 # Increased from 64
+        log(f">>> [PPO-Turbo] Multi-snake mode: Increased envs to {num_envs} for FPS")
 
     batch_size = num_envs * num_steps
     minibatch_size = 2048 
@@ -135,16 +152,18 @@ def train_ppo(
                 "self_collision_penalty": -60.0,
             }
         else:
+            # Align with DQN battle preset (train_dqn_variants.py PHASE 2)
             reward_cfg = {
                 "closer_reward": 0.15,
                 "farther_penalty": -0.10,
                 "step_penalty": -0.05,
-                "kill_reward": 250.0,
+                "min_food": 2,
+                "death_penalty": -100.0,
+                "kill_reward": 150.0,
                 "food_reward": 80.0,
-                "win_reward": 800.0,
+                "self_collision_penalty": -150.0,
+                "win_reward": 500.0,
                 "loss_penalty": -200.0,
-                "death_penalty": -30.0,
-                "self_collision_penalty": -50.0,
             }
         # Unpack reward_cfg to avoid conflicts with make_gymnasium_env defaults
         mfn = reward_cfg.pop("min_food", 2)
@@ -213,6 +232,7 @@ def train_ppo(
     global_step = 0
     update = 0
     start_time = time.time()
+    total_snakes = num_envs * num_snakes
 
     log(">>> [PPO-Turbo] Setup finished. Starting training loop...")
 
@@ -243,15 +263,20 @@ def train_ppo(
                 b_logprobs[step].copy_(lp)
                 b_values[step].copy_(v.squeeze(-1))
 
-            # Handle Opponents (Grouped Inference)
-            all_full_obs = info["full_obs"] # List size num_envs, each has num_snakes obs dicts
+            # Handle Opponents (Grouped Inference - V30.0 High Speed Matrix mode)
             all_actions = np.zeros((num_envs, num_snakes), dtype=np.int32)
             all_actions[:, 0] = a.cpu().numpy()
             
             if num_snakes > 1:
-                groups: Dict[nn.Module, List[Tuple[int, int, dict]]] = {}
+                # Only move opponent observations needed for model inference.
+                # Random opponents don't need GPU copies.
+                full_grids = info["full_obs_grids"].reshape(total_snakes, 5, 20, 20)
+                full_vecs = info["full_obs_vecs"].reshape(total_snakes, -1)
+
+                groups: Dict[nn.Module, List[int]] = {}
                 for e_idx in range(num_envs):
                     for s_idx in range(1, num_snakes):
+                        idx = e_idx * num_snakes + s_idx
                         m_path = opp_model_paths[e_idx][s_idx]
                         if not m_path:
                             all_actions[e_idx, s_idx] = random.randint(0, 3)
@@ -260,16 +285,19 @@ def train_ppo(
                         if not m:
                             all_actions[e_idx, s_idx] = random.randint(0, 3)
                             continue
-                        groups.setdefault(m, []).append((e_idx, s_idx, all_full_obs[e_idx][s_idx]))
-                
-                for m, samples in groups.items():
-                    with torch.inference_mode():
-                        g = torch.as_tensor(np.asarray([s[2]['grid'] for s in samples]), dtype=torch.float32, device=device)
-                        v = torch.as_tensor(np.asarray([s[2]['vector'] for s in samples]), dtype=torch.float32, device=device)
+                        groups.setdefault(m, []).append(idx)
+
+                # Per-model batched inference; only copy the required rows.
+                for m, idx_list in groups.items():
+                    with torch.no_grad():
+                        g = torch.as_tensor(full_grids[idx_list], dtype=torch.float32, device=device)
+                        v = torch.as_tensor(full_vecs[idx_list], dtype=torch.float32, device=device)
                         logits, _ = m(g, v)
-                        acts = logits.argmax(dim=1).cpu().numpy()
-                        for i, (e_idx, s_idx, _) in enumerate(samples):
-                            all_actions[e_idx, s_idx] = int(acts[i])
+                        acts = logits.argmax(dim=1).to(dtype=torch.int32).cpu().numpy()
+                        for i, idx in enumerate(idx_list):
+                            e_i = idx // num_snakes
+                            s_i = idx % num_snakes
+                            all_actions[e_i, s_i] = int(acts[i])
 
             # Step Environments (Async)
             # Note: We need to pass the multi-agent actions. 
@@ -336,6 +364,7 @@ def train_ppo(
         # Optimization
         model.train()
         inds = np.arange(batch_size)
+        stop_early = False
         for epoch in range(update_epochs):
             np.random.shuffle(inds)
             for start in range(0, batch_size, minibatch_size):
@@ -371,7 +400,11 @@ def train_ppo(
 
                 with torch.no_grad():
                     approx_kl = ((ratio - 1) - logratio).mean()
-                    if approx_kl > target_kl: break
+                    if approx_kl > target_kl:
+                        stop_early = True
+                        break
+            if stop_early:
+                break
 
         # Logging
         if update <= 10 or update % 10 == 0:

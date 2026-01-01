@@ -8,7 +8,7 @@ from __future__ import annotations
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List, Union
 
 from env.battle_snake_env import BattleSnakeEnv, BattleSnakeConfig
 
@@ -40,7 +40,7 @@ class BattleSnakeGymnasiumEnv(gym.Env):
                 low=0.0,
                 high=1.0,
                 shape=(5, self.config.height, self.config.width),
-                dtype=np.float32,
+                dtype=np.uint8,
             ),
             "vector": spaces.Box(
                 low=-10.0,
@@ -74,8 +74,12 @@ class BattleSnakeGymnasiumEnv(gym.Env):
             self._env.seed(seed)
             
         obs_list = self._env.reset()
-        # Return only the first snake's observation
-        return obs_list[0], {"full_obs": obs_list}
+        # V21.0: Pre-process ALL observations into arrays for fast global indexing
+        # This allows AsyncVectorEnv to stack them automatically
+        all_grids = np.asarray([o["grid"] for o in obs_list], dtype=np.uint8)
+        all_vecs = np.asarray([o["vector"] for o in obs_list])
+        
+        return obs_list[0], {"full_obs_grids": all_grids, "full_obs_vecs": all_vecs, "raw_obs": obs_list}
     
     def step(
         self, action: Union[int, List[int], np.ndarray]
@@ -109,7 +113,8 @@ class BattleSnakeGymnasiumEnv(gym.Env):
         truncated = False  # Gymnasium convention
         
         info_out = {
-            "full_obs": obs_list,
+            "full_obs_grids": np.asarray([o["grid"] for o in obs_list], dtype=np.uint8),
+            "full_obs_vecs": np.asarray([o["vector"] for o in obs_list]),
             "full_rewards": rewards,
             "full_dones": dones,
             "scores": info.get("scores", []),

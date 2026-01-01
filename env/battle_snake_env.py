@@ -25,7 +25,7 @@ class Action(IntEnum):
 
 class ObservationDict(TypedDict):
     """V3+ Hybrid Observation Format"""
-    grid: np.ndarray    # (5, H, W) Full view
+    grid: np.ndarray    # (5, H, W) Full view (uint8 0/1)
     vector: np.ndarray  # (28,) Global features
 
 @dataclass
@@ -151,76 +151,108 @@ class BattleSnakeEnv:
 
         # Run moves
         for sub_step in range(2):
-            # Precompute body occupancy (exclude tail) for fast collision checks.
-            # This matches the previous logic `pos in self.snakes[j][:-1]` but avoids O(length) scans.
-            body_sets = [
-                (set(self.snakes[i][:-1]) if (not self.dead[i] and self.snakes[i]) else set())
-                for i in range(self.config.num_snakes)
-            ]
-            next_heads = []
+            # Compute planned next heads once.
+            next_heads: List[Optional[Tuple[int, int]]] = [None] * self.config.num_snakes
+
             for i in range(self.config.num_snakes):
                 if self.dead[i] or move_repeats[i] <= sub_step:
-                    next_heads.append(None); continue
-                
+                    continue
+
                 if sub_step == 0:
                     self.directions[i] = self._turn(self.directions[i], actions[i])
-                
+
                 head = self.snakes[i][0]
                 dx, dy = self.DIR_DELTA[self.directions[i]]
                 new_head = (head[0] + dx, head[1] + dy)
-                next_heads.append(new_head)
-                
+                next_heads[i] = new_head
+
                 # Distance shaping (V6.0: Smooth Potential-based Reward)
                 if self.foods:
-                    old_min = min(abs(head[0]-fx)+abs(head[1]-fy) for fx, fy in self.foods)
-                    new_min = min(abs(new_head[0]-fx)+abs(new_head[1]-fy) for fx, fy in self.foods)
-                    
-                    # V6.2: Definitive Smooth Potential Reward
+                    old_min = min(abs(head[0] - fx) + abs(head[1] - fy) for fx, fy in self.foods)
+                    new_min = min(abs(new_head[0] - fx) + abs(new_head[1] - fy) for fx, fy in self.foods)
                     dist_diff = old_min - new_min
                     if dist_diff > 0:
                         rewards[i] += self.config.closer_reward
                     elif dist_diff < 0:
                         rewards[i] += self.config.farther_penalty
 
-            # Collisions
-            alive_indices = [i for i, d in enumerate(self.dead) if not d and next_heads[i] is not None]
+            alive_indices = [i for i in range(self.config.num_snakes) if (not self.dead[i] and next_heads[i] is not None)]
+            if not alive_indices:
+                continue
+
+            # Build a compact occupancy table (H*W is tiny: 20*20).
+            # Stores owner snake idx for body cells (excluding tail), else -1.
+            occ = np.full((self.height, self.width), -1, dtype=np.int16)
+            for j in range(self.config.num_snakes):
+                if self.dead[j] or not self.snakes[j]:
+                    continue
+                for x, y in self.snakes[j][:-1]:
+                    if 0 <= x < self.width and 0 <= y < self.height:
+                        occ[y, x] = j
+
             dying_now = set()
+
+            # 1) Wall + body collisions
             for i in alive_indices:
                 nh = next_heads[i]
-                # Wall collision
+                if nh is None:
+                    continue
                 if not (0 <= nh[0] < self.width and 0 <= nh[1] < self.height):
-                    dying_now.add(i); rewards[i] += self.config.death_penalty
-                # Body collision (V41.0: Distinguish self vs other)
-                for j in range(self.config.num_snakes):
-                    if not self.dead[j] and nh in body_sets[j]:
-                        dying_now.add(i)
-                        if i == j:
-                            # Self-collision: heavier penalty to teach self-avoidance
-                            rewards[i] += self.config.self_collision_penalty
-                        else:
-                            # Hit opponent body: standard death penalty
-                            rewards[i] += self.config.death_penalty
-                            rewards[j] += self.config.kill_reward
-                # Head-on collision
-                for j in alive_indices:
-                    if i != j and nh == next_heads[j]:
-                        if len(self.snakes[i]) <= len(self.snakes[j]):
-                            dying_now.add(i); rewards[i] += self.config.death_penalty
-                        if len(self.snakes[j]) <= len(self.snakes[i]):
-                            dying_now.add(j); rewards[j] += self.config.death_penalty
+                    dying_now.add(i)
+                    rewards[i] += self.config.death_penalty
+                    continue
 
-            # Update State
+                owner = int(occ[nh[1], nh[0]])
+                if owner != -1 and not self.dead[owner]:
+                    dying_now.add(i)
+                    if owner == i:
+                        rewards[i] += self.config.self_collision_penalty
+                    else:
+                        rewards[i] += self.config.death_penalty
+                        rewards[owner] += self.config.kill_reward
+
+            # 2) Head-on collisions: group by next head position
+            head_groups: Dict[Tuple[int, int], List[int]] = {}
+            for i in alive_indices:
+                nh = next_heads[i]
+                if nh is not None:
+                    head_groups.setdefault(nh, []).append(i)
+
+            for pos, idxs in head_groups.items():
+                if len(idxs) <= 1:
+                    continue
+                lengths = [len(self.snakes[i]) for i in idxs]
+                max_len = max(lengths)
+                # Shorter (or equal) snakes die; if multiple tie for max, all survive (matches previous pairwise rule)
+                if lengths.count(max_len) == 1:
+                    winner = idxs[lengths.index(max_len)]
+                    for i in idxs:
+                        if i != winner:
+                            dying_now.add(i)
+                            rewards[i] += self.config.death_penalty
+                else:
+                    # all tied -> all die (pairwise rule with <= would kill both)
+                    for i in idxs:
+                        dying_now.add(i)
+                        rewards[i] += self.config.death_penalty
+
+            # 3) Apply state updates
             for i in alive_indices:
                 if i in dying_now:
-                    self._handle_death(i); dones[i] = True
+                    self._handle_death(i)
+                    dones[i] = True
+                    continue
+
+                nh = next_heads[i]
+                if nh is None:
+                    continue
+                self.snakes[i].insert(0, nh)
+                if nh in self.foods:
+                    rewards[i] += self.config.food_reward
+                    self.scores[i] += 1
+                    self.foods.remove(nh)
                 else:
-                    nh = next_heads[i]
-                    self.snakes[i].insert(0, nh)
-                    if nh in self.foods:
-                        rewards[i] += self.config.food_reward; self.scores[i] += 1
-                        self.foods.remove(nh)
-                    else:
-                        self.snakes[i].pop()
+                    self.snakes[i].pop()
 
         if len(self.foods) < self.config.min_food: self._spawn_food()
         
@@ -275,7 +307,7 @@ class BattleSnakeEnv:
         if self.dead[agent_idx]:
              return {
                  "vector": np.zeros(self.obs_dim, dtype=np.float32),
-                 "grid": np.zeros((5, self.height, self.width), dtype=np.float32)
+                 "grid": np.zeros((5, self.height, self.width), dtype=np.uint8)
              }
              
         head = self.snakes[agent_idx][0]
@@ -371,27 +403,27 @@ class BattleSnakeEnv:
         # Channel 2: Enemy Heads
         # Channel 3: Enemy Bodies
         # Channel 4: Obstacles (Walls are implicit by grid boundaries, here we mark them as 1 if outside)
-        grid = np.zeros((5, self.height, self.width), dtype=np.float32)
-        
-        # Food
-        for fx, fy in self.foods:
-            grid[0, fy, fx] = 1.0
-            
-        # Snakes
+        grid = np.zeros((5, self.height, self.width), dtype=np.uint8)
+
+        # Food (vectorized)
+        if self.foods:
+            fx, fy = zip(*self.foods)
+            grid[0, np.asarray(fy, dtype=np.intp), np.asarray(fx, dtype=np.intp)] = 1
+
+        # Snakes (vectorized per snake)
         for i in range(self.config.num_snakes):
-            if self.dead[i] or not self.snakes[i]: continue
-            
+            if self.dead[i] or not self.snakes[i]:
+                continue
+
             if i == agent_idx:
-                # Self Body
-                for bx, by in self.snakes[i]:
-                    grid[1, by, bx] = 1.0
+                bx, by = zip(*self.snakes[i])
+                grid[1, np.asarray(by, dtype=np.intp), np.asarray(bx, dtype=np.intp)] = 1
             else:
-                # Enemy Head
                 hx, hy = self.snakes[i][0]
-                grid[2, hy, hx] = 1.0
-                # Enemy Body
-                for bx, by in self.snakes[i][1:]:
-                    grid[3, by, bx] = 1.0
+                grid[2, hy, hx] = 1
+                if len(self.snakes[i]) > 1:
+                    bx, by = zip(*self.snakes[i][1:])
+                    grid[3, np.asarray(by, dtype=np.intp), np.asarray(bx, dtype=np.intp)] = 1
         
         # Channel 4 could be used for static obstacles if any, or specialized features. 
         # Here we leave it or fill with boundaries if needed (though CNN handles coords fine).
