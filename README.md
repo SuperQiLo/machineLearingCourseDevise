@@ -60,15 +60,27 @@ export SELF_PLAY_POOL_SIZE=30
 Battle 额外推荐（DQN/DDQN）：
 
 ```bash
-python train_dqn_variants.py --variant dqn --steps 3000000 \
-  --eps-start 0.5 --eps-min 0.05 \
-  --sp-prob-start 0.7 --sp-prob-end 0.4 --sp-prob-frac 0.3
+# 直接走课程脚本，但只调 Phase 2（battle）相关参数
+bash scripts/run_dqn_curriculum.sh dqn \
+  --eps-start2 0.5 --eps-min2 0.05 \
+  --sp-prob-start 0.7 --sp-prob-end 0.4 --sp-prob-frac 0.3 \
+  --finetune-lr-mult2 0.5 \
+  --save2 agent/checkpoints/dqn_battle_lr05.pth
 ```
 
 ### 3. 本地演示
 ```bash
 # 观看 PPO 冠军模型博弈
 python gui_game.py --mode battle --algo ppo --model agent/checkpoints/ppo_battle_best.pth
+```
+
+### 4. 离线评估（推荐用来判断“效果好不好”）
+
+GUI 的 battle 模式会给所有蛇加载同一个模型，容易出现“看起来不聪明/互相同归于尽/僵持”的错觉。
+建议先用离线评估脚本看 win rate vs random：
+
+```bash
+python eval_battle.py --algo dqn --model agent/checkpoints/dqn_battle.final.pth --episodes 200 --opponent random
 ```
 
 ## 🛠️ 深度技术规格 (V7.0 Balance)

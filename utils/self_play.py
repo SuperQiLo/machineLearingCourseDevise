@@ -13,7 +13,10 @@ class SelfPlayManager:
     def __init__(self, pool_dir: str, max_pool_size: int = 10):
         self.pool_dir = Path(pool_dir)
         self.pool_dir.mkdir(parents=True, exist_ok=True)
-        self.max_pool_size = max_pool_size
+        # Allow overriding pool size for better diversity in self-play.
+        # Example: SELF_PLAY_POOL_SIZE=50
+        env_max = os.getenv("SELF_PLAY_POOL_SIZE")
+        self.max_pool_size = int(env_max) if env_max else max_pool_size
         self.history_models: List[Path] = []
         self._refresh_pool()
 

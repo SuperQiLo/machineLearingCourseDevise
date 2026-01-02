@@ -8,6 +8,39 @@ sys.path.append(os.path.abspath(os.curdir))
 
 from env.battle_snake_env import BattleSnakeEnv, BattleSnakeConfig, Action
 
+_HAS_GYMNASIUM = True
+try:
+    from env.gymnasium_wrapper import make_gymnasium_env
+except Exception:
+    _HAS_GYMNASIUM = False
+
+
+def test_gymnasium_wrapper_full_obs_single_snake():
+    if not _HAS_GYMNASIUM:
+        print("[SKIP] gymnasium 未安装，跳过 gymnasium_wrapper 测试")
+        return
+    env = make_gymnasium_env(num_snakes=1, grid_size=20, return_full_obs=True)
+    obs, info = env.reset()
+    assert "full_obs_grids" in info and "full_obs_vecs" in info, "单蛇 reset 必须返回 full_obs_*"
+    assert info["full_obs_grids"].shape == (1, 5, 20, 20), "full_obs_grids 形状应为 (1,5,20,20)"
+    assert info["full_obs_vecs"].shape[0] == 1, "full_obs_vecs 第一维应为 1"
+
+    obs, reward, terminated, truncated, info2 = env.step(0)
+    assert "full_obs_grids" in info2 and "full_obs_vecs" in info2, "单蛇 step 必须返回 full_obs_*"
+    assert info2["full_obs_grids"].shape == (1, 5, 20, 20)
+    assert info2["full_obs_vecs"].shape[0] == 1
+
+
+def test_gymnasium_wrapper_full_obs_multi_snake():
+    if not _HAS_GYMNASIUM:
+        print("[SKIP] gymnasium 未安装，跳过 gymnasium_wrapper 测试")
+        return
+    env = make_gymnasium_env(num_snakes=2, grid_size=20, return_full_obs=True)
+    obs, info = env.reset()
+    assert "full_obs_grids" in info and "full_obs_vecs" in info
+    assert info["full_obs_grids"].shape == (2, 5, 20, 20)
+    assert info["full_obs_vecs"].shape[0] == 2
+
 def test_logic():
     print("--- 开始逻辑测试 ---")
     config = BattleSnakeConfig(width=20, height=20, num_snakes=2)
@@ -43,11 +76,44 @@ def test_logic():
     obs, rewards, dones, info = env.step([Action.STRAIGHT, Action.STRAIGHT])
     print(f"全灭后 dones: {dones}")
     assert all(dones), "全灭后游戏应结束！"
+
+    # 5. 验证只剩一条蛇时立刻结束（避免最后赢家继续移动撞死）
+    print("模拟只剩一条蛇存活...")
+    env = BattleSnakeEnv(config)
+    env.reset()
+    env.dead[1] = True
+    obs, rewards, dones, info = env.step([Action.STRAIGHT, Action.STRAIGHT])
+    print(f"只剩一条蛇存活 dones: {dones}, rewards: {rewards}")
+    assert all(dones), "只剩一条蛇存活时游戏应结束！"
+    assert rewards[0] > rewards[1], "赢家奖励应大于失败者惩罚！"
+
+    # 6. 验证“全员死亡”特例：赢家必须来自结束前上一时刻的存活蛇
+    print("模拟全员死亡且存在早死长蛇...")
+    config3 = BattleSnakeConfig(width=20, height=20, num_snakes=3)
+    env = BattleSnakeEnv(config3)
+    env.reset()
+    # P0 早死但身体很长（不应成为赢家）
+    env.dead[0] = True
+    env.snakes[0] = [(10, 10)] * 30
+    # P1/P2 存活，下一步直接撞墙同归于尽
+    env.dead[1] = False
+    env.dead[2] = False
+    env.snakes[1] = [(0, 0), (0, 1), (0, 2)]
+    env.snakes[2] = [(19, 0), (19, 1), (19, 2)]
+    from env.battle_snake_env import Direction
+    env.directions[1] = Direction.UP
+    env.directions[2] = Direction.UP
+    obs, rewards, dones, info = env.step([Action.STRAIGHT, Action.STRAIGHT, Action.STRAIGHT])
+    assert all(dones), "全员死亡后游戏应结束！"
+    assert bool(info.get("winner_all_dead", False)) is True, "全员死亡应标记 winner_all_dead"
+    assert info.get("winner_idx") in (1, 2), "赢家应来自结束前仍存活的蛇（P1/P2）"
     
     print("--- 逻辑测试通过！ ---")
 
 if __name__ == "__main__":
     try:
+        test_gymnasium_wrapper_full_obs_single_snake()
+        test_gymnasium_wrapper_full_obs_multi_snake()
         test_logic()
     except Exception as e:
         print(f"测试失败: {e}")

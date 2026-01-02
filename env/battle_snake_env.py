@@ -37,8 +37,8 @@ class BattleSnakeConfig:
     max_steps: int = 1000
     
     # Mechanics
-    # 延长冲刺持续时间
-    dash_duration_steps: int = 15
+    # 冲刺持续时间（步数）
+    dash_duration_steps: int = 5
     
     # Rewards
     food_reward: float = 20.0
@@ -75,6 +75,7 @@ class BattleSnakeEnv:
         self.dead: List[bool] = []
         self.scores: List[int] = []
         self.dash_durations: List[int] = [] # 新增：冲刺持续步数
+        self.pre_terminal_lengths: List[int] = []  # 记录“游戏结束前一时刻”的长度快照（用于全员死亡时判赢家）
         self.foods: List[Tuple[int, int]] = []
         self.steps = 0
         
@@ -96,6 +97,7 @@ class BattleSnakeEnv:
         self.dead = []
         self.scores = []
         self.dash_durations = []
+        self.pre_terminal_lengths = []
         self.steps = 0
         self.foods = []
         
@@ -117,11 +119,22 @@ class BattleSnakeEnv:
             self.dead.append(False)
             self.scores.append(0)
             self.dash_durations.append(0)
+            self.pre_terminal_lengths.append(len(self.snakes[-1]))
             
         self._spawn_food()
         return self._get_observations()
 
     def step(self, actions: List[int]) -> Tuple[List[ObservationDict], List[float], List[bool], Dict]:
+        # Snapshot lengths at the moment right before this step executes.
+        # Used for winner selection when the game ends with everyone dead.
+        # IMPORTANT: only count snakes that are alive at this moment.
+        self.pre_terminal_lengths = [
+            (len(self.snakes[i]) if (i < len(self.snakes) and self.snakes[i]) else 0)
+            if (i < len(self.dead) and not self.dead[i])
+            else 0
+            for i in range(self.config.num_snakes)
+        ]
+
         rewards = [self.config.step_penalty] * self.config.num_snakes
         dones = [False] * self.config.num_snakes
         self.steps += 1
@@ -255,24 +268,76 @@ class BattleSnakeEnv:
                     self.snakes[i].pop()
 
         if len(self.foods) < self.config.min_food: self._spawn_food()
-        
-        # 修改游戏结束规则：全灭或达到最大步数
-        game_over = all(self.dead) or self.steps >= self.config.max_steps
+
+        # 统一游戏结束规则：
+        # - 单人：蛇死亡或达到最大步数结束
+        # - 多人：只剩最后一条蛇存活（含全员死亡）或达到最大步数结束
+        def _is_alive(i: int) -> bool:
+            if i >= self.config.num_snakes:
+                return False
+            if i >= len(self.dead) or self.dead[i]:
+                return False
+            return i < len(self.snakes) and bool(self.snakes[i])
+
+        alive_idxs = [i for i in range(self.config.num_snakes) if _is_alive(i)]
+        alive_count = len(alive_idxs)
+
+        if self.config.num_snakes <= 1:
+            game_over = (not _is_alive(0)) or self.steps >= self.config.max_steps
+        else:
+            game_over = alive_count <= 1 or self.steps >= self.config.max_steps
+
+        winner_idx: Optional[int] = None
+        winner_len: int = 0
+        winner_is_all_dead: bool = False
+
+        if self.config.num_snakes <= 1:
+            if _is_alive(0):
+                winner_idx = 0
+                winner_len = len(self.snakes[0]) if (self.snakes and self.snakes[0]) else 0
+        else:
+            if alive_idxs:
+                # Winner = longest alive at game end (tie-break: score, then lower idx)
+                def _alive_key(i: int):
+                    cur_len = len(self.snakes[i]) if (i < len(self.snakes) and self.snakes[i]) else 0
+                    score = self.scores[i] if i < len(self.scores) else 0
+                    return (cur_len, score, -i)
+
+                winner_idx = max(alive_idxs, key=_alive_key)
+                winner_len = len(self.snakes[winner_idx]) if (winner_idx < len(self.snakes) and self.snakes[winner_idx]) else 0
+            else:
+                # All dead: winner = longest among those alive at the moment right before game over.
+                winner_is_all_dead = True
+
+                def _dead_key(i: int):
+                    pre_len = self.pre_terminal_lengths[i] if i < len(self.pre_terminal_lengths) else 0
+                    score = self.scores[i] if i < len(self.scores) else 0
+                    return (pre_len, score, -i)
+
+                winner_idx = max(range(self.config.num_snakes), key=_dead_key)
+                winner_len = self.pre_terminal_lengths[winner_idx] if winner_idx < len(self.pre_terminal_lengths) else 0
+
         if game_over:
             for i in range(self.config.num_snakes): dones[i] = True
             
-            # V10.0: Inject Terminal Tournament Rewards
-            if self.config.num_snakes > 1:
-                lengths = [len(s) for s in self.snakes]
-                max_len = max(lengths) if lengths else 0
-                if max_len > 0:
-                    for i in range(self.config.num_snakes):
-                        if lengths[i] == max_len:
-                            rewards[i] += self.config.win_reward
-                        else:
-                            rewards[i] += self.config.loss_penalty
+            # 终局奖励：多人模式给赢家 win_reward，其余给 loss_penalty
+            if self.config.num_snakes > 1 and winner_idx is not None:
+                for i in range(self.config.num_snakes):
+                    rewards[i] += self.config.win_reward if i == winner_idx else self.config.loss_penalty
         
-        return self._get_observations(), rewards, dones, {"scores": self.scores}
+        info = {
+            "scores": self.scores,
+            "game_over": game_over,
+            "alive_count": alive_count,
+            "winner_idx": winner_idx,
+            "winner_len": winner_len,
+            "winner_all_dead": winner_is_all_dead,
+            "pre_terminal_lengths": self.pre_terminal_lengths,
+            # Backward-compat alias (was briefly used as "max_lengths")
+            "max_lengths": self.pre_terminal_lengths,
+        }
+
+        return self._get_observations(), rewards, dones, info
 
     def _handle_death(self, idx: int):
         self.dead[idx] = True

@@ -1,6 +1,7 @@
 #!/bin/bash
 # run_ppo_curriculum.sh
-# Usage: ./scripts/run_ppo_curriculum.sh
+# Usage: ./scripts/run_ppo_curriculum.sh [flags...]
+# Forwards flags to train_ppo_curriculum.py (e.g. --steps1/2, --lr1/2, --target-kl*, --envs*, --rollout-steps*, --update-epochs*, --minibatch-size*)
 
 # 1. Setup directories
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

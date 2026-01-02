@@ -58,6 +58,13 @@ def train_ppo(
     pool_dir: str,
     self_play_prob: float,
     lr: float,
+    target_kl: float,
+    finetune_lr: Optional[float] = None,
+    finetune_lr_mult: float = 0.25,
+    finetune_target_kl: float = 0.030,
+    rollout_steps: Optional[int] = None,
+    update_epochs: Optional[int] = None,
+    minibatch_size: Optional[int] = None,
     seed: int = 0,
 ) -> None:
     random.seed(seed)
@@ -66,6 +73,9 @@ def train_ppo(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log(f">>> [PPO-Turbo] Device={device} | snakes={num_snakes} | envs={num_envs} | steps={total_timesteps}")
+
+    obs_dtype = torch.float16 if device.type == 'cuda' else torch.float32
+    use_amp = (device.type == 'cuda')
 
     Path("agent/checkpoints").mkdir(parents=True, exist_ok=True)
     sp_manager = SelfPlayManager(pool_dir)
@@ -101,16 +111,17 @@ def train_ppo(
     optimizer = optim.Adam(model.parameters(), lr=lr, eps=1e-5)
     scaler = GradScaler('cuda', enabled=(device.type == 'cuda'))
 
-    # PPO hyperparams (Optimized for Throughput)
-    num_steps = 512 if num_snakes == 1 else 1024 
-    update_epochs = 4 # V18.2: Increased to 4 for better sample reuse
+    # PPO hyperparams (Recommended defaults: stable + lower memory/CPU pressure)
+    # Note: PPO is update-heavy; reducing rollout/update cost prevents OOM/-9 kills on smaller machines.
+    num_steps = (256 if num_snakes == 1 else 512) if rollout_steps is None else int(rollout_steps)
+    update_epochs = 2 if update_epochs is None else int(update_epochs)
     gamma = 0.99
     gae_lambda = 0.95
     clip_coef = 0.20
     ent_start = 0.08 if num_snakes == 1 else 0.12 
     ent_min = 0.02
     lr_init = lr
-    target_kl = 0.015 
+    target_kl = float(target_kl)
     vf_coef = 0.5            # Value function coefficient
     ent_coef_weight = 0.01   # Policy entropy coefficient weight
     max_grad_norm = 0.5      # Gradient clipping
@@ -120,22 +131,24 @@ def train_ppo(
     # Prevent Policy Collapse in Phase 2 by boosting entropy and relaxing KL
     is_finetune = load_path is not None
     if is_finetune:
-        lr_init = lr * 0.25      # Lower LR for stable fine-tuning
+        if finetune_lr is not None:
+            lr_init = float(finetune_lr)
+        else:
+            lr_init = lr * float(finetune_lr_mult)  # Lower LR for stable fine-tuning
         ent_start = 0.12         # V29.0: Boosted from 0.05 to force exploration in Battle Mode
-        target_kl = 0.030        # V29.0: Relaxed from 0.010 to allow adaptation to new dynamics
+        target_kl = float(finetune_target_kl)        # V29.0: Relaxed from 0.010 to allow adaptation to new dynamics
         log(f">>> [PPO-Turbo] Fine-tuning mode: LR={lr_init:.2e}, Ent={ent_start}, KL={target_kl}")
 
-    # V19.0: Increase num_envs for multi-snake to boost FPS
-    if num_snakes > 1:
-        num_envs = 96 # Increased from 64
-        log(f">>> [PPO-Turbo] Multi-snake mode: Increased envs to {num_envs} for FPS")
+    # Keep user-provided num_envs; no auto-bump by default (stability-first).
 
     batch_size = num_envs * num_steps
-    minibatch_size = 2048 
+    minibatch_size = 4096 if minibatch_size is None else int(minibatch_size)
     if minibatch_size > batch_size:
         minibatch_size = batch_size
 
     log(f">>> [PPO-Turbo] Initializing Parallel Environments...")
+
+    use_model_opps = (num_snakes > 1 and float(self_play_prob) > 0.0)
     
     def env_creator():
         # Configuration for battle or navigation
@@ -169,7 +182,13 @@ def train_ppo(
         mfn = reward_cfg.pop("min_food", 2)
         gs = reward_cfg.pop("width", 20)
         ns = reward_cfg.pop("num_snakes", num_snakes) # Ensure no double-passing
-        return make_gymnasium_env(num_snakes=ns, grid_size=gs, min_food=mfn, **reward_cfg)
+        return make_gymnasium_env(
+            num_snakes=ns,
+            grid_size=gs,
+            min_food=mfn,
+            return_full_obs=use_model_opps,
+            **reward_cfg,
+        )
 
     # Use AsyncVectorEnv for true multi-process parallelism
     envs = gym.vector.AsyncVectorEnv([env_creator for _ in range(num_envs)])
@@ -191,7 +210,8 @@ def train_ppo(
                 opp_model_paths[e_idx][s_idx] = None
     
     for i in range(num_envs):
-        assign_opps(i)
+        if use_model_opps:
+            assign_opps(i)
 
     # Model cache for opponents to avoid reloading
     opp_model_cache: Dict[str, Tuple[float, nn.Module]] = {}
@@ -215,10 +235,9 @@ def train_ppo(
         except: return None
 
     # V18.0: Pre-allocate Rollout Buffers (directly on device)
-    # Using float32 for observation grids to match network input
-    # (Memory usage: 128 envs * 512 steps * 5*20*20 * 4 bytes ≈ 130MB, well within GPU memory)
-    b_obs_grid = torch.zeros((num_steps, num_envs, 5, 20, 20), device=device)
-    b_obs_vec = torch.zeros((num_steps, num_envs, 28), device=device)
+    # Use fp16 on CUDA to cut transfer bandwidth + memory.
+    b_obs_grid = torch.zeros((num_steps, num_envs, 5, 20, 20), dtype=obs_dtype, device=device)
+    b_obs_vec = torch.zeros((num_steps, num_envs, 28), dtype=obs_dtype, device=device)
     b_actions = torch.zeros((num_steps, num_envs), dtype=torch.long, device=device)
     b_logprobs = torch.zeros((num_steps, num_envs), device=device)
     b_rewards = torch.zeros((num_steps, num_envs), device=device)
@@ -250,9 +269,9 @@ def train_ppo(
             
             # Map observations to tensors (Optimized with pre-allocated buffer)
             # obs['grid'] is (num_envs, 5, 20, 20), obs['vector'] is (num_envs, 28)
-            with torch.no_grad():
-                t_grid = torch.as_tensor(obs['grid'], dtype=torch.float32, device=device)
-                t_vec = torch.as_tensor(obs['vector'], dtype=torch.float32, device=device)
+            with torch.inference_mode(), autocast('cuda', enabled=use_amp):
+                t_grid = torch.as_tensor(obs['grid'], dtype=obs_dtype, device=device)
+                t_vec = torch.as_tensor(obs['vector'], dtype=obs_dtype, device=device)
                 
                 b_obs_grid[step].copy_(t_grid)
                 b_obs_vec[step].copy_(t_vec)
@@ -268,36 +287,41 @@ def train_ppo(
             all_actions[:, 0] = a.cpu().numpy()
             
             if num_snakes > 1:
-                # Only move opponent observations needed for model inference.
-                # Random opponents don't need GPU copies.
-                full_grids = info["full_obs_grids"].reshape(total_snakes, 5, 20, 20)
-                full_vecs = info["full_obs_vecs"].reshape(total_snakes, -1)
+                if use_model_opps and ("full_obs_grids" in info) and ("full_obs_vecs" in info):
+                    # Only move opponent observations needed for model inference.
+                    # Random opponents don't need GPU copies.
+                    full_grids = info["full_obs_grids"].reshape(total_snakes, 5, 20, 20)
+                    full_vecs = info["full_obs_vecs"].reshape(total_snakes, -1)
 
-                groups: Dict[nn.Module, List[int]] = {}
-                for e_idx in range(num_envs):
-                    for s_idx in range(1, num_snakes):
-                        idx = e_idx * num_snakes + s_idx
-                        m_path = opp_model_paths[e_idx][s_idx]
-                        if not m_path:
-                            all_actions[e_idx, s_idx] = random.randint(0, 3)
-                            continue
-                        m = get_cached_model(m_path)
-                        if not m:
-                            all_actions[e_idx, s_idx] = random.randint(0, 3)
-                            continue
-                        groups.setdefault(m, []).append(idx)
+                    groups: Dict[nn.Module, List[int]] = {}
+                    for e_idx in range(num_envs):
+                        for s_idx in range(1, num_snakes):
+                            idx = e_idx * num_snakes + s_idx
+                            m_path = opp_model_paths[e_idx][s_idx]
+                            if not m_path:
+                                all_actions[e_idx, s_idx] = random.randint(0, 3)
+                                continue
+                            m = get_cached_model(m_path)
+                            if not m:
+                                all_actions[e_idx, s_idx] = random.randint(0, 3)
+                                continue
+                            groups.setdefault(m, []).append(idx)
 
-                # Per-model batched inference; only copy the required rows.
-                for m, idx_list in groups.items():
-                    with torch.no_grad():
-                        g = torch.as_tensor(full_grids[idx_list], dtype=torch.float32, device=device)
-                        v = torch.as_tensor(full_vecs[idx_list], dtype=torch.float32, device=device)
-                        logits, _ = m(g, v)
-                        acts = logits.argmax(dim=1).to(dtype=torch.int32).cpu().numpy()
-                        for i, idx in enumerate(idx_list):
-                            e_i = idx // num_snakes
-                            s_i = idx % num_snakes
-                            all_actions[e_i, s_i] = int(acts[i])
+                    # Per-model batched inference; only copy the required rows.
+                    for m, idx_list in groups.items():
+                        with torch.inference_mode(), autocast('cuda', enabled=use_amp):
+                            g = torch.as_tensor(full_grids[idx_list], dtype=obs_dtype, device=device)
+                            v = torch.as_tensor(full_vecs[idx_list], dtype=obs_dtype, device=device)
+                            logits, _ = m(g, v)
+                            acts = logits.argmax(dim=1).to(dtype=torch.int32).cpu().numpy()
+                            for i, idx in enumerate(idx_list):
+                                e_i = idx // num_snakes
+                                s_i = idx % num_snakes
+                                all_actions[e_i, s_i] = int(acts[i])
+                else:
+                    for e_idx in range(num_envs):
+                        for s_idx in range(1, num_snakes):
+                            all_actions[e_idx, s_idx] = random.randint(0, 3)
 
             # Step Environments (Async)
             # Note: We need to pass the multi-agent actions. 
@@ -322,14 +346,15 @@ def train_ppo(
                 if next_terminated[e_idx] or next_truncated[e_idx]:
                     ep_returns.append(float(running_return[e_idx]))
                     running_return[e_idx] = 0.0
-                    assign_opps(e_idx) # Re-assign for next episode
+                    if use_model_opps:
+                        assign_opps(e_idx) # Re-assign for next episode
 
             obs, info = next_obs, next_info
 
         # Bootstrap Value
-        with torch.no_grad():
-            t_grid = torch.as_tensor(obs['grid'], dtype=torch.float32, device=device)
-            t_vec = torch.as_tensor(obs['vector'], dtype=torch.float32, device=device)
+        with torch.inference_mode(), autocast('cuda', enabled=use_amp):
+            t_grid = torch.as_tensor(obs['grid'], dtype=obs_dtype, device=device)
+            t_vec = torch.as_tensor(obs['vector'], dtype=obs_dtype, device=device)
             next_value = model.get_value(t_grid, t_vec).squeeze(-1)
 
         # GAE
@@ -433,13 +458,25 @@ if __name__ == "__main__":
     p.add_argument("--single", action="store_true")
     p.add_argument("--load", type=str, default=None)
     p.add_argument("--steps", type=int, default=10_000_000) # V18.3: 10M for deep mastery
+    p.add_argument("--envs", type=int, default=None, help="Number of parallel envs (overrides default).")
+    p.add_argument("--rollout-steps", type=int, default=None, help="Rollout steps per env before each PPO update.")
+    p.add_argument("--update-epochs", type=int, default=None, help="PPO update epochs per rollout (more = slower, more reuse).")
+    p.add_argument("--minibatch-size", type=int, default=None, help="Minibatch size for PPO updates.")
+    p.add_argument("--lr", type=float, default=None, help="Base learning rate (before fine-tune scaling).")
+    p.add_argument("--target-kl", type=float, default=0.015, help="KL early-stop threshold for PPO updates.")
+    p.add_argument("--finetune-lr", type=float, default=None, help="Override fine-tune LR directly (only when --load is set).")
+    p.add_argument("--finetune-lr-mult", type=float, default=0.25, help="Fine-tune LR multiplier applied to --lr (only when --load is set, ignored if --finetune-lr is set).")
+    p.add_argument("--finetune-target-kl", type=float, default=0.030, help="Fine-tune KL early-stop threshold (only when --load is set).")
+    p.add_argument("--self-play-prob", type=float, default=None, help="Battle self-play probability for opponent snakes (0 disables self-play).")
     args = p.parse_args()
 
-    # V18.0: Turbo Hyperparams
+    # Recommended defaults (stable across GPUs/CPUs)
     num_snakes = 1 if args.single else 4
-    num_envs = 128 if args.single else 64 
-    base_lr = 2.0e-4 if args.single else 1.5e-4
+    num_envs = (64 if args.single else 64) if args.envs is None else int(args.envs)
+    base_lr = (2.0e-4 if args.single else 1.5e-4) if args.lr is None else float(args.lr)
     ckpt = "agent/checkpoints/ppo_best.pth" if args.single else "agent/checkpoints/ppo_battle_best.pth"
+
+    self_play_prob = (0.3 if num_snakes > 1 else 0.0) if args.self_play_prob is None else float(args.self_play_prob)
 
     train_ppo(
         num_envs=num_envs,
@@ -448,6 +485,13 @@ if __name__ == "__main__":
         load_path=args.load,
         checkpoint_path=ckpt,
         pool_dir="agent/pool/ppo",
-        self_play_prob=0.3 if num_snakes > 1 else 0.0,
+        self_play_prob=self_play_prob,
         lr=base_lr,
+        target_kl=float(args.target_kl),
+        finetune_lr=args.finetune_lr,
+        finetune_lr_mult=float(args.finetune_lr_mult),
+        finetune_target_kl=float(args.finetune_target_kl),
+        rollout_steps=args.rollout_steps,
+        update_epochs=args.update_epochs,
+        minibatch_size=args.minibatch_size,
     )

@@ -5,8 +5,8 @@ Used by both local GUI and network clients.
 """
 
 from PyQt6.QtWidgets import QWidget
-from PyQt6.QtCore import Qt, QPoint
-from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QRadialGradient
+from PyQt6.QtCore import Qt, QPoint, pyqtSignal
+from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QRadialGradient, QMouseEvent
 
 # Define Colors centrally
 COLOR_BG = QColor(25, 30, 45)
@@ -30,6 +30,7 @@ class GameRenderer(QWidget):
         "dead": [bool, ...],
     }
     """
+    clicked = pyqtSignal() # V7.6: Signal for screen clicks
     def __init__(self, parent=None, grid_size=20):
         super().__init__(parent)
         self.grid_size = grid_size
@@ -39,7 +40,10 @@ class GameRenderer(QWidget):
         self.food = []
         self.dead = []
         self.player_id = -1 # ID to highlight
+        self.winner_id = -1 # V7.5: Winner of the last match
         self.countdown = 0  # V7.2: Countdown overlay
+        self.server_state = "WAITING" # V7.5: Track state local
+        self.player_names = [] # V7.7: Global player names
         
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         
@@ -111,8 +115,8 @@ class GameRenderer(QWidget):
                 font = painter.font(); font.setBold(True); painter.setFont(font)
                 painter.drawText(hcx - 12, hcy - 20, "YOU")
 
-        # 4. Countdown Overlay (V7.2)
-        if self.countdown > 0:
+        # 4. Countdown Overlay (V7.2) - ONLY show in COUNTDOWN state
+        if self.server_state == "COUNTDOWN" and self.countdown > 0:
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(0, 0, 0, 150))
             painter.drawRect(self.rect())
@@ -127,3 +131,60 @@ class GameRenderer(QWidget):
             font.setPointSize(24)
             painter.setFont(font)
             painter.drawText(self.rect().adjusted(0, 150, 0, 0), Qt.AlignmentFlag.AlignCenter, "GET READY!")
+
+        # 5. MVP/Result Overlay (V7.5)
+        if self.server_state == "RESULT":
+            self.draw_result(painter)
+
+    def draw_result(self, painter: QPainter):
+        # Semi-transparent overlay
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 180))
+        painter.drawRect(self.rect())
+
+        if self.winner_id is not None and self.winner_id != -1:
+            base_color = COLORS_SNAKE[int(self.winner_id) % len(COLORS_SNAKE)]
+            
+            # Glow behind text
+            center = self.rect().center()
+            grad = QRadialGradient(float(center.x()), float(center.y()), float(self.width() * 0.5))
+            grad.setColorAt(0, QColor(base_color.red(), base_color.green(), base_color.blue(), 100))
+            grad.setColorAt(1, QColor(base_color.red(), base_color.green(), base_color.blue(), 0))
+            painter.setBrush(grad)
+            painter.drawEllipse(self.rect().center(), self.width()//2, self.height()//2)
+
+            # Draw "MVP VICTORY"
+            painter.setPen(base_color)
+            font = painter.font()
+            font.setPointSize(60); font.setBold(True)
+            painter.setFont(font)
+            painter.drawText(self.rect().adjusted(0, -100, 0, 0), Qt.AlignmentFlag.AlignCenter, "MVP VICTORY")
+
+            # Winner Name
+            painter.setPen(Qt.GlobalColor.white)
+            font.setPointSize(48)
+            painter.setFont(font)
+            
+            name = self.player_names[self.winner_id] if self.winner_id < len(self.player_names) else f"PLAYER {self.winner_id}"
+            winner_text = ("YOU WON!" if self.winner_id == self.player_id else f"{name} WON!")
+            painter.drawText(self.rect().adjusted(0, 50, 0, 0), Qt.AlignmentFlag.AlignCenter, winner_text)
+
+            # Score or Subtext
+            font.setPointSize(20)
+            painter.setFont(font)
+            painter.drawText(self.rect().adjusted(0, 150, 0, 0), Qt.AlignmentFlag.AlignCenter, "[ CLICK ANYWHERE TO RETURN TO LOBBY ]")
+        else:
+            # Draw "DRAW GAME"
+            painter.setPen(Qt.GlobalColor.gray)
+            font = painter.font(); font.setPointSize(60); font.setBold(True)
+            painter.setFont(font)
+            painter.drawText(self.rect().adjusted(0, -50, 0, 0), Qt.AlignmentFlag.AlignCenter, "DRAW GAME")
+            
+            font.setPointSize(20)
+            painter.setFont(font)
+            painter.drawText(self.rect().adjusted(0, 150, 0, 0), Qt.AlignmentFlag.AlignCenter, "[ CLICK ANYWHERE TO CONTINUE ]")
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if self.server_state == "RESULT":
+            self.clicked.emit()
+        super().mousePressEvent(event)

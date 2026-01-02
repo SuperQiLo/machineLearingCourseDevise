@@ -174,13 +174,18 @@ class GameWindow(QMainWindow):
                     QProgressBar::chunk {{ background-color: {chunk_color}; border-radius: 4px; }}
                 """)
             
-        if all(dones) and not self.is_resetting:
+        game_over = bool(info.get("game_over", all(dones)))
+        winner_idx = info.get("winner_idx", None)
+        winner_len = info.get("winner_len", None)
+
+        if game_over and not self.is_resetting:
             self.is_resetting = True
             self.timer.stop() # 停止计时器，防止多次进入此逻辑
-            # 找到最长的蛇（或得分最高，根据需求是结束前最长的蛇）
-            lengths = [len(s) if s else 0 for s in self.env.snakes]
-            winner_idx = np.argmax(lengths)
-            winner_msg = f"Winner: P{winner_idx} (Len: {lengths[winner_idx]})"
+            if winner_idx is None:
+                winner_msg = "Winner: None"
+            else:
+                wl = int(winner_len) if winner_len is not None else (len(self.env.snakes[winner_idx]) if self.env.snakes[winner_idx] else 0)
+                winner_msg = f"Winner: P{winner_idx} (Len: {wl})"
             self.status_label.setText(f"Game Over! {winner_msg}")
             print(f"Game Over! Final Scores: {scores}, {winner_msg}")
             QTimer.singleShot(5000, self.reset_game)

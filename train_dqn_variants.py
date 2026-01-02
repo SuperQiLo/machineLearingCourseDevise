@@ -60,6 +60,30 @@ from agent.per_dqn import PERDQNNet, PERDQNAgent
 from agent.dueling_dqn import DuelingDQNNet, DuelingDQNAgent
 from utils.self_play import SelfPlayManager
 
+
+def _normalize_variant(v: str) -> str:
+    """Normalize user-facing variant names to internal canonical names.
+
+    Canonical variants:
+      - dqn
+      - ddqn
+      - per        (DDQN + PER)
+      - dueling    (DDQN + PER + Dueling)
+    """
+    v0 = (v or "").strip().lower()
+    v1 = v0.replace("+", "_").replace("-", "_")
+    if v1 in {"dqn"}:
+        return "dqn"
+    if v1 in {"ddqn"}:
+        return "ddqn"
+    if v1 in {"per", "ddqn_per", "ddqn_per_nodueling", "ddqnper"}:
+        return "per"
+    if v1 in {"dueling", "ddqn_per_dueling", "per_dueling", "ddqnperdueling"}:
+        return "dueling"
+    raise ValueError(
+        f"Unknown variant '{v}'. Use one of: dqn, ddqn, per(=ddqn+per), dueling(=ddqn+per+dueling)."
+    )
+
 # V17.4: AMP for faster GPU training (Updated API for PyTorch 2.x)
 from torch.amp import autocast, GradScaler
 
@@ -255,9 +279,10 @@ class PrioritizedReplayBuffer:
 
 @dataclass
 class TrainConfig:
-    variant: str = "dqn" # dqn, ddqn, per, dueling
+    variant: str = "dqn" # dqn, ddqn, per(=ddqn+per), dueling(=ddqn+per+dueling)
     total_frames: int = 5_000_000 
     num_envs: int = 64 # V26.0: Optimal IPC for A6000 Phase 2
+    num_envs_override: Optional[int] = None
     batch_size: int = 512 
     lr: float = 1e-4
     eps_decay: int = 0  
@@ -266,7 +291,8 @@ class TrainConfig:
     pool_dir: str = "agent/pool/dqn"
     save_path: str = "agent/checkpoints/dqn_best.pth"
     load_path: Optional[str] = None
-    self_play_prob: float = 0.5
+    # Recommended defaults for best performance in battle/self-play
+    self_play_prob: float = 0.6
     buffer_size: int = 200_000 # V17.4: Reduced to 200k for much faster sampling
     single_snake: bool = False
     # Exploration (can override via CLI)
@@ -274,12 +300,18 @@ class TrainConfig:
     eps_min: Optional[float] = None
 
     # Self-play probability schedule (front-high then low)
-    self_play_prob_start: Optional[float] = None
-    self_play_prob_end: Optional[float] = None
+    # Defaults tuned for stronger generalization: more self-play early, more randomness later.
+    self_play_prob_start: Optional[float] = 0.7
+    self_play_prob_end: Optional[float] = 0.4
     self_play_prob_frac: float = 0.30
+
+    # Fine-tune learning rate multiplier when --load is used.
+    finetune_lr_mult: float = 0.5
 
 class DQNVariantTrainer:
     def __init__(self, cfg: TrainConfig):
+        # Normalize variants early (support DDQN+PER naming requested by user)
+        cfg.variant = _normalize_variant(cfg.variant)
         self.cfg = cfg  # FIXED: Restored self.cfg assignment
 
         # Curriculum correctness: when running Phase 1 ("single"), force a true single-snake env.
@@ -306,15 +338,21 @@ class DQNVariantTrainer:
         self.cfg.eps_decay = self.decay_steps
 
         # V35.0 Aggressive Optimization: Reduce overhead
+        # Respect explicit overrides for A6000 benchmarking.
+        if cfg.num_envs_override is not None:
+            self.cfg.num_envs = int(cfg.num_envs_override)
+        else:
+            if not cfg.single_snake:
+                self.cfg.num_envs = 32 # Reduced from 64 to save CPU/Memory
+            else:
+                self.cfg.num_envs = 128
+
         if not cfg.single_snake:
-            self.cfg.num_envs = 32 # Reduced from 64 to save CPU/Memory
             self.active_rivals = [] # Global Active Rival models (paths)
             # Reduce FPS spikes from frequent model refresh/load.
             # Can override via env var for experiments.
             self.rival_update_interval = int(os.getenv("RIVAL_UPDATE_INTERVAL", "50000"))
             self.next_rival_update = 0
-        else:
-            self.cfg.num_envs = 128
         
         # Opponent Grouping Cache
         self.cached_opp_groups = {}
@@ -324,7 +362,7 @@ class DQNVariantTrainer:
         num_snakes = cfg.num_snakes
         if cfg.single_snake:
             # Phase 1: High Exploration & Robust Learning
-            default_eps_start, default_eps_min = 1.0, 0.1
+            default_eps_start, default_eps_min = 1.0, 0.05
             self.batch_size = 1024 # V21.1: Increased for GPU saturation
             if v == "dqn":
                 self.lr, self.tau = 1.5e-4, 0.002
@@ -332,7 +370,7 @@ class DQNVariantTrainer:
                 self.lr, self.tau = 2.0e-4, 0.005
         else:
             # Phase 2: High Stability & Combat Precision
-            default_eps_start, default_eps_min = 0.3, 0.05
+            default_eps_start, default_eps_min = 0.5, 0.10
             self.batch_size = 1024 # V21.1: Increased
             if v == "dqn":
                 self.lr, self.tau = 1.0e-4, 0.002
@@ -347,6 +385,13 @@ class DQNVariantTrainer:
         self.sp_prob_start = float(cfg.self_play_prob_start) if cfg.self_play_prob_start is not None else float(cfg.self_play_prob)
         self.sp_prob_end = float(cfg.self_play_prob_end) if cfg.self_play_prob_end is not None else float(cfg.self_play_prob)
         self.sp_prob_frac = float(cfg.self_play_prob_frac) if cfg.self_play_prob_frac is not None else 0.30
+
+        # If self-play is fully disabled, avoid requesting full observations and avoid opponent model inference.
+        self.use_model_opps = (
+            (not cfg.single_snake)
+            and (cfg.num_snakes > 1)
+            and (max(self.sp_prob_start, self.sp_prob_end, float(cfg.self_play_prob)) > 0.0)
+        )
             
         self.grad_clip = 0.5 
         
@@ -406,7 +451,8 @@ class DQNVariantTrainer:
                  # Only passed if present in BattleSnakeConfig
                  kill_reward=getattr(env_cfg, 'kill_reward', 150.0),
                  win_reward=getattr(env_cfg, 'win_reward', 800.0),
-                 loss_penalty=getattr(env_cfg, 'loss_penalty', -200.0)
+                 loss_penalty=getattr(env_cfg, 'loss_penalty', -200.0),
+                 return_full_obs=self.use_model_opps,
              )
         self.envs = gym.vector.AsyncVectorEnv([env_fn for _ in range(cfg.num_envs)])
         log(">>> [V18.3 Turbo] Environments Ready.")
@@ -435,7 +481,7 @@ class DQNVariantTrainer:
             # Clean Prefix: Handle models saved with torch.compile enabled
             sd = { k.replace("_orig_mod.", ""): v for k, v in sd.items() }
             self.policy_net.load_state_dict(sd)
-            self.lr = self.lr * 0.25 
+            self.lr = self.lr * float(getattr(cfg, "finetune_lr_mult", 0.25))
             log(f">>> [V22.0] Fine-tuning mode: Lowered LR to {self.lr:.2e}")
             
         # 2. Sync target net
@@ -607,61 +653,91 @@ class DQNVariantTrainer:
         current_actions = torch.empty(total_snakes, dtype=torch.int32, device=self.device)
         
         # V26.0 Initialization
-        self.opp_model_paths = [([None] * num_snakes) for _ in range(self.cfg.num_envs)]
-        self._rebuild_opp_groups()
+        if self.use_model_opps:
+            self.opp_model_paths = [([None] * num_snakes) for _ in range(self.cfg.num_envs)]
+            self._rebuild_opp_groups()
         
         while self.steps < total_frames:
             self.steps += self.cfg.num_envs
             completion = min(1.0, self.steps / self.decay_steps)
             eps = max(self.eps_min, self.eps_start - completion * (self.eps_start - self.eps_min))
             
-            # 1. Faster batch creation (V34.0)
-            # Transfer grids as uint8 to reduce PCIe bandwidth, then cast on GPU.
-            # `full_obs_grids` is uint8 (0/1) so float conversion is pure overhead on CPU.
-            all_g_u8 = torch.from_numpy(info["full_obs_grids"]).view(total_snakes, 5, 20, 20)
-            all_v_f32 = torch.from_numpy(info["full_obs_vecs"]).view(total_snakes, -1)
-
-            t_all_g_u8 = all_g_u8.to(self.device, non_blocking=True)
-            t_all_v = all_v_f32.to(self.device, non_blocking=True)
-            
-            # 2. Optimized Inference (V34.0: Direct assignment, no clones)
-            with torch.inference_mode(), autocast('cuda', enabled=self.use_amp):
-                # Cast on GPU (prefer fp16 when on CUDA for throughput)
-                grid_dtype = torch.float16 if (self.device.type == "cuda") else torch.float32
-                t_all_g = t_all_g_u8.to(dtype=grid_dtype)
-                if self.device.type == "cuda":
-                    t_all_g = t_all_g.contiguous(memory_format=torch.channels_last)
-
-                # A. Policy Forward
-                q_vals = self.policy_net(t_all_g[learner_map], t_all_v[learner_map])
-                la = q_vals.argmax(dim=1).to(torch.int32)
-                
-                # B. Epsilon-Greedy (One-shot)
-                if eps > 0:
-                    rv = torch.rand(self.cfg.num_envs, device=self.device)
-                    la = torch.where(
-                        rv < eps,
-                        torch.randint(0, 4, (self.cfg.num_envs,), device=self.device, dtype=torch.int32),
-                        la,
+            # 1-2. Action selection
+            if self.use_model_opps:
+                # Faster batch creation (V34.0)
+                # Transfer grids as uint8 to reduce PCIe bandwidth, then cast on GPU.
+                full_grids = info.get("full_obs_grids") if isinstance(info, dict) else None
+                full_vecs = info.get("full_obs_vecs") if isinstance(info, dict) else None
+                if full_grids is None or full_vecs is None:
+                    raise KeyError(
+                        "Missing 'full_obs_grids'/'full_obs_vecs' in env info for multi-snake mode. "
+                        "Ensure the Gymnasium wrapper returns full observations (return_full_obs=True)."
                     )
-                current_actions[learner_map] = la
-                
-                # C. Opponents (V34.0: Batch cache check)
-                for m_path, idxs in self.cached_opp_groups.items():
-                    if m_path is None:
-                        current_actions[idxs] = torch.randint(
-                            0, 4, (len(idxs),), device=self.device, dtype=torch.int32
+
+                all_g_u8 = torch.from_numpy(full_grids).view(total_snakes, 5, 20, 20)
+                all_v_f32 = torch.from_numpy(full_vecs).view(total_snakes, -1)
+
+                t_all_g_u8 = all_g_u8.to(self.device, non_blocking=True)
+                t_all_v = all_v_f32.to(self.device, non_blocking=True)
+
+                with torch.inference_mode(), autocast('cuda', enabled=self.use_amp):
+                    grid_dtype = torch.float16 if (self.device.type == "cuda") else torch.float32
+                    t_all_g = t_all_g_u8.to(dtype=grid_dtype)
+                    if self.device.type == "cuda":
+                        t_all_g = t_all_g.contiguous(memory_format=torch.channels_last)
+
+                    # A. Learner
+                    q_vals = self.policy_net(t_all_g[learner_map], t_all_v[learner_map])
+                    la = q_vals.argmax(dim=1).to(torch.int32)
+                    if eps > 0:
+                        rv = torch.rand(self.cfg.num_envs, device=self.device)
+                        la = torch.where(
+                            rv < eps,
+                            torch.randint(0, 4, (self.cfg.num_envs,), device=self.device, dtype=torch.int32),
+                            la,
                         )
-                    else:
-                        m = self._get_opp_model(m_path)
-                        if m:
-                            current_actions[idxs] = m(t_all_g[idxs], t_all_v[idxs]).argmax(dim=1).to(torch.int32)
-                
-                actions_cpu.copy_(current_actions, non_blocking=True)
-                all_actions_flat_np = actions_cpu.numpy()
+                    current_actions[learner_map] = la
+
+                    # B. Opponents
+                    for m_path, idxs in self.cached_opp_groups.items():
+                        if m_path is None:
+                            current_actions[idxs] = torch.randint(
+                                0, 4, (len(idxs),), device=self.device, dtype=torch.int32
+                            )
+                        else:
+                            m = self._get_opp_model(m_path)
+                            if m:
+                                current_actions[idxs] = m(t_all_g[idxs], t_all_v[idxs]).argmax(dim=1).to(torch.int32)
+
+                    actions_cpu.copy_(current_actions, non_blocking=True)
+                    all_actions_flat_np = actions_cpu.numpy()
+
+                all_actions = all_actions_flat_np.reshape(self.cfg.num_envs, num_snakes)
+            else:
+                # No self-play models: learner uses its own obs; all opponents random.
+                t_g = torch.from_numpy(obs_dict["grid"]).to(self.device, non_blocking=True)
+                t_v = torch.from_numpy(obs_dict["vector"]).to(self.device, non_blocking=True)
+                with torch.inference_mode(), autocast('cuda', enabled=self.use_amp):
+                    grid_dtype = torch.float16 if (self.device.type == "cuda") else torch.float32
+                    t_g = t_g.to(dtype=grid_dtype)
+                    if self.device.type == "cuda":
+                        t_g = t_g.contiguous(memory_format=torch.channels_last)
+                    q_vals = self.policy_net(t_g, t_v)
+                    la = q_vals.argmax(dim=1).to(torch.int32)
+                    if eps > 0:
+                        rv = torch.rand(self.cfg.num_envs, device=self.device)
+                        la = torch.where(
+                            rv < eps,
+                            torch.randint(0, 4, (self.cfg.num_envs,), device=self.device, dtype=torch.int32),
+                            la,
+                        )
+                if num_snakes == 1:
+                    all_actions = la.view(self.cfg.num_envs, 1).cpu().numpy()
+                else:
+                    opp = torch.randint(0, 4, (self.cfg.num_envs, num_snakes - 1), device="cpu", dtype=torch.int32)
+                    all_actions = torch.cat([la.cpu().view(self.cfg.num_envs, 1), opp], dim=1).numpy()
 
             # 3. Step Environment
-            all_actions = all_actions_flat_np.reshape(self.cfg.num_envs, num_snakes)
             next_obs_dict, rews, terminated, truncated, next_info = self.envs.step(all_actions)
             
             # 4. Global Experience Store
@@ -681,8 +757,22 @@ class DQNVariantTrainer:
                     if len(recent_rewards) > 100: recent_rewards.pop(0)
                     ep_rewards[e_idx] = 0.0
 
+                    # Two-stage self-play probability schedule: early higher, later lower.
+                    if not self.cfg.single_snake and num_snakes > 1:
+                        prog = self.steps / float(total_frames)
+                        sp_prob = self.sp_prob_start if prog < self.sp_prob_frac else self.sp_prob_end
+                        for s in range(1, num_snakes):
+                            old = self.opp_model_paths[e_idx][s]
+                            if self.active_rivals and (random.random() < sp_prob):
+                                new = random.choice(self.active_rivals)
+                            else:
+                                new = None
+                            if new != old:
+                                self.opp_model_paths[e_idx][s] = new
+                                should_rebuild = True
+
             # Global Rival Update (V35.0)
-            if not self.cfg.single_snake and self.steps >= self.next_rival_update:
+            if self.use_model_opps and self.steps >= self.next_rival_update:
                 self.next_rival_update = self.steps + self.rival_update_interval
                 new_rivals = []
                 for _ in range(4):
@@ -692,22 +782,11 @@ class DQNVariantTrainer:
                     self.active_rivals = new_rivals
                     for p in self.active_rivals:
                         self._enqueue_prefetch(p)
-
-                    # Two-stage self-play probability schedule: early higher, later lower.
-                    prog = self.steps / float(total_frames)
-                    sp_prob = self.sp_prob_start if prog < self.sp_prob_frac else self.sp_prob_end
-
-                    for e in range(self.cfg.num_envs):
-                        for s in range(1, num_snakes):
-                            if random.random() < sp_prob:
-                                self.opp_model_paths[e][s] = random.choice(self.active_rivals)
-                                should_rebuild = True
                 
-            if should_rebuild:
+            if self.use_model_opps and should_rebuild:
                 self._rebuild_opp_groups()
             
             obs_dict, info = next_obs_dict, next_info
-
 
             # V16.0: 10% LR annealing floor
             progress = self.steps / total_frames
@@ -832,37 +911,48 @@ class DQNVariantTrainer:
 if __name__ == "__main__":
     from argparse import ArgumentParser
     p = ArgumentParser()
-    p.add_argument("--variant", type=str, default="dqn", choices=["dqn", "ddqn", "per", "dueling"])
+    p.add_argument(
+        "--variant",
+        type=str,
+        default="dqn",
+        choices=["dqn", "ddqn", "per", "dueling", "ddqn_per", "ddqn_per_dueling"],
+        help="Variants: dqn, ddqn, per(=ddqn+per), dueling(=ddqn+per+dueling)",
+    )
     p.add_argument("--steps", type=int, default=1000000)
     p.add_argument("--single", action="store_true")
     p.add_argument("--load", type=str, default=None)
     p.add_argument("--save", type=str, default="agent/checkpoints/dqn_best.pth")
-    p.add_argument("--sp-prob", type=float, default=0.5)
+    p.add_argument("--num-envs", type=int, default=None, help="Override number of parallel envs")
+    p.add_argument("--sp-prob", type=float, default=0.6)
+    p.add_argument("--finetune-lr-mult", type=float, default=0.5, help="LR multiplier when --load is used (default 0.5)")
 
     # Optional knobs (battle/single)
     p.add_argument("--eps-start", type=float, default=None, help="Override epsilon start (default depends on phase)")
     p.add_argument("--eps-min", type=float, default=None, help="Override epsilon min (default depends on phase)")
 
     # Self-play probability schedule: early high then low
-    p.add_argument("--sp-prob-start", type=float, default=None, help="Self-play prob in early phase (defaults to --sp-prob)")
-    p.add_argument("--sp-prob-end", type=float, default=None, help="Self-play prob after switch (defaults to --sp-prob)")
+    p.add_argument("--sp-prob-start", type=float, default=0.7, help="Self-play prob in early phase (default 0.7)")
+    p.add_argument("--sp-prob-end", type=float, default=0.4, help="Self-play prob after switch (default 0.4)")
     p.add_argument("--sp-prob-frac", type=float, default=0.30, help="Switch point as fraction of total steps (default 0.30)")
     args = p.parse_args()
-    
-    p_dir = f"agent/pool/{args.variant}"
+
+    v_norm = _normalize_variant(args.variant)
+    p_dir = f"agent/pool/{v_norm}"
     
     cfg = TrainConfig(
-        variant=args.variant, 
+        variant=v_norm,
         total_frames=args.steps,
         single_snake=args.single,
         load_path=args.load,
         save_path=args.save,
+        num_envs_override=args.num_envs,
         self_play_prob=args.sp_prob,
         eps_start=args.eps_start,
         eps_min=args.eps_min,
         self_play_prob_start=args.sp_prob_start,
         self_play_prob_end=args.sp_prob_end,
         self_play_prob_frac=args.sp_prob_frac,
+        finetune_lr_mult=args.finetune_lr_mult,
         pool_dir=p_dir
     )
     DQNVariantTrainer(cfg).train()

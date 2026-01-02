@@ -9,6 +9,7 @@ import socket
 import argparse
 from pathlib import Path
 import glob
+import random
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, 
@@ -136,6 +137,11 @@ class MainWindow(QMainWindow):
         settings_layout.addWidget(QLabel("SERVER HOST"))
         settings_layout.addWidget(self.host_input)
         
+        self.name_input = QLineEdit(f"Player_{random.randint(100,999)}")
+        self.name_input.editingFinished.connect(self.sync_name_now)
+        settings_layout.addWidget(QLabel("YOUR NICKNAME"))
+        settings_layout.addWidget(self.name_input)
+        
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["Human", "AI", "Spectator"])
         self.mode_combo.currentTextChanged.connect(self.toggle_ai_config)
@@ -166,6 +172,11 @@ class MainWindow(QMainWindow):
         btn_browse.clicked.connect(self.browse_model)
         model_row.addWidget(btn_browse)
         ai_cfg_layout.addLayout(model_row)
+
+        # Connection for real-time AI updates
+        self.algo_combo.currentIndexChanged.connect(self.setup_ai)
+        self.model_combo.editTextChanged.connect(self.setup_ai)
+        self.model_combo.currentIndexChanged.connect(self.setup_ai)
         
         settings_layout.addWidget(self.ai_config_widget)
         self.ai_config_widget.setVisible(False)
@@ -191,6 +202,7 @@ class MainWindow(QMainWindow):
         
         # Right Panel
         self.board = GameRenderer()
+        self.board.clicked.connect(self.request_reset)
         main_layout.addWidget(self.settings_panel)
         main_layout.addWidget(self.board, 1)
         
@@ -206,6 +218,7 @@ class MainWindow(QMainWindow):
 
     def toggle_ai_config(self, mode):
         self.ai_config_widget.setVisible(mode == "AI")
+        self.setup_ai()
 
     def refresh_models(self):
         self.model_combo.clear()
@@ -219,6 +232,35 @@ class MainWindow(QMainWindow):
             p = Path(file); self.model_combo.insertItem(0, p.name, str(p))
             self.model_combo.setCurrentIndex(0)
 
+    def setup_ai(self):
+        """Dynamic AI Initialization/Reload."""
+        # Stop timer first if we are not in AI mode or not connected
+        if self.mode_combo.currentText() != "AI" or not self.net_thread:
+            self.ai_timer.stop()
+            self.agent = None
+            return
+
+        # Load Agent
+        path_str = self.model_combo.currentData() or self.model_combo.currentText()
+        path = Path(path_str)
+        if not path.exists():
+            self.status_label.setText(f"AI ERROR: Model not found at {path.name}")
+            return
+            
+        algo = self.algo_combo.currentText().lower()
+        if not algo.endswith("agent"): algo += "agent"
+        
+        try:
+            # Re-load only if needed or just replace for safety
+            self.agent = get_agent(algo, 28, str(path))
+            if not self.ai_timer.isActive():
+                self.ai_timer.start(50)
+            self.status_label.setText(f"AI LOADED: {algo.upper()}")
+        except Exception as e:
+            self.status_label.setText(f"AI LOADED FAILED: {e}")
+            self.agent = None
+            self.ai_timer.stop()
+
     def connect_to_server(self):
         if self.net_thread:
             self.net_thread.stop(); self.net_thread = None
@@ -228,32 +270,35 @@ class MainWindow(QMainWindow):
             self.ai_timer.stop()
             return
             
-        if self.mode_combo.currentText() == "AI":
-            path_str = self.model_combo.currentData() or self.model_combo.currentText()
-            path = Path(path_str)
-            if not path.exists():
-                QMessageBox.critical(self, "Error", "Model not found."); return
-            algo = self.algo_combo.currentText().lower()
-            if not algo.endswith("agent"): algo += "agent"
-            try:
-                self.agent = get_agent(algo, 28, str(path))
-                self.ai_timer.start(50)
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Load failed: {e}"); return
-        
         self.net_thread = NetworkThread(self.host_input.text(), DEFAULT_PORT)
         self.net_thread.msg_received.connect(self.handle_message)
         self.net_thread.disconnected.connect(self.on_disconnect)
         self.net_thread.start()
+        
+        # Send Name immediately after connection
+        QTimer.singleShot(500, lambda: self.net_thread.send({"type": "JOIN", "name": self.name_input.text()}))
+        
         self.btn_connect.setText("DISCONNECT")
         self.btn_ready.setVisible(True)
         self.btn_ready.setChecked(False)
         self.btn_ready.setText("SET READY")
+        
+        # Trigger AI setup after connection is established
+        self.setup_ai()
 
     def send_ready(self, checked):
         if self.net_thread:
             self.net_thread.send({"type": "READY", "ready": checked})
             self.btn_ready.setText("CANCEL READY" if checked else "SET READY")
+
+    def request_reset(self):
+        if self.net_thread and self.server_state == "RESULT":
+            self.net_thread.send({"type": "RESET"})
+
+    def sync_name_now(self):
+        """Send current nickname to server."""
+        if self.net_thread:
+            self.net_thread.send({"type": "JOIN", "name": self.name_input.text()})
 
     def on_disconnect(self):
         self.net_thread = None
@@ -285,7 +330,10 @@ class MainWindow(QMainWindow):
 
             # Prepare Renderer
             self.board.update_state(msg.get("snakes", []), msg.get("food", []), msg.get("dead", []), self.player_id)
-            self.board.countdown = self.countdown if self.server_state == "COUNTDOWN" else 0
+            self.board.countdown = self.countdown if self.server_state in ["COUNTDOWN", "RESULT"] else 0
+            self.board.server_state = self.server_state
+            self.board.winner_id = msg.get("winner_id", -1)
+            self.board.player_names = msg.get("names", [])
             
             # Lobby Status
             r_list = msg.get("ready_list", [])
@@ -311,7 +359,7 @@ class MainWindow(QMainWindow):
                 self.dummy_env.snakes = [ [tuple(x) for x in s] for s in self.board.snakes ]
                 self.dummy_env.foods = [tuple(f) for f in self.board.food]
                 self.dummy_env.dead = self.board.dead
-                self.dummy_env.dash_cooldowns = msg.get("dash_cooldowns", [0]*4)
+                self.dummy_env.dash_durations = msg.get("dash_durations", [0]*4)
 
     def keyPressEvent(self, event):
         if self.mode_combo.currentText() != "Human" or self.server_state != "PLAYING": return

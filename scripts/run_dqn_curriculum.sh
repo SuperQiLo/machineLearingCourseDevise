@@ -1,7 +1,7 @@
 #!/bin/bash
 # run_dqn_curriculum.sh
 # Usage:
-#   ./scripts/run_dqn_curriculum.sh [dqn|ddqn|per|dueling] [steps1] [steps2] [extra flags...]
+#   ./scripts/run_dqn_curriculum.sh [dqn|ddqn|per|dueling|ddqn_per|ddqn_per_dueling] [steps1] [steps2] [extra flags...]
 #
 # Extra flags are forwarded to train_dqn_curriculum.py (and then to train_dqn_variants.py).
 
@@ -29,7 +29,7 @@ if ! command -v $PY_CMD &> /dev/null; then PY_CMD="python3"; fi
 ARGS=("--variant" "${VARIANT}")
 
 # If the user provided the variant as the first argument, shift it so we can parse steps
-if [[ "$1" == "dqn" || "$1" == "ddqn" || "$1" == "per" || "$1" == "dueling" ]]; then
+if [[ "$1" == "dqn" || "$1" == "ddqn" || "$1" == "per" || "$1" == "dueling" || "$1" == "ddqn_per" || "$1" == "ddqn_per_dueling" ]]; then
     shift
 fi
 

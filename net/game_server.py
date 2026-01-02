@@ -26,6 +26,7 @@ class GameState(Enum):
     WAITING = "WAITING"
     COUNTDOWN = "COUNTDOWN"
     PLAYING = "PLAYING"
+    RESULT = "RESULT"
 
 class GameServer:
     def __init__(self):
@@ -35,16 +36,18 @@ class GameServer:
         print(f"Server started on {HOST}:{PORT}")
         
         # Game State
-        self.env = BattleSnakeEnv(config=BattleSnakeConfig(num_snakes=MAX_PLAYERS, dash_cooldown_steps=15))
+        self.env = BattleSnakeEnv(config=BattleSnakeConfig(num_snakes=MAX_PLAYERS))
         self.env.reset()
         
         self.state = GameState.WAITING
         self.countdown = 0
+        self.winner_id = -1
         
         # Clients: {conn: player_id}
         self.clients: Dict[socket.socket, int] = {}
         self.ready_pids = set()
         self.player_inputs = [0] * MAX_PLAYERS
+        self.player_names = ["Unknown"] * MAX_PLAYERS # V7.7: Map pid to nickname
         self.pid_to_idx = {} # V7.8: Mapping from player_id to env index
         self.lock = threading.Lock()
         
@@ -103,6 +106,14 @@ class GameServer:
                         elif msg["type"] == "ACTION" and player_id != -1:
                             if self.state == GameState.PLAYING:
                                 self.player_inputs[player_id] = msg["action"]
+                        elif msg["type"] == "RESET":
+                            with self.lock:
+                                if self.state == GameState.RESULT:
+                                    self.reset_game()
+                        elif msg["type"] == "JOIN" and player_id != -1:
+                            with self.lock:
+                                self.player_names[player_id] = msg.get("name", f"P{player_id}")[:12]
+                                print(f"Player {player_id} set nickname: {self.player_names[player_id]}")
                     except: pass
             except: break
         self.remove_client(conn)
@@ -130,7 +141,7 @@ class GameServer:
                         self.pid_to_idx = {pid: i for i, pid in enumerate(ready_list_sorted)}
                         num_snakes = len(ready_list_sorted)
                         
-                        self.env = BattleSnakeEnv(config=BattleSnakeConfig(num_snakes=num_snakes, dash_cooldown_steps=15))
+                        self.env = BattleSnakeEnv(config=BattleSnakeConfig(num_snakes=num_snakes))
                         self.env.reset()
                         self.player_inputs = [0] * MAX_PLAYERS
                         print(f">>> {num_snakes} players ready. Rebuilding env and starting countdown...")
@@ -153,12 +164,17 @@ class GameServer:
                     self.player_inputs = [0] * MAX_PLAYERS
                     
                     # End game if all active participants are done
-                    if all(dones):
-                        print(">>> Game ended. Back to Lobby.")
-                        self.state = GameState.WAITING
-                        self.ready_pids.clear()
-                        self.pid_to_idx = {}
-                        self.player_inputs = [0] * MAX_PLAYERS
+                    if bool(info.get("game_over", all(dones))):
+                        print(f">>> Game ended. Winner: P{info.get('winner_idx')}. Showing Results.")
+                        self.state = GameState.RESULT
+                        self.countdown = 5.0 # Show results for 5 seconds
+                        self.winner_id = info.get("winner_idx", -1)
+                        
+                # Logic: Result -> Waiting (Auto-timeout removed, now triggered by RESET message)
+                elif self.state == GameState.RESULT:
+                    self.countdown -= 0.1
+                    if self.countdown <= -60: # 60 seconds safety timeout
+                        self.reset_game()
                 
                 # Broadcast Full State (V7.8 Mapping)
                 try:
@@ -173,25 +189,38 @@ class GameServer:
                                 if idx < len(self.env.snakes): snakes_full[pid] = self.env.snakes[idx]
                                 if idx < len(self.env.dead): dead_full[pid] = self.env.dead[idx]
                                 if idx < len(self.env.scores): scores_full[pid] = self.env.scores[idx]
-                                if idx < len(self.env.dash_cooldowns): dash_full[pid] = self.env.dash_cooldowns[idx]
+                                if idx < len(self.env.dash_durations): dash_full[pid] = self.env.dash_durations[idx]
 
                     sync_msg = {
                         "type": "SYNC",
                         "state": self.state.value,
-                        "countdown": int(self.countdown + 0.9) if self.state == GameState.COUNTDOWN else 0,
+                        "countdown": int(self.countdown + 0.9) if self.state in [GameState.COUNTDOWN, GameState.RESULT] else 0,
+                        "winner_id": self.winner_id,
                         "ready_list": list(self.ready_pids),
+                        "names": self.player_names, 
                         "player_list": active_players,
                         "snakes": snakes_full,
                         "food": self.env.foods if self.state != GameState.WAITING else [],
                         "dead": dead_full,
                         "scores": scores_full,
-                        "dash_cooldowns": dash_full
+                        "dash_durations": dash_full
                     }
                     self.broadcast(sync_msg)
                 except Exception as e:
                     print(f">>> Broadcast Error (Suppressed): {e}")
             
             time.sleep(max(0, 0.1 - (time.time() - start_time)))
+
+    def reset_game(self):
+        """Uniform game reset logic."""
+        if self.state != GameState.WAITING:
+            print(">>> Resetting Game State to Lobby.")
+            self.state = GameState.WAITING
+            self.ready_pids.clear()
+            self.pid_to_idx = {}
+            self.player_inputs = [0] * MAX_PLAYERS
+            self.winner_id = -1
+            self.countdown = 0
 
     def accept_loop(self):
         while True:

@@ -28,11 +28,13 @@ class BattleSnakeGymnasiumEnv(gym.Env):
         config: Optional[BattleSnakeConfig] = None,
         seed: Optional[int] = None,
         render_mode: Optional[str] = None,
+        return_full_obs: bool = True,
     ):
         super().__init__()
         self.config = config or BattleSnakeConfig()
         self._env = BattleSnakeEnv(self.config, seed=seed)
         self.render_mode = render_mode
+        self.return_full_obs = bool(return_full_obs)
         
         # Define observation space (Dict space for grid + vector)
         self.observation_space = spaces.Dict({
@@ -74,12 +76,16 @@ class BattleSnakeGymnasiumEnv(gym.Env):
             self._env.seed(seed)
             
         obs_list = self._env.reset()
-        # V21.0: Pre-process ALL observations into arrays for fast global indexing
-        # This allows AsyncVectorEnv to stack them automatically
-        all_grids = np.asarray([o["grid"] for o in obs_list], dtype=np.uint8)
-        all_vecs = np.asarray([o["vector"] for o in obs_list])
-        
-        return obs_list[0], {"full_obs_grids": all_grids, "full_obs_vecs": all_vecs, "raw_obs": obs_list}
+        if self.return_full_obs:
+            # Pre-process ALL observations into arrays for fast global indexing.
+            # NOTE: Even in single-snake mode, downstream trainers expect these keys.
+            all_grids = np.asarray([o["grid"] for o in obs_list], dtype=np.uint8)
+            all_vecs = np.asarray([o["vector"] for o in obs_list])
+            info = {"full_obs_grids": all_grids, "full_obs_vecs": all_vecs, "raw_obs": obs_list}
+        else:
+            info = {}
+
+        return obs_list[0], info
     
     def step(
         self, action: Union[int, List[int], np.ndarray]
@@ -109,16 +115,18 @@ class BattleSnakeGymnasiumEnv(gym.Env):
         # Return only the first snake's data
         obs = obs_list[0]
         reward = rewards[0]
-        terminated = dones[0]
+        terminated = bool(info.get("game_over", all(dones)))
         truncated = False  # Gymnasium convention
         
-        info_out = {
-            "full_obs_grids": np.asarray([o["grid"] for o in obs_list], dtype=np.uint8),
-            "full_obs_vecs": np.asarray([o["vector"] for o in obs_list]),
+        info_out: Dict[str, Any] = {
             "full_rewards": rewards,
             "full_dones": dones,
             "scores": info.get("scores", []),
         }
+
+        if self.return_full_obs:
+            info_out["full_obs_grids"] = np.asarray([o["grid"] for o in obs_list], dtype=np.uint8)
+            info_out["full_obs_vecs"] = np.asarray([o["vector"] for o in obs_list])
         
         return obs, reward, terminated, truncated, info_out
     
@@ -136,6 +144,7 @@ def make_gymnasium_env(
     num_snakes: int = 1,
     grid_size: int = 20,
     seed: Optional[int] = None,
+    return_full_obs: bool = True,
     **reward_kwargs,
 ) -> BattleSnakeGymnasiumEnv:
     """Factory function for creating Gymnasium-compatible BattleSnake environments.
@@ -160,4 +169,4 @@ def make_gymnasium_env(
         if hasattr(config, key):
             setattr(config, key, value)
     
-    return BattleSnakeGymnasiumEnv(config, seed=seed)
+    return BattleSnakeGymnasiumEnv(config, seed=seed, return_full_obs=return_full_obs)
