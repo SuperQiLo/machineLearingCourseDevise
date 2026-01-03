@@ -1,7 +1,20 @@
-"""
-Unified Trainer for DQN Variants (V6.7 - Turbo Battle Performance).
-Supports: DQN, DDQN, PER, Dueling-PER.
-Features: Omni-Batch Inference (Massive FPS boost), Soft Updates, Algorithm-Specific Hyperparameters.
+"""train_dqn_variants.py
+
+【中文说明】
+这是 DQN 家族（DQN / DDQN / PER / Dueling）统一训练入口。
+
+- 训练模式：
+    - `--single`：单蛇（更偏“找食物/导航”的 shaping），用于 curriculum 的 Phase 1。
+    - 默认（不加 `--single`）：多蛇对战 + 自博弈（battle），用于 curriculum 的 Phase 2。
+- 主要功能：并行环境采样、经验回放（含 PER）、目标网络软更新（tau）、混合精度（AMP）、
+    以及对手模型分组推断（减少重复推断，提高 FPS）。
+- 性能/稳定性相关环境变量：
+    - `DQN_CPU_THREADS`：限制 CPU 线程数，减少多进程/多环境时的线程争用。
+    - `RIVAL_UPDATE_INTERVAL`：battle 模式下刷新“活跃对手池”的间隔（步数）。
+
+历史说明（原英文注释的中文化）：
+统一的 DQN 变体训练器（偏重 battle 性能优化）。支持 DQN/DDQN/PER/Dueling-PER，
+包含“按对手模型分组的批量推断”、目标网络软更新，以及针对不同算法的默认超参。
 """
 
 import math
@@ -19,12 +32,12 @@ import torch.optim as optim
 import sys
 import os
 
-# cuDNN autotune for fixed-shape conv nets (20x20 grid)
+# cuDNN autotune：输入形状固定（20x20 grid）的卷积网络可加速
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
 
-# Optional CPU thread caps to reduce AsyncVectorEnv worker contention.
-# Recommended: 1 (or 2) on typical multi-process rollouts.
+# 可选：限制 CPU 线程数，减少 AsyncVectorEnv 多进程 worker 与 PyTorch 线程池争用。
+# 常见建议：1（或 2），具体取决于 CPU 核数与并行环境数量。
 _cpu_threads_env = os.getenv("DQN_CPU_THREADS")
 if _cpu_threads_env:
     try:
@@ -41,12 +54,12 @@ if _cpu_threads_env:
     except Exception:
         pass
 
-# V31.1: Align with PPO - Skip CUDAGraphs for dynamic opponent batches
+# V31.1：对齐 PPO：对“动态 batch”（对手分组推断大小会变）跳过 CUDAGraphs
 if hasattr(torch, '_inductor'):
     import torch._inductor.config as inductor_config
     inductor_config.triton.cudagraph_skip_dynamic_graphs = True
 
-# V18.4: Enable TF32 for Tensor Core acceleration (Ampere+)
+# V18.4：开启 TF32（Ampere+）以使用 Tensor Core 加速 matmul/conv
 if torch.cuda.is_available():
     torch.set_float32_matmul_precision('high')
 
@@ -63,6 +76,9 @@ from utils.self_play import SelfPlayManager
 
 def _normalize_variant(v: str) -> str:
     """Normalize user-facing variant names to internal canonical names.
+
+    中文：将命令行/用户输入的各种写法（如 `ddqn-per`、`ddqn_per_dueling`）统一归一化，
+    便于后续根据 variant 选择网络结构、回放缓冲区与训练超参。
 
     Canonical variants:
       - dqn
@@ -88,11 +104,19 @@ def _normalize_variant(v: str) -> str:
 from torch.amp import autocast, GradScaler
 
 def log(msg):
+    """打印训练日志（强制 flush，便于重定向/监控）。"""
     print(msg, flush=True)
 
 # --- Buffer Implementations ---
 
 class FastReplayBuffer:
+    """标准 DQN 的快速回放缓冲区（GPU 侧存储）。
+
+    中文要点：
+    - 该实现把 transition 的主要张量直接放在 GPU 上，减少 host<->device 同步开销。
+    - `push_batch()` 支持一次写入一批并行环境采样的数据。
+    - `sample()` 直接在 GPU 上生成随机索引并取样。
+    """
     def __init__(self, capacity, grid_shape, vector_dim, batch_size, device):
         self.capacity = capacity
         self.batch_size = batch_size
@@ -161,9 +185,16 @@ class FastReplayBuffer:
 
 
 
-# V25.0 DEPRECATED: TorchSumTree removed for O(1) linear GPU priorities
+# V25.0：已弃用 TorchSumTree（改为线性 GPU priorities + multinomial 采样）
 
 class PrioritizedReplayBuffer:
+    """Prioritized Experience Replay（PER）回放缓冲区（GPU 侧存储）。
+
+    中文要点：
+    - `priorities` 存储的是 $(|TD|+\\epsilon)^\\alpha$（已做 alpha 幂）。
+    - 采样使用 `torch.multinomial` 按优先级抽样，并返回重要性采样权重（IS weights）。
+    - `update_priorities()` 用 TD-error 更新优先级；beta 会在训练中逐步增大以减小偏差。
+    """
     def __init__(self, capacity, grid_shape, vector_dim, batch_size, device, alpha=0.5, beta=0.4):
         self.capacity = capacity
         self.batch_size = batch_size
@@ -217,9 +248,11 @@ class PrioritizedReplayBuffer:
         self.next_vectors[idx_range] = torch.as_tensor(next_vecs, dtype=torch.float32, device=self.device)
         self.dones[idx_range] = torch.as_tensor(dones, dtype=torch.bool, device=self.device)
         
-        # O(1) GPU Priority Update (No host sync)
+       # O(1) GPU Priority Update (No host sync)
+        # NOTE: `self.priorities` stores *already alpha-exponentiated* priorities (|TD|^alpha).
+        # `update_priorities()` computes (|TD| + eps)^alpha, so we must NOT apply `^alpha` again here.
         old_sum = self.priorities[idx_range].sum()
-        new_p = self._max_pri_tensor[0].pow(self.alpha)
+        new_p = self._max_pri_tensor[0]
         self.priorities[idx_range] = new_p
         self._total_priority[0] += (new_p * num) - old_sum
         
@@ -279,6 +312,17 @@ class PrioritizedReplayBuffer:
 
 @dataclass
 class TrainConfig:
+    """训练配置（TrainConfig）。
+
+    中文字段说明（只写关键项）：
+    - `variant`：算法变体（dqn/ddqn/per/dueling），会先经过 `_normalize_variant()` 归一化。
+    - `total_frames`：总交互步数（跨所有并行环境累计）。
+    - `num_envs`/`num_envs_override`：并行环境数量；battle 和 single 会有不同默认值。
+    - `num_snakes`：环境中蛇的数量；当 `single_snake=True` 时会强制为 1。
+    - `self_play_prob_*`：自博弈概率的“前高后低”日程，用于提升泛化。
+    - `pool_dir`：自博弈模型池目录（用于抽取/保存历史对手）。
+    - `save_path`/`load_path`：best 模型保存路径 / 可选加载路径（Phase 2 常用于微调）。
+    """
     variant: str = "dqn" # dqn, ddqn, per(=ddqn+per), dueling(=ddqn+per+dueling)
     total_frames: int = 5_000_000 
     num_envs: int = 64 # V26.0: Optimal IPC for A6000 Phase 2
@@ -309,6 +353,13 @@ class TrainConfig:
     finetune_lr_mult: float = 0.5
 
 class DQNVariantTrainer:
+    """DQN 统一训练器（按 `TrainConfig.variant` 切换实现）。
+
+    中文概览：
+    - single 模式更偏“稳定学习导航能力”（更高探索、更密集 shaping）。
+    - battle 模式引入自博弈与对手池，训练更偏“对抗/稳定胜率”。
+    - 末尾会额外保存一个 `.final.pth` 快照，避免 best 与 final 混淆。
+    """
     def __init__(self, cfg: TrainConfig):
         # Normalize variants early (support DDQN+PER naming requested by user)
         cfg.variant = _normalize_variant(cfg.variant)
@@ -588,14 +639,21 @@ class DQNVariantTrainer:
         self.use_amp = True
 
     def save_model(self, path):
+        """保存当前策略网络到磁盘（原子写入，跨平台尽量稳）。
+
+        中文：
+        - 训练中可能随时中断，因此先写入 `.tmp` 再替换目标文件。
+        - 如果启用了 `torch.compile`，会存在 `_orig_mod` 包装，这里保存“干净”的 state_dict。
+        - 统一保存 CPU Tensor，避免序列化 CUDA Tensor 带来的兼容性问题。
+        """
         # V37.0: Always save the clean state_dict (stripping torch.compile wrappers)
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = p.with_suffix(p.suffix + ".tmp")
         
-        # Access the raw module if it's compiled
+        # 访问原始 module（如果被 torch.compile 包装）
         raw_net = self.policy_net._orig_mod if hasattr(self.policy_net, "_orig_mod") else self.policy_net
-        # Save CPU tensors for portability and to avoid serializing CUDA tensors.
+        # 保存 CPU tensor：更便携，避免把 CUDA 张量写进权重文件
         sd_cpu = {k: v.detach().cpu() for k, v in raw_net.state_dict().items()}
         torch.save(sd_cpu, tmp_path)
         
@@ -603,18 +661,24 @@ class DQNVariantTrainer:
             try:
                 os.replace(tmp_path, p)
             except OSError:
-                # Windows atomic replace retry fallback
+                # Windows 下少数情况下 replace 可能失败：退化为删除再重命名
                 os.remove(p)
                 os.rename(tmp_path, p)
         else:
             os.rename(tmp_path, p)
 
     def _get_opp_model(self, path: str) -> nn.Module:
-        """Get model from cache or load from disk"""
+        """获取对手模型（优先缓存/预取结果），失败则返回 None。
+
+        中文：battle 自博弈下，对手模型来自历史池（磁盘上的权重文件）。
+        - 直接在训练主线程频繁 `torch.load` 会造成 I/O 抖动；因此先在后台线程预取到 CPU。
+        - 主线程只在“CPU 权重已准备好”时才 materialize 到 GPU 并进入缓存。
+        - 如果文件缺失/损坏/尚未预取完成：返回 None，调用方会回退到随机动作。
+        """
         if path in self.loaded_opp_models:
             return self.loaded_opp_models.get(path)
 
-        # If weights were prefetched on CPU, materialize GPU module fast.
+        # 如果后台已经把权重预取到 CPU，则在这里快速创建 GPU 模型并 load
         try:
             mtime = os.stat(path).st_mtime
         except OSError:
@@ -638,7 +702,7 @@ class DQNVariantTrainer:
             except Exception:
                 return None
 
-        # Not ready yet: enqueue async prefetch and skip (caller will fallback to random action)
+        # 预取尚未完成：把路径丢进队列，暂时跳过（调用方回退随机动作）
         self._enqueue_prefetch(path)
         return None
 
@@ -652,6 +716,12 @@ class DQNVariantTrainer:
         self._prefetch_queue.put(path)
 
     def _prefetch_worker(self) -> None:
+        """后台线程：把对手权重文件预取到 CPU 内存。
+
+        中文：
+        - 只做 CPU 侧 `torch.load`，不在后台创建 GPU 模型，避免和训练抢 GPU。
+        - 通过 mtime 判断是否需要更新缓存。
+        """
         while not self._prefetch_stop.is_set():
             try:
                 path = self._prefetch_queue.get(timeout=0.5)
@@ -682,6 +752,18 @@ class DQNVariantTrainer:
                 continue
 
     def train(self):
+        """主训练循环。
+
+        中文结构（每步）：
+        1) 按步数更新 epsilon（探索率）
+        2) 选择动作：learner 用 policy_net（epsilon-greedy）；对手随机或模型推断（分组批推断）
+        3) env.step(all_actions) 与环境交互
+        4) 写入回放（只存 learner 的 transition）
+        5) episode 结束统计与 self-play 对手刷新
+        6) 达到 batch_size 后更新网络（update）
+        7) 软更新 target_net（Polyak）
+        8) 周期日志 + best 保存 + 追加历史池快照
+        """
         log(f">>> Starting {self.cfg.variant.upper()} Training (V21.0 Flash-Batch)...")
         obs_dict, info = self.envs.reset()
         ep_rewards = [0.0] * self.cfg.num_envs
@@ -694,11 +776,13 @@ class DQNVariantTrainer:
         num_snakes = self.cfg.num_snakes
         total_snakes = self.cfg.num_envs * num_snakes
 
-        # Precompute indices and pinned CPU buffer for fast env stepping
+        # 预计算索引与 pinned CPU buffer：
+        # - `learner_map`：在 flatten 的 total_snakes 维度中，定位每个 env 的 learner（蛇0）
+        # - `actions_cpu`：pinned memory 可加速 GPU->CPU 拷贝，便于喂给 envs.step()
         learner_map = torch.arange(0, total_snakes, num_snakes, device=self.device)
         actions_cpu = torch.empty((total_snakes,), dtype=torch.int32, device="cpu", pin_memory=True)
 
-        # Reusable tensors to avoid per-step allocations
+        # 复用张量：避免每 step 分配导致的 GPU allocator 抖动
         current_actions = torch.empty(total_snakes, dtype=torch.int32, device=self.device)
         
         # V26.0 Initialization
@@ -710,11 +794,13 @@ class DQNVariantTrainer:
             self.steps += self.cfg.num_envs
             completion = min(1.0, self.steps / self.decay_steps)
             eps = max(self.eps_min, self.eps_start - completion * (self.eps_start - self.eps_min))
-            
-            # 1-2. Action selection
+
+            # ====== 1) 动作选择（epsilon-greedy）======
+            # - learner：用 Q(s,·) 选 argmax；以 eps 概率随机动作
+            # - 对手：battle 时可来自历史池模型（self-play），否则随机
             if self.use_model_opps:
-                # Faster batch creation (V34.0)
-                # Transfer grids as uint8 to reduce PCIe bandwidth, then cast on GPU.
+                # battle 模式：从 info 取全体蛇的 full_obs（由 wrapper 提供）
+                # - grid 用 uint8 传到 GPU，减少 PCIe 带宽；forward 前再 cast
                 full_grids = info.get("full_obs_grids") if isinstance(info, dict) else None
                 full_vecs = info.get("full_obs_vecs") if isinstance(info, dict) else None
                 if full_grids is None or full_vecs is None:
@@ -735,7 +821,7 @@ class DQNVariantTrainer:
                     if self.device.type == "cuda":
                         t_all_g = t_all_g.contiguous(memory_format=torch.channels_last)
 
-                    # A. Learner
+                    # A) learner（蛇0）：对每个 env 计算一次 Q，并 epsilon-greedy
                     q_vals = self.policy_net(t_all_g[learner_map], t_all_v[learner_map])
                     la = q_vals.argmax(dim=1).to(torch.int32)
                     if eps > 0:
@@ -747,7 +833,9 @@ class DQNVariantTrainer:
                         )
                     current_actions[learner_map] = la
 
-                    # B. Opponents
+                    # B) opponents：按“模型路径”分组推断
+                    # - m_path=None 表示随机对手
+                    # - m_path!=None 尝试取缓存/预取模型；取不到则保持默认（稍后由调用方看到缺口）
                     for m_path, idxs in self.cached_opp_groups.items():
                         if m_path is None:
                             current_actions[idxs] = torch.randint(
@@ -758,12 +846,13 @@ class DQNVariantTrainer:
                             if m:
                                 current_actions[idxs] = m(t_all_g[idxs], t_all_v[idxs]).argmax(dim=1).to(torch.int32)
 
+                    # 将 total_snakes 的动作一次性拷贝到 CPU，再 reshape 成 (num_envs, num_snakes)
                     actions_cpu.copy_(current_actions, non_blocking=True)
                     all_actions_flat_np = actions_cpu.numpy()
 
                 all_actions = all_actions_flat_np.reshape(self.cfg.num_envs, num_snakes)
             else:
-                # No self-play models: learner uses its own obs; all opponents random.
+                # single/无 self-play：只用 learner 的 obs；如果是多蛇也让对手随机
                 t_g = torch.from_numpy(obs_dict["grid"]).to(self.device, non_blocking=True)
                 t_v = torch.from_numpy(obs_dict["vector"]).to(self.device, non_blocking=True)
                 with torch.inference_mode(), autocast('cuda', enabled=self.use_amp):
@@ -786,10 +875,12 @@ class DQNVariantTrainer:
                     opp = torch.randint(0, 4, (self.cfg.num_envs, num_snakes - 1), device="cpu", dtype=torch.int32)
                     all_actions = torch.cat([la.cpu().view(self.cfg.num_envs, 1), opp], dim=1).numpy()
 
-            # 3. Step Environment
+            # ====== 2) 与环境交互 ======
+            # 中文：Gymnasium wrapper 约定：当 action 是 (num_envs, num_snakes) 时，表示全体蛇动作。
             next_obs_dict, rews, terminated, truncated, next_info = self.envs.step(all_actions)
             
-            # 4. Global Experience Store
+            # ====== 3) 写入回放（只存 learner transition）======
+            # 中文：对手动作/观测不进入 learner 的回放；训练目标是 learner 的 Q-learning。
             self.memory.push_batch(
                 obs_dict["grid"], obs_dict["vector"],
                 all_actions[:, 0], rews,
@@ -797,7 +888,8 @@ class DQNVariantTrainer:
                 terminated
             )
             
-            # 5. Monitor & Self-Play (V35.1: Balanced Update)
+            # ====== 4) episode 统计 + self-play 对手刷新 ======
+            # 中文：episode 结束时，记录 return；battle 模式额外记录 win-rate 与 score0。
             should_rebuild = False
             for e_idx in range(self.cfg.num_envs):
                 ep_rewards[e_idx] += rews[e_idx]
@@ -806,7 +898,7 @@ class DQNVariantTrainer:
                     if len(recent_rewards) > 100: recent_rewards.pop(0)
                     ep_rewards[e_idx] = 0.0
 
-                    # Extra diagnostics for battle mode
+                    # battle 的额外统计：winner_idx / score0 来自 wrapper 的 info
                     if (not self.cfg.single_snake) and num_snakes > 1 and isinstance(next_info, dict):
                         try:
                             winner = int(next_info.get("winner_idx", [-1])[e_idx])
@@ -822,7 +914,7 @@ class DQNVariantTrainer:
                         if len(recent_score0) > 200:
                             recent_score0.pop(0)
 
-                    # Two-stage self-play probability schedule: early higher, later lower.
+                    # self-play 概率两段式：前期更高（多样性/探索），后期更低（稳定收敛）
                     if not self.cfg.single_snake and num_snakes > 1:
                         prog = self.steps / float(total_frames)
                         sp_prob = self.sp_prob_start if prog < self.sp_prob_frac else self.sp_prob_end
@@ -836,7 +928,9 @@ class DQNVariantTrainer:
                                 self.opp_model_paths[e_idx][s] = new
                                 should_rebuild = True
 
-            # Global Rival Update (V35.0)
+            # ====== 5) 全局对手池刷新（active_rivals）======
+            # 中文：定期从 SelfPlayManager 采样若干模型路径，作为“当前活跃对手集合”，
+            # 再由每个 env 在 episode 结束时随机选择其中一个作为对手。
             if self.use_model_opps and self.steps >= self.next_rival_update:
                 self.next_rival_update = self.steps + self.rival_update_interval
                 new_rivals = []
@@ -853,31 +947,30 @@ class DQNVariantTrainer:
             
             obs_dict, info = next_obs_dict, next_info
 
-            # V16.0: 10% LR annealing floor
+            # ====== 6) 学习率退火（有下限）======
+            # 中文：学习率从 lr 退火到 10%*lr，避免后期彻底停学。
             progress = self.steps / total_frames
             frac = max(0.0, 1.0 - progress)
             current_lr = self.lr * (0.10 + 0.90 * frac) 
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = current_lr
 
-            # V9.0 Hyper-Precision Schedule
+            # ====== 7) 兼容遗留的“阶段阈值”变量（不直接影响逻辑）======
             warmup1, warmup2 = 50000, 150000
             late_half = total_frames * 0.5
             late_40 = total_frames * 0.4
             
-            # V13.0 CRITICAL FIX: Actually train the network!
-            # V22.0: Multi-update to utilize GPU throughput
-            # With num_envs=128, one loop adds 128 samples.
-            # V23.0: 8 updates per 128 transitions (1:16 samples-to-steps ratio)
-            # This is much more balanced than 32 updates.
-            # V25.0: Consistent 1-update ratio to maximize FPS
+            # ====== 8) 网络更新（从回放采样 + 反向传播）======
+            # 中文：当回放样本数达到 batch_size 后开始 update。
+            # 这里固定每步更新 1 次，是“吞吐/稳定/FPS”之间的折中（并行环境本身就会快速填充回放）。
             if self.memory.size >= self.batch_size:
                 updates = 1
                 for _ in range(updates):
                     self.update()
 
-            # 5. Soft Update
-            # 5. Soft Update (V31.1: Vectorized update - 100x faster than loops)
+            # ====== 9) 目标网络软更新（Polyak）======
+            # 中文：target <- (1-tau)*target + tau*policy。
+            # 同时根据训练进度与 variant，在后期把 tau 降低以减少抖动。
             tau_eff = self.tau
             if self.cfg.variant == "ddqn":
                 late_cut = late_half if self.cfg.single_snake else late_40
@@ -894,7 +987,7 @@ class DQNVariantTrainer:
                 for target_param, policy_param in zip(self.target_net.parameters(), self.policy_net.parameters()):
                     target_param.mul_(1.0 - tau_eff).add_(policy_param, alpha=tau_eff)
                 
-            # 5. Heartbeat Logging (V25.0: 1024 interval for better visibility)
+            # ====== 10) 心跳日志 + best 保存 + 周期性池快照 ======
             if self.steps % 1024 < self.cfg.num_envs:
                 elapsed = time.time() - last_log_time
                 fps = (1024) / (elapsed + 1e-6)
@@ -906,8 +999,8 @@ class DQNVariantTrainer:
                         f"Step: {self.steps} | EPS: {eps:.2f} | Rew: {avg_r:.2f} | Win%: {win_rate:.1f} | S0: {avg_s0:.1f} | FPS: {fps:.1f} | Var: {self.cfg.variant}"
                     )
 
-                    # Save best model for battle: prioritize S0, then Win%.
-                    # Use small thresholds to avoid overly frequent disk writes.
+                    # 保存 best（battle）：优先 S0，其次 Win%。
+                    # 中文：加阈值是为了减少频繁写盘（尤其是 SSD/网络盘）。
                     improved = False
                     if avg_s0 > self.best_s0 + 5.0:
                         improved = True
@@ -923,7 +1016,7 @@ class DQNVariantTrainer:
                 else:
                     log(f"Step: {self.steps} | EPS: {eps:.2f} | Rew: {avg_r:.2f} | FPS: {fps:.1f} | Var: {self.cfg.variant}")
 
-                    # Save best model for single snake based on avg episode reward.
+                    # 保存 best（single）：按 avg episode reward
                     improved = False
                     if avg_r > self.best_reward + 0.5:
                         improved = True
@@ -935,15 +1028,16 @@ class DQNVariantTrainer:
                         log(f">>> [Best] Saved -> {self.cfg.save_path} | Rew {self.best_reward:.2f}")
                 last_log_time = time.time()
                 
-                # Simplified Saving (User requested ONLY final model or periodic snapshot)
-                # Keep periodic pool snapshots for self-play diversity
+                # 周期性追加历史池快照：即使不是 best，也能增加对手多样性
                 pool_interval = max(150_000, int(total_frames * 0.03))
                 if self.steps % pool_interval < self.cfg.num_envs:
                     raw_net = self.policy_net._orig_mod if hasattr(self.policy_net, "_orig_mod") else self.policy_net
                     sd_cpu = {k: v.detach().cpu() for k, v in raw_net.state_dict().items()}
                     self.sp_manager.add_model(sd_cpu, f"{self.cfg.variant}_step_{self.steps}")
             
-        # Final Save: keep `save_path` as BEST; write a separate `.final.pth` snapshot.
+        # ====== 训练结束：保证 best 存在，并写 final 快照 ======
+        # - `save_path` 始终代表 best（便于 GUI/推理直接使用）
+        # - 额外写 `.final.pth` 作为训练末尾的快照
         best_path = Path(self.cfg.save_path)
         if not best_path.exists():
             self.save_model(self.cfg.save_path)
@@ -954,7 +1048,8 @@ class DQNVariantTrainer:
         log(f">>> [Final] Saved -> {final_path}")
 
     def _rebuild_opp_groups(self):
-        # V34.0: Pre-compute Tensors to avoid CPU-GPU sync during推断
+        """按对手模型路径分组 env-index，用于批量推断减少重复计算。"""
+        # 中文：把 {path -> [snake_idx,...]} 转成 GPU tensor，推断时无需频繁 Python list 操作。
         temp_groups = {}
         for e in range(self.cfg.num_envs):
             for s in range(1, self.cfg.num_snakes):
@@ -973,7 +1068,9 @@ class DQNVariantTrainer:
         }
 
     def update(self):
-        # V6.3: Calculate dynamic Beta for PER
+        """从回放缓冲区采样并执行一次梯度更新（含 PER/AMP/梯度裁剪）。"""
+        # ====== PER 的 beta 退火 ======
+        # 中文：beta 从 beta_start -> 1.0（随训练进度增大），逐步抵消优先采样带来的偏差。
         frac = self.steps / self.cfg.total_frames
         beta_start = getattr(self, "per_beta_start", 0.4)
         current_beta = min(1.0, beta_start + frac * (1.0 - beta_start))
@@ -983,7 +1080,11 @@ class DQNVariantTrainer:
         else:
             states, actions, rewards, next_states, dones, weights, idxs = self.memory.sample()
         
-        # V17.4: AMP Mixed Precision Training
+        # ====== 计算 TD target 与 loss（AMP）======
+        # 中文：
+        # - DQN：target 用 target_net 的 max(Q')
+        # - DDQN/PER/Dueling：用 policy_net 选 best_action，再用 target_net 评估（减小过估计）
+        # - PER：用 IS weights 加权每个样本的 loss
         with autocast('cuda', enabled=self.use_amp):
             q_curr = self.policy_net(states['grid'], states['vector']).gather(1, actions.unsqueeze(1)).squeeze(1)
             
@@ -1003,6 +1104,7 @@ class DQNVariantTrainer:
                 loss = nn.SmoothL1Loss()(q_curr, target)
         
         self.optimizer.zero_grad()
+        # AMP scaler：缩放梯度以降低 fp16 下溢风险；unscale 后再做梯度裁剪
         self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.optimizer)
         nn.utils.clip_grad_norm_(self.policy_net.parameters(), self.grad_clip)
@@ -1010,12 +1112,13 @@ class DQNVariantTrainer:
         self.scaler.update()
         
         if weights is not None:
-            # V24.0: Async priority update
+            # 用 TD-error 更新优先级（PER）
             self.memory.update_priorities(idxs, td_errors.detach())
 
 if __name__ == "__main__":
     from argparse import ArgumentParser
     p = ArgumentParser()
+    # 中文：命令行参数尽量保持“短而直观”，更多默认行为由 `DQNVariantTrainer` 按阶段/variant 自动设定。
     p.add_argument(
         "--variant",
         type=str,

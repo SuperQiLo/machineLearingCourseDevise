@@ -1,0 +1,268 @@
+=== Snake PPO Curriculum Training ===
+
+>>> [PPO-Curriculum] Starting Phase: 1. Pre-training (Single Snake) -> agent/checkpoints/ppo_best.pth
+>>> Command: train_ppo.py --single --steps 10000000 --envs 64 --rollout-steps 256 --update-epochs 2 --minibatch-size 4096 --lr 0.0002 --target-kl 0.015
+>>> [PPO-Turbo] Device=cuda | snakes=1 | envs=64 | steps=10000000
+>>> [PPO-Turbo] torch.compile() enabled.
+>>> [PPO-Turbo] Initializing Parallel Environments...
+>>> [PPO-Turbo] Environments Ready. Resetting...
+>>> [PPO-Turbo] Setup finished. Starting training loop...
+>>> [PPO-Turbo] Upd 1 | Step 16384/10000000 (0.2%) | Ret -0.72 | pg_loss 0.085 | v_loss 0.944 | ent 1.219 | kl 0.1310/0.0150 | clipfrac 0.360 | ev -0.472 | lr 2.00e-04 | ent_coef 0.080 | early_stop
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret -0.72
+>>> [PPO-Turbo] Upd 2 | Step 32768/10000000 (0.3%) | Ret -0.78 | pg_loss 0.023 | v_loss 0.138 | ent 1.151 | kl 0.0088/0.0150 | clipfrac 0.072 | ev -0.055 | lr 2.00e-04 | ent_coef 0.080 | early_stop
+>>> [PPO-Turbo] Upd 3 | Step 49152/10000000 (0.5%) | Ret -0.78 | pg_loss 0.013 | v_loss 0.046 | ent 1.193 | kl 0.0177/0.0150 | clipfrac 0.340 | ev -0.461 | lr 1.99e-04 | ent_coef 0.080 | early_stop
+>>> [PPO-Turbo] Upd 4 | Step 65536/10000000 (0.7%) | Ret -0.75 | pg_loss 0.005 | v_loss 0.023 | ent 1.183 | kl 0.0079/0.0150 | clipfrac 0.145 | ev -0.560 | lr 1.99e-04 | ent_coef 0.080 | early_stop
+>>> [PPO-Turbo] Upd 5 | Step 81920/10000000 (0.8%) | Ret -0.73 | pg_loss 0.002 | v_loss 0.018 | ent 1.282 | kl 0.0111/0.0150 | clipfrac 0.255 | ev -0.295 | lr 1.99e-04 | ent_coef 0.080 | early_stop
+>>> [PPO-Turbo] Upd 6 | Step 98304/10000000 (1.0%) | Ret -0.73 | pg_loss 0.011 | v_loss 0.014 | ent 1.295 | kl 0.0143/0.0150 | clipfrac 0.247 | ev -0.426 | lr 1.99e-04 | ent_coef 0.080 | early_stop
+>>> [PPO-Turbo] Upd 7 | Step 114688/10000000 (1.1%) | Ret -0.73 | pg_loss 0.006 | v_loss 0.011 | ent 1.319 | kl 0.0092/0.0150 | clipfrac 0.148 | ev -0.177 | lr 1.98e-04 | ent_coef 0.079 | early_stop
+>>> [PPO-Turbo] Upd 8 | Step 131072/10000000 (1.3%) | Ret -0.74 | pg_loss 0.002 | v_loss 0.011 | ent 1.279 | kl 0.0078/0.0150 | clipfrac 0.117 | ev -0.122 | lr 1.98e-04 | ent_coef 0.079 | early_stop
+>>> [PPO-Turbo] Upd 9 | Step 147456/10000000 (1.5%) | Ret -0.70 | pg_loss -0.005 | v_loss 0.010 | ent 1.312 | kl 0.0037/0.0150 | clipfrac 0.033 | ev -0.080 | lr 1.98e-04 | ent_coef 0.079
+>>> [PPO-Turbo] Upd 10 | Step 163840/10000000 (1.6%) | Ret -0.69 | pg_loss 0.006 | v_loss 0.010 | ent 1.321 | kl 0.0075/0.0150 | clipfrac 0.141 | ev -0.156 | lr 1.97e-04 | ent_coef 0.079 | early_stop
+>>> [PPO-Turbo] Upd 20 | Step 327680/10000000 (3.3%) | Ret -0.61 | pg_loss -0.002 | v_loss 0.004 | ent 1.297 | kl 0.0037/0.0150 | clipfrac 0.022 | ev 0.104 | lr 1.94e-04 | ent_coef 0.078
+>>> [PPO-Turbo] Upd 30 | Step 491520/10000000 (4.9%) | Ret -0.28 | pg_loss -0.003 | v_loss 0.004 | ent 1.301 | kl 0.0050/0.0150 | clipfrac 0.048 | ev 0.079 | lr 1.91e-04 | ent_coef 0.077
+>>> [PPO-Turbo] Upd 40 | Step 655360/10000000 (6.6%) | Ret -0.08 | pg_loss -0.002 | v_loss 0.005 | ent 1.257 | kl 0.0037/0.0150 | clipfrac 0.021 | ev 0.126 | lr 1.88e-04 | ent_coef 0.077
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret -0.08
+>>> [PPO-Turbo] Upd 50 | Step 819200/10000000 (8.2%) | Ret 0.09 | pg_loss -0.002 | v_loss 0.004 | ent 1.238 | kl 0.0044/0.0150 | clipfrac 0.033 | ev 0.186 | lr 1.86e-04 | ent_coef 0.076
+>>> [PPO-Turbo] Upd 60 | Step 983040/10000000 (9.8%) | Ret 0.33 | pg_loss -0.002 | v_loss 0.006 | ent 1.164 | kl 0.0006/0.0150 | clipfrac 0.000 | ev 0.097 | lr 1.83e-04 | ent_coef 0.075
+>>> [PPO-Turbo] Upd 70 | Step 1146880/10000000 (11.5%) | Ret 0.76 | pg_loss -0.001 | v_loss 0.009 | ent 1.099 | kl 0.0027/0.0150 | clipfrac 0.016 | ev 0.110 | lr 1.80e-04 | ent_coef 0.074
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 0.76
+>>> [PPO-Turbo] Upd 80 | Step 1310720/10000000 (13.1%) | Ret 1.82 | pg_loss -0.002 | v_loss 0.016 | ent 0.884 | kl 0.0021/0.0150 | clipfrac 0.015 | ev 0.160 | lr 1.77e-04 | ent_coef 0.073
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 1.82
+>>> [PPO-Turbo] Upd 90 | Step 1474560/10000000 (14.7%) | Ret 3.60 | pg_loss -0.002 | v_loss 0.024 | ent 0.635 | kl 0.0020/0.0150 | clipfrac 0.020 | ev 0.272 | lr 1.74e-04 | ent_coef 0.072
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 3.60
+>>> [PPO-Turbo] Upd 100 | Step 1638400/10000000 (16.4%) | Ret 5.20 | pg_loss -0.002 | v_loss 0.033 | ent 0.587 | kl 0.0025/0.0150 | clipfrac 0.029 | ev 0.291 | lr 1.71e-04 | ent_coef 0.071
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 5.20
+>>> [PPO-Turbo] Upd 110 | Step 1802240/10000000 (18.0%) | Ret 6.59 | pg_loss -0.002 | v_loss 0.041 | ent 0.518 | kl 0.0022/0.0150 | clipfrac 0.026 | ev 0.278 | lr 1.68e-04 | ent_coef 0.070
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 6.59
+>>> [PPO-Turbo] Upd 120 | Step 1966080/10000000 (19.7%) | Ret 8.79 | pg_loss -0.002 | v_loss 0.055 | ent 0.477 | kl 0.0014/0.0150 | clipfrac 0.009 | ev 0.264 | lr 1.65e-04 | ent_coef 0.069
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 8.79
+>>> [PPO-Turbo] Upd 130 | Step 2129920/10000000 (21.3%) | Ret 12.02 | pg_loss -0.002 | v_loss 0.074 | ent 0.453 | kl 0.0010/0.0150 | clipfrac 0.007 | ev 0.262 | lr 1.62e-04 | ent_coef 0.069
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 12.02
+>>> [PPO-Turbo] Upd 140 | Step 2293760/10000000 (22.9%) | Ret 12.54 | pg_loss -0.001 | v_loss 0.078 | ent 0.446 | kl 0.0021/0.0150 | clipfrac 0.026 | ev 0.358 | lr 1.59e-04 | ent_coef 0.068
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 12.54
+>>> [PPO-Turbo] Upd 150 | Step 2457600/10000000 (24.6%) | Ret 13.53 | pg_loss -0.001 | v_loss 0.090 | ent 0.419 | kl 0.0016/0.0150 | clipfrac 0.016 | ev 0.396 | lr 1.56e-04 | ent_coef 0.067
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 13.53
+>>> [PPO-Turbo] Upd 160 | Step 2621440/10000000 (26.2%) | Ret 13.97 | pg_loss -0.001 | v_loss 0.089 | ent 0.416 | kl 0.0009/0.0150 | clipfrac 0.008 | ev 0.359 | lr 1.53e-04 | ent_coef 0.066
+>>> [PPO-Turbo] Upd 170 | Step 2785280/10000000 (27.9%) | Ret 15.56 | pg_loss -0.001 | v_loss 0.094 | ent 0.416 | kl 0.0008/0.0150 | clipfrac 0.007 | ev 0.395 | lr 1.50e-04 | ent_coef 0.065
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 15.56
+>>> [PPO-Turbo] Upd 180 | Step 2949120/10000000 (29.5%) | Ret 17.20 | pg_loss -0.002 | v_loss 0.105 | ent 0.409 | kl 0.0019/0.0150 | clipfrac 0.022 | ev 0.430 | lr 1.47e-04 | ent_coef 0.064
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 17.20
+>>> [PPO-Turbo] Upd 190 | Step 3112960/10000000 (31.1%) | Ret 19.11 | pg_loss -0.001 | v_loss 0.103 | ent 0.409 | kl 0.0013/0.0150 | clipfrac 0.013 | ev 0.358 | lr 1.44e-04 | ent_coef 0.063
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 19.11
+>>> [PPO-Turbo] Upd 200 | Step 3276800/10000000 (32.8%) | Ret 20.61 | pg_loss -0.001 | v_loss 0.118 | ent 0.391 | kl 0.0021/0.0150 | clipfrac 0.023 | ev 0.362 | lr 1.41e-04 | ent_coef 0.062
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 20.61
+>>> [PPO-Turbo] Upd 210 | Step 3440640/10000000 (34.4%) | Ret 20.82 | pg_loss -0.002 | v_loss 0.096 | ent 0.386 | kl 0.0010/0.0150 | clipfrac 0.010 | ev 0.427 | lr 1.38e-04 | ent_coef 0.062
+>>> [PPO-Turbo] Upd 220 | Step 3604480/10000000 (36.0%) | Ret 22.05 | pg_loss -0.002 | v_loss 0.136 | ent 0.370 | kl 0.0015/0.0150 | clipfrac 0.018 | ev 0.435 | lr 1.35e-04 | ent_coef 0.061
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 22.05
+>>> [PPO-Turbo] Upd 230 | Step 3768320/10000000 (37.7%) | Ret 22.61 | pg_loss -0.001 | v_loss 0.132 | ent 0.368 | kl 0.0020/0.0150 | clipfrac 0.024 | ev 0.399 | lr 1.32e-04 | ent_coef 0.060
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 22.61
+>>> [PPO-Turbo] Upd 240 | Step 3932160/10000000 (39.3%) | Ret 22.76 | pg_loss -0.002 | v_loss 0.144 | ent 0.358 | kl 0.0015/0.0150 | clipfrac 0.018 | ev 0.368 | lr 1.30e-04 | ent_coef 0.059
+>>> [PPO-Turbo] Upd 250 | Step 4096000/10000000 (41.0%) | Ret 23.93 | pg_loss -0.001 | v_loss 0.137 | ent 0.358 | kl 0.0018/0.0150 | clipfrac 0.020 | ev 0.406 | lr 1.27e-04 | ent_coef 0.058
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 23.93
+>>> [PPO-Turbo] Upd 260 | Step 4259840/10000000 (42.6%) | Ret 27.49 | pg_loss -0.001 | v_loss 0.144 | ent 0.342 | kl 0.0012/0.0150 | clipfrac 0.012 | ev 0.486 | lr 1.24e-04 | ent_coef 0.057
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 27.49
+>>> [PPO-Turbo] Upd 270 | Step 4423680/10000000 (44.2%) | Ret 29.01 | pg_loss -0.001 | v_loss 0.191 | ent 0.338 | kl 0.0018/0.0150 | clipfrac 0.020 | ev 0.455 | lr 1.21e-04 | ent_coef 0.056
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 29.01
+>>> [PPO-Turbo] Upd 280 | Step 4587520/10000000 (45.9%) | Ret 26.35 | pg_loss -0.002 | v_loss 0.144 | ent 0.320 | kl 0.0015/0.0150 | clipfrac 0.017 | ev 0.499 | lr 1.18e-04 | ent_coef 0.055
+>>> [PPO-Turbo] Upd 290 | Step 4751360/10000000 (47.5%) | Ret 25.68 | pg_loss -0.002 | v_loss 0.189 | ent 0.312 | kl 0.0008/0.0150 | clipfrac 0.007 | ev 0.513 | lr 1.15e-04 | ent_coef 0.054
+>>> [PPO-Turbo] Upd 300 | Step 4915200/10000000 (49.2%) | Ret 26.34 | pg_loss -0.002 | v_loss 0.202 | ent 0.305 | kl 0.0022/0.0150 | clipfrac 0.029 | ev 0.505 | lr 1.12e-04 | ent_coef 0.054
+>>> [PPO-Turbo] Upd 310 | Step 5079040/10000000 (50.8%) | Ret 24.97 | pg_loss -0.002 | v_loss 0.185 | ent 0.304 | kl 0.0020/0.0150 | clipfrac 0.026 | ev 0.517 | lr 1.09e-04 | ent_coef 0.053
+>>> [PPO-Turbo] Upd 320 | Step 5242880/10000000 (52.4%) | Ret 26.98 | pg_loss -0.002 | v_loss 0.164 | ent 0.293 | kl 0.0019/0.0150 | clipfrac 0.025 | ev 0.518 | lr 1.06e-04 | ent_coef 0.052
+>>> [PPO-Turbo] Upd 330 | Step 5406720/10000000 (54.1%) | Ret 29.87 | pg_loss -0.001 | v_loss 0.160 | ent 0.288 | kl 0.0010/0.0150 | clipfrac 0.009 | ev 0.554 | lr 1.03e-04 | ent_coef 0.051
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 29.87
+>>> [PPO-Turbo] Upd 340 | Step 5570560/10000000 (55.7%) | Ret 31.05 | pg_loss -0.001 | v_loss 0.133 | ent 0.283 | kl 0.0011/0.0150 | clipfrac 0.012 | ev 0.579 | lr 1.00e-04 | ent_coef 0.050
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 31.05
+>>> [PPO-Turbo] Upd 350 | Step 5734400/10000000 (57.3%) | Ret 29.24 | pg_loss -0.001 | v_loss 0.184 | ent 0.283 | kl 0.0005/0.0150 | clipfrac 0.004 | ev 0.576 | lr 9.71e-05 | ent_coef 0.049
+>>> [PPO-Turbo] Upd 360 | Step 5898240/10000000 (59.0%) | Ret 29.98 | pg_loss -0.002 | v_loss 0.155 | ent 0.276 | kl 0.0015/0.0150 | clipfrac 0.017 | ev 0.654 | lr 9.41e-05 | ent_coef 0.048
+>>> [PPO-Turbo] Upd 370 | Step 6062080/10000000 (60.6%) | Ret 30.59 | pg_loss -0.002 | v_loss 0.197 | ent 0.274 | kl 0.0013/0.0150 | clipfrac 0.013 | ev 0.567 | lr 9.12e-05 | ent_coef 0.047
+>>> [PPO-Turbo] Upd 380 | Step 6225920/10000000 (62.3%) | Ret 34.03 | pg_loss -0.001 | v_loss 0.161 | ent 0.270 | kl 0.0008/0.0150 | clipfrac 0.009 | ev 0.615 | lr 8.82e-05 | ent_coef 0.046
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 34.03
+>>> [PPO-Turbo] Upd 390 | Step 6389760/10000000 (63.9%) | Ret 31.42 | pg_loss -0.001 | v_loss 0.213 | ent 0.268 | kl 0.0008/0.0150 | clipfrac 0.009 | ev 0.599 | lr 8.53e-05 | ent_coef 0.046
+>>> [PPO-Turbo] Upd 400 | Step 6553600/10000000 (65.5%) | Ret 36.89 | pg_loss -0.001 | v_loss 0.195 | ent 0.258 | kl 0.0011/0.0150 | clipfrac 0.012 | ev 0.660 | lr 8.23e-05 | ent_coef 0.045
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 36.89
+>>> [PPO-Turbo] Upd 410 | Step 6717440/10000000 (67.2%) | Ret 32.19 | pg_loss -0.001 | v_loss 0.205 | ent 0.246 | kl 0.0007/0.0150 | clipfrac 0.007 | ev 0.544 | lr 7.94e-05 | ent_coef 0.044
+>>> [PPO-Turbo] Upd 420 | Step 6881280/10000000 (68.8%) | Ret 34.72 | pg_loss -0.001 | v_loss 0.178 | ent 0.252 | kl 0.0009/0.0150 | clipfrac 0.009 | ev 0.688 | lr 7.64e-05 | ent_coef 0.043
+>>> [PPO-Turbo] Upd 430 | Step 7045120/10000000 (70.5%) | Ret 36.55 | pg_loss -0.001 | v_loss 0.194 | ent 0.254 | kl 0.0009/0.0150 | clipfrac 0.008 | ev 0.664 | lr 7.35e-05 | ent_coef 0.042
+>>> [PPO-Turbo] Upd 440 | Step 7208960/10000000 (72.1%) | Ret 34.99 | pg_loss -0.001 | v_loss 0.182 | ent 0.238 | kl 0.0015/0.0150 | clipfrac 0.018 | ev 0.656 | lr 7.05e-05 | ent_coef 0.041
+>>> [PPO-Turbo] Upd 450 | Step 7372800/10000000 (73.7%) | Ret 37.65 | pg_loss -0.001 | v_loss 0.179 | ent 0.242 | kl 0.0006/0.0150 | clipfrac 0.005 | ev 0.704 | lr 6.76e-05 | ent_coef 0.040
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 37.65
+>>> [PPO-Turbo] Upd 460 | Step 7536640/10000000 (75.4%) | Ret 37.14 | pg_loss -0.001 | v_loss 0.216 | ent 0.238 | kl 0.0007/0.0150 | clipfrac 0.005 | ev 0.721 | lr 6.46e-05 | ent_coef 0.039
+>>> [PPO-Turbo] Upd 470 | Step 7700480/10000000 (77.0%) | Ret 36.80 | pg_loss -0.001 | v_loss 0.175 | ent 0.232 | kl 0.0011/0.0150 | clipfrac 0.011 | ev 0.695 | lr 6.17e-05 | ent_coef 0.039
+>>> [PPO-Turbo] Upd 480 | Step 7864320/10000000 (78.6%) | Ret 39.48 | pg_loss -0.001 | v_loss 0.184 | ent 0.232 | kl 0.0010/0.0150 | clipfrac 0.010 | ev 0.710 | lr 5.87e-05 | ent_coef 0.038
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 39.48
+>>> [PPO-Turbo] Upd 490 | Step 8028160/10000000 (80.3%) | Ret 42.04 | pg_loss -0.001 | v_loss 0.166 | ent 0.230 | kl 0.0008/0.0150 | clipfrac 0.007 | ev 0.752 | lr 5.58e-05 | ent_coef 0.037
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_best.pth | Ret 42.04
+>>> [PPO-Turbo] Upd 500 | Step 8192000/10000000 (81.9%) | Ret 33.74 | pg_loss -0.001 | v_loss 0.198 | ent 0.228 | kl 0.0011/0.0150 | clipfrac 0.012 | ev 0.733 | lr 5.28e-05 | ent_coef 0.036
+>>> [PPO-Turbo] Upd 510 | Step 8355840/10000000 (83.6%) | Ret 34.81 | pg_loss -0.000 | v_loss 0.191 | ent 0.223 | kl 0.0005/0.0150 | clipfrac 0.004 | ev 0.710 | lr 4.99e-05 | ent_coef 0.035
+>>> [PPO-Turbo] Upd 520 | Step 8519680/10000000 (85.2%) | Ret 33.79 | pg_loss -0.001 | v_loss 0.230 | ent 0.230 | kl 0.0010/0.0150 | clipfrac 0.009 | ev 0.694 | lr 4.69e-05 | ent_coef 0.034
+>>> [PPO-Turbo] Upd 530 | Step 8683520/10000000 (86.8%) | Ret 35.99 | pg_loss -0.000 | v_loss 0.133 | ent 0.232 | kl 0.0009/0.0150 | clipfrac 0.010 | ev 0.758 | lr 4.40e-05 | ent_coef 0.033
+>>> [PPO-Turbo] Upd 540 | Step 8847360/10000000 (88.5%) | Ret 34.36 | pg_loss -0.000 | v_loss 0.177 | ent 0.230 | kl 0.0009/0.0150 | clipfrac 0.009 | ev 0.724 | lr 4.10e-05 | ent_coef 0.032
+>>> [PPO-Turbo] Upd 550 | Step 9011200/10000000 (90.1%) | Ret 38.16 | pg_loss -0.000 | v_loss 0.196 | ent 0.215 | kl 0.0009/0.0150 | clipfrac 0.008 | ev 0.709 | lr 3.81e-05 | ent_coef 0.031
+>>> [PPO-Turbo] Upd 560 | Step 9175040/10000000 (91.8%) | Ret 36.30 | pg_loss -0.001 | v_loss 0.216 | ent 0.225 | kl 0.0007/0.0150 | clipfrac 0.007 | ev 0.698 | lr 3.51e-05 | ent_coef 0.031
+>>> [PPO-Turbo] Upd 570 | Step 9338880/10000000 (93.4%) | Ret 37.22 | pg_loss -0.001 | v_loss 0.224 | ent 0.212 | kl 0.0007/0.0150 | clipfrac 0.009 | ev 0.690 | lr 3.22e-05 | ent_coef 0.030
+>>> [PPO-Turbo] Upd 580 | Step 9502720/10000000 (95.0%) | Ret 36.14 | pg_loss -0.001 | v_loss 0.217 | ent 0.220 | kl 0.0010/0.0150 | clipfrac 0.013 | ev 0.712 | lr 2.92e-05 | ent_coef 0.029
+>>> [PPO-Turbo] Upd 590 | Step 9666560/10000000 (96.7%) | Ret 37.87 | pg_loss -0.000 | v_loss 0.220 | ent 0.214 | kl 0.0001/0.0150 | clipfrac 0.000 | ev 0.688 | lr 2.63e-05 | ent_coef 0.028
+>>> [PPO-Turbo] Upd 600 | Step 9830400/10000000 (98.3%) | Ret 39.43 | pg_loss -0.000 | v_loss 0.162 | ent 0.219 | kl 0.0007/0.0150 | clipfrac 0.008 | ev 0.768 | lr 2.33e-05 | ent_coef 0.027
+>>> [PPO-Turbo] Upd 610 | Step 9994240/10000000 (99.9%) | Ret 37.97 | pg_loss -0.000 | v_loss 0.193 | ent 0.204 | kl 0.0001/0.0150 | clipfrac 0.000 | ev 0.730 | lr 2.04e-05 | ent_coef 0.026
+>>> [PPO-Turbo] Finished. Saved to agent/checkpoints/ppo_best.final.pth
+>>> [PPO-Curriculum] Phase completed successfully.
+
+>>> [PPO-Curriculum] Starting Phase: 2. Fine-tuning (Battle + Self-Play) -> agent/checkpoints/ppo_battle_best.final.pth
+>>> Command: train_ppo.py --load agent/checkpoints/ppo_best.final.pth --steps 10000000 --envs 64 --rollout-steps 128 --update-epochs 2 --minibatch-size 4096 --lr 0.00015 --target-kl 0.015 --finetune-lr 5e-05 --finetune-target-kl 0.03 --self-play-prob 0.3
+>>> [PPO-Turbo] Device=cuda | snakes=4 | envs=64 | steps=10000000
+>>> [PPO] Loading weights from agent/checkpoints/ppo_best.final.pth
+>>> [PPO-Turbo] torch.compile() enabled.
+>>> [PPO-Turbo] Fine-tuning mode: LR=5.00e-05, Ent=0.12, KL=0.03
+>>> [PPO-Turbo] Initializing Parallel Environments...
+>>> [PPO-Turbo] Environments Ready. Resetting...
+>>> [PPO-Turbo] Setup finished. Starting training loop...
+>>> [PPO-Turbo] Upd 1 | Step 8192/10000000 (0.1%) | Ret 1.86 | Win% 72.2 | Score0 633.3 | pg_loss -0.001 | v_loss 0.366 | ent 0.255 | kl 0.0021/0.0300 | clipfrac 0.030 | ev 0.158 | lr 5.00e-05 | ent_coef 0.120
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_battle_best.pth | Win% 72.2 | Score0 633.3
+>>> [PPO-Turbo] Upd 2 | Step 16384/10000000 (0.2%) | Ret 2.29 | Win% 67.4 | Score0 707.3 | pg_loss -0.001 | v_loss 0.299 | ent 0.310 | kl 0.0002/0.0300 | clipfrac 0.000 | ev 0.160 | lr 5.00e-05 | ent_coef 0.120
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_battle_best.pth | Win% 67.4 | Score0 707.3
+>>> [PPO-Turbo] Upd 3 | Step 24576/10000000 (0.2%) | Ret 2.03 | Win% 64.5 | Score0 740.1 | pg_loss -0.000 | v_loss 0.302 | ent 0.274 | kl 0.0006/0.0300 | clipfrac 0.006 | ev 0.102 | lr 4.99e-05 | ent_coef 0.120
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_battle_best.pth | Win% 64.5 | Score0 740.1
+>>> [PPO-Turbo] Upd 4 | Step 32768/10000000 (0.3%) | Ret 2.09 | Win% 59.5 | Score0 785.6 | pg_loss -0.000 | v_loss 0.254 | ent 0.293 | kl 0.0002/0.0300 | clipfrac 0.002 | ev 0.034 | lr 4.99e-05 | ent_coef 0.120
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_battle_best.pth | Win% 59.5 | Score0 785.6
+>>> [PPO-Turbo] Upd 5 | Step 40960/10000000 (0.4%) | Ret 2.28 | Win% 60.0 | Score0 834.4 | pg_loss -0.001 | v_loss 0.179 | ent 0.250 | kl 0.0005/0.0300 | clipfrac 0.005 | ev -0.047 | lr 4.99e-05 | ent_coef 0.120
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_battle_best.pth | Win% 60.0 | Score0 834.4
+>>> [PPO-Turbo] Upd 6 | Step 49152/10000000 (0.5%) | Ret 2.66 | Win% 60.0 | Score0 871.2 | pg_loss -0.001 | v_loss 0.153 | ent 0.266 | kl 0.0005/0.0300 | clipfrac 0.006 | ev -0.070 | lr 4.98e-05 | ent_coef 0.120
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_battle_best.pth | Win% 60.0 | Score0 871.2
+>>> [PPO-Turbo] Upd 7 | Step 57344/10000000 (0.6%) | Ret 2.69 | Win% 58.5 | Score0 943.9 | pg_loss -0.000 | v_loss 0.165 | ent 0.299 | kl 0.0003/0.0300 | clipfrac 0.002 | ev -0.031 | lr 4.98e-05 | ent_coef 0.120
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_battle_best.pth | Win% 58.5 | Score0 943.9
+>>> [PPO-Turbo] Upd 8 | Step 65536/10000000 (0.7%) | Ret 2.97 | Win% 56.0 | Score0 985.0 | pg_loss -0.001 | v_loss 0.174 | ent 0.319 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.054 | lr 4.97e-05 | ent_coef 0.119
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_battle_best.pth | Win% 56.0 | Score0 985.0
+>>> [PPO-Turbo] Upd 9 | Step 73728/10000000 (0.7%) | Ret 2.61 | Win% 60.0 | Score0 986.8 | pg_loss -0.000 | v_loss 0.164 | ent 0.346 | kl 0.0007/0.0300 | clipfrac 0.008 | ev -0.144 | lr 4.97e-05 | ent_coef 0.119
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_battle_best.pth | Win% 60.0 | Score0 986.8
+>>> [PPO-Turbo] Upd 10 | Step 81920/10000000 (0.8%) | Ret 2.38 | Win% 65.5 | Score0 925.0 | pg_loss -0.000 | v_loss 0.134 | ent 0.274 | kl 0.0004/0.0300 | clipfrac 0.002 | ev -0.082 | lr 4.97e-05 | ent_coef 0.119
+>>> [PPO-Turbo] Upd 20 | Step 163840/10000000 (1.6%) | Ret 3.04 | Win% 65.5 | Score0 1014.2 | pg_loss -0.001 | v_loss 0.116 | ent 0.263 | kl 0.0004/0.0300 | clipfrac 0.003 | ev 0.262 | lr 4.93e-05 | ent_coef 0.119
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_battle_best.pth | Win% 65.5 | Score0 1014.2
+>>> [PPO-Turbo] Upd 30 | Step 245760/10000000 (2.5%) | Ret 3.34 | Win% 73.0 | Score0 1045.3 | pg_loss -0.000 | v_loss 0.137 | ent 0.272 | kl 0.0002/0.0300 | clipfrac 0.001 | ev 0.301 | lr 4.89e-05 | ent_coef 0.118
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_battle_best.pth | Win% 73.0 | Score0 1045.3
+>>> [PPO-Turbo] Upd 40 | Step 327680/10000000 (3.3%) | Ret 3.24 | Win% 66.0 | Score0 1166.2 | pg_loss -0.000 | v_loss 0.120 | ent 0.308 | kl 0.0002/0.0300 | clipfrac 0.000 | ev 0.455 | lr 4.86e-05 | ent_coef 0.117
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_battle_best.pth | Win% 66.0 | Score0 1166.2
+>>> [PPO-Turbo] Upd 50 | Step 409600/10000000 (4.1%) | Ret 2.87 | Win% 67.5 | Score0 962.2 | pg_loss -0.001 | v_loss 0.141 | ent 0.339 | kl 0.0003/0.0300 | clipfrac 0.001 | ev 0.519 | lr 4.82e-05 | ent_coef 0.116
+>>> [PPO-Turbo] Upd 60 | Step 491520/10000000 (4.9%) | Ret 3.25 | Win% 65.5 | Score0 1068.6 | pg_loss -0.000 | v_loss 0.139 | ent 0.325 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.418 | lr 4.78e-05 | ent_coef 0.116
+>>> [PPO-Turbo] Upd 70 | Step 573440/10000000 (5.7%) | Ret 3.45 | Win% 67.0 | Score0 1094.3 | pg_loss -0.001 | v_loss 0.141 | ent 0.327 | kl 0.0006/0.0300 | clipfrac 0.005 | ev 0.327 | lr 4.75e-05 | ent_coef 0.115
+>>> [PPO-Turbo] Upd 80 | Step 655360/10000000 (6.6%) | Ret 3.08 | Win% 71.5 | Score0 1131.8 | pg_loss -0.001 | v_loss 0.133 | ent 0.342 | kl 0.0003/0.0300 | clipfrac 0.001 | ev 0.472 | lr 4.71e-05 | ent_coef 0.114
+>>> [PPO-Turbo] Upd 90 | Step 737280/10000000 (7.4%) | Ret 3.50 | Win% 75.0 | Score0 1256.8 | pg_loss -0.001 | v_loss 0.159 | ent 0.340 | kl 0.0003/0.0300 | clipfrac 0.003 | ev 0.418 | lr 4.67e-05 | ent_coef 0.113
+>>> [PPO-Turbo][Best] Saved -> agent/checkpoints/ppo_battle_best.pth | Win% 75.0 | Score0 1256.8
+>>> [PPO-Turbo] Upd 100 | Step 819200/10000000 (8.2%) | Ret 3.49 | Win% 72.0 | Score0 1204.7 | pg_loss -0.000 | v_loss 0.128 | ent 0.363 | kl 0.0002/0.0300 | clipfrac 0.000 | ev 0.486 | lr 4.64e-05 | ent_coef 0.113
+>>> [PPO-Turbo] Upd 110 | Step 901120/10000000 (9.0%) | Ret 3.08 | Win% 62.0 | Score0 1070.1 | pg_loss -0.001 | v_loss 0.137 | ent 0.392 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.531 | lr 4.60e-05 | ent_coef 0.112
+>>> [PPO-Turbo] Upd 120 | Step 983040/10000000 (9.8%) | Ret 3.05 | Win% 69.5 | Score0 1080.0 | pg_loss -0.001 | v_loss 0.125 | ent 0.386 | kl 0.0008/0.0300 | clipfrac 0.006 | ev 0.560 | lr 4.56e-05 | ent_coef 0.111
+>>> [PPO-Turbo] Upd 130 | Step 1064960/10000000 (10.6%) | Ret 3.34 | Win% 69.5 | Score0 1149.1 | pg_loss -0.000 | v_loss 0.128 | ent 0.358 | kl 0.0002/0.0300 | clipfrac 0.000 | ev 0.361 | lr 4.52e-05 | ent_coef 0.110
+>>> [PPO-Turbo] Upd 140 | Step 1146880/10000000 (11.5%) | Ret 3.58 | Win% 67.5 | Score0 1202.0 | pg_loss -0.001 | v_loss 0.137 | ent 0.406 | kl 0.0004/0.0300 | clipfrac 0.002 | ev 0.500 | lr 4.49e-05 | ent_coef 0.110
+>>> [PPO-Turbo] Upd 150 | Step 1228800/10000000 (12.3%) | Ret 3.12 | Win% 61.5 | Score0 1167.3 | pg_loss -0.001 | v_loss 0.112 | ent 0.406 | kl 0.0006/0.0300 | clipfrac 0.001 | ev 0.538 | lr 4.45e-05 | ent_coef 0.109
+>>> [PPO-Turbo] Upd 160 | Step 1310720/10000000 (13.1%) | Ret 3.08 | Win% 66.5 | Score0 1126.5 | pg_loss -0.001 | v_loss 0.120 | ent 0.387 | kl 0.0005/0.0300 | clipfrac 0.001 | ev 0.392 | lr 4.41e-05 | ent_coef 0.108
+>>> [PPO-Turbo] Upd 170 | Step 1392640/10000000 (13.9%) | Ret 2.61 | Win% 60.0 | Score0 982.3 | pg_loss -0.000 | v_loss 0.126 | ent 0.415 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.500 | lr 4.38e-05 | ent_coef 0.108
+>>> [PPO-Turbo] Upd 180 | Step 1474560/10000000 (14.7%) | Ret 3.36 | Win% 67.0 | Score0 1085.5 | pg_loss -0.001 | v_loss 0.114 | ent 0.420 | kl 0.0007/0.0300 | clipfrac 0.003 | ev 0.490 | lr 4.34e-05 | ent_coef 0.107
+>>> [PPO-Turbo] Upd 190 | Step 1556480/10000000 (15.6%) | Ret 3.51 | Win% 69.0 | Score0 1168.5 | pg_loss -0.000 | v_loss 0.155 | ent 0.412 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.363 | lr 4.30e-05 | ent_coef 0.106
+>>> [PPO-Turbo] Upd 200 | Step 1638400/10000000 (16.4%) | Ret 3.21 | Win% 68.5 | Score0 1084.5 | pg_loss -0.001 | v_loss 0.109 | ent 0.446 | kl 0.0005/0.0300 | clipfrac 0.002 | ev 0.547 | lr 4.27e-05 | ent_coef 0.105
+>>> [PPO-Turbo] Upd 210 | Step 1720320/10000000 (17.2%) | Ret 3.73 | Win% 68.0 | Score0 1148.5 | pg_loss -0.000 | v_loss 0.112 | ent 0.422 | kl 0.0004/0.0300 | clipfrac 0.002 | ev 0.393 | lr 4.23e-05 | ent_coef 0.105
+>>> [PPO-Turbo] Upd 220 | Step 1802240/10000000 (18.0%) | Ret 2.78 | Win% 66.5 | Score0 1018.4 | pg_loss -0.000 | v_loss 0.107 | ent 0.436 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.484 | lr 4.19e-05 | ent_coef 0.104
+>>> [PPO-Turbo] Upd 230 | Step 1884160/10000000 (18.8%) | Ret 3.28 | Win% 64.0 | Score0 1097.2 | pg_loss -0.000 | v_loss 0.134 | ent 0.458 | kl 0.0002/0.0300 | clipfrac 0.000 | ev 0.496 | lr 4.16e-05 | ent_coef 0.103
+>>> [PPO-Turbo] Upd 240 | Step 1966080/10000000 (19.7%) | Ret 3.13 | Win% 68.0 | Score0 1014.3 | pg_loss -0.001 | v_loss 0.112 | ent 0.467 | kl 0.0006/0.0300 | clipfrac 0.002 | ev 0.528 | lr 4.12e-05 | ent_coef 0.102
+>>> [PPO-Turbo] Upd 250 | Step 2048000/10000000 (20.5%) | Ret 3.06 | Win% 64.5 | Score0 1055.0 | pg_loss -0.001 | v_loss 0.119 | ent 0.446 | kl 0.0004/0.0300 | clipfrac 0.000 | ev 0.433 | lr 4.08e-05 | ent_coef 0.102
+>>> [PPO-Turbo] Upd 260 | Step 2129920/10000000 (21.3%) | Ret 2.76 | Win% 59.5 | Score0 873.8 | pg_loss -0.000 | v_loss 0.108 | ent 0.526 | kl 0.0002/0.0300 | clipfrac 0.000 | ev 0.606 | lr 4.05e-05 | ent_coef 0.101
+>>> [PPO-Turbo] Upd 270 | Step 2211840/10000000 (22.1%) | Ret 2.31 | Win% 60.0 | Score0 865.5 | pg_loss -0.001 | v_loss 0.098 | ent 0.461 | kl 0.0003/0.0300 | clipfrac 0.000 | ev 0.544 | lr 4.01e-05 | ent_coef 0.100
+>>> [PPO-Turbo] Upd 280 | Step 2293760/10000000 (22.9%) | Ret 2.25 | Win% 64.5 | Score0 819.0 | pg_loss -0.000 | v_loss 0.109 | ent 0.455 | kl 0.0002/0.0300 | clipfrac 0.000 | ev 0.472 | lr 3.97e-05 | ent_coef 0.099
+>>> [PPO-Turbo] Upd 290 | Step 2375680/10000000 (23.8%) | Ret 2.65 | Win% 62.5 | Score0 1036.5 | pg_loss -0.000 | v_loss 0.136 | ent 0.466 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.488 | lr 3.93e-05 | ent_coef 0.099
+>>> [PPO-Turbo] Upd 300 | Step 2457600/10000000 (24.6%) | Ret 3.00 | Win% 57.0 | Score0 853.8 | pg_loss -0.000 | v_loss 0.099 | ent 0.474 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.489 | lr 3.90e-05 | ent_coef 0.098
+>>> [PPO-Turbo] Upd 310 | Step 2539520/10000000 (25.4%) | Ret 2.33 | Win% 61.5 | Score0 830.1 | pg_loss -0.000 | v_loss 0.110 | ent 0.486 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.479 | lr 3.86e-05 | ent_coef 0.097
+>>> [PPO-Turbo] Upd 320 | Step 2621440/10000000 (26.2%) | Ret 2.66 | Win% 59.0 | Score0 951.1 | pg_loss -0.001 | v_loss 0.107 | ent 0.492 | kl 0.0005/0.0300 | clipfrac 0.001 | ev 0.534 | lr 3.82e-05 | ent_coef 0.096
+>>> [PPO-Turbo] Upd 330 | Step 2703360/10000000 (27.0%) | Ret 3.05 | Win% 64.0 | Score0 938.9 | pg_loss -0.000 | v_loss 0.118 | ent 0.460 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.430 | lr 3.79e-05 | ent_coef 0.096
+>>> [PPO-Turbo] Upd 340 | Step 2785280/10000000 (27.9%) | Ret 3.14 | Win% 62.0 | Score0 1109.0 | pg_loss -0.000 | v_loss 0.101 | ent 0.520 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.598 | lr 3.75e-05 | ent_coef 0.095
+>>> [PPO-Turbo] Upd 350 | Step 2867200/10000000 (28.7%) | Ret 2.92 | Win% 64.0 | Score0 982.7 | pg_loss -0.000 | v_loss 0.100 | ent 0.488 | kl 0.0002/0.0300 | clipfrac 0.000 | ev 0.543 | lr 3.71e-05 | ent_coef 0.094
+>>> [PPO-Turbo] Upd 360 | Step 2949120/10000000 (29.5%) | Ret 2.77 | Win% 63.0 | Score0 997.8 | pg_loss -0.000 | v_loss 0.119 | ent 0.491 | kl 0.0002/0.0300 | clipfrac 0.000 | ev 0.467 | lr 3.68e-05 | ent_coef 0.094
+>>> [PPO-Turbo] Upd 370 | Step 3031040/10000000 (30.3%) | Ret 2.68 | Win% 61.5 | Score0 944.0 | pg_loss -0.000 | v_loss 0.116 | ent 0.504 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.450 | lr 3.64e-05 | ent_coef 0.093
+>>> [PPO-Turbo] Upd 380 | Step 3112960/10000000 (31.1%) | Ret 2.72 | Win% 63.0 | Score0 949.3 | pg_loss -0.000 | v_loss 0.114 | ent 0.553 | kl 0.0006/0.0300 | clipfrac 0.001 | ev 0.570 | lr 3.60e-05 | ent_coef 0.092
+>>> [PPO-Turbo] Upd 390 | Step 3194880/10000000 (31.9%) | Ret 2.60 | Win% 63.5 | Score0 876.6 | pg_loss -0.000 | v_loss 0.086 | ent 0.514 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.601 | lr 3.57e-05 | ent_coef 0.091
+>>> [PPO-Turbo] Upd 400 | Step 3276800/10000000 (32.8%) | Ret 2.84 | Win% 61.0 | Score0 944.4 | pg_loss -0.001 | v_loss 0.105 | ent 0.534 | kl 0.0004/0.0300 | clipfrac 0.000 | ev 0.566 | lr 3.53e-05 | ent_coef 0.091
+>>> [PPO-Turbo] Upd 410 | Step 3358720/10000000 (33.6%) | Ret 2.49 | Win% 55.0 | Score0 830.9 | pg_loss -0.000 | v_loss 0.108 | ent 0.517 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.522 | lr 3.49e-05 | ent_coef 0.090
+>>> [PPO-Turbo] Upd 420 | Step 3440640/10000000 (34.4%) | Ret 2.93 | Win% 61.0 | Score0 864.5 | pg_loss -0.000 | v_loss 0.087 | ent 0.540 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.580 | lr 3.46e-05 | ent_coef 0.089
+>>> [PPO-Turbo] Upd 430 | Step 3522560/10000000 (35.2%) | Ret 2.34 | Win% 59.0 | Score0 823.9 | pg_loss -0.000 | v_loss 0.112 | ent 0.492 | kl 0.0002/0.0300 | clipfrac 0.000 | ev 0.450 | lr 3.42e-05 | ent_coef 0.088
+>>> [PPO-Turbo] Upd 440 | Step 3604480/10000000 (36.0%) | Ret 2.50 | Win% 61.5 | Score0 924.1 | pg_loss -0.000 | v_loss 0.107 | ent 0.521 | kl 0.0002/0.0300 | clipfrac 0.000 | ev 0.491 | lr 3.38e-05 | ent_coef 0.088
+>>> [PPO-Turbo] Upd 450 | Step 3686400/10000000 (36.9%) | Ret 3.09 | Win% 61.0 | Score0 1043.8 | pg_loss -0.000 | v_loss 0.090 | ent 0.521 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.559 | lr 3.34e-05 | ent_coef 0.087
+>>> [PPO-Turbo] Upd 460 | Step 3768320/10000000 (37.7%) | Ret 2.93 | Win% 64.5 | Score0 1030.3 | pg_loss -0.000 | v_loss 0.104 | ent 0.501 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.479 | lr 3.31e-05 | ent_coef 0.086
+>>> [PPO-Turbo] Upd 470 | Step 3850240/10000000 (38.5%) | Ret 2.82 | Win% 62.5 | Score0 1024.1 | pg_loss -0.000 | v_loss 0.099 | ent 0.524 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.539 | lr 3.27e-05 | ent_coef 0.085
+>>> [PPO-Turbo] Upd 480 | Step 3932160/10000000 (39.3%) | Ret 2.57 | Win% 51.0 | Score0 891.5 | pg_loss -0.000 | v_loss 0.103 | ent 0.521 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.572 | lr 3.23e-05 | ent_coef 0.085
+>>> [PPO-Turbo] Upd 490 | Step 4014080/10000000 (40.1%) | Ret 2.86 | Win% 67.0 | Score0 880.6 | pg_loss -0.000 | v_loss 0.109 | ent 0.493 | kl 0.0003/0.0300 | clipfrac 0.000 | ev 0.419 | lr 3.20e-05 | ent_coef 0.084
+>>> [PPO-Turbo] Upd 500 | Step 4096000/10000000 (41.0%) | Ret 2.86 | Win% 60.0 | Score0 914.2 | pg_loss -0.001 | v_loss 0.111 | ent 0.541 | kl 0.0002/0.0300 | clipfrac 0.000 | ev 0.544 | lr 3.16e-05 | ent_coef 0.083
+>>> [PPO-Turbo] Upd 510 | Step 4177920/10000000 (41.8%) | Ret 3.08 | Win% 63.0 | Score0 1046.2 | pg_loss -0.000 | v_loss 0.104 | ent 0.510 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.525 | lr 3.12e-05 | ent_coef 0.082
+>>> [PPO-Turbo] Upd 520 | Step 4259840/10000000 (42.6%) | Ret 2.90 | Win% 65.0 | Score0 974.8 | pg_loss -0.000 | v_loss 0.106 | ent 0.532 | kl 0.0002/0.0300 | clipfrac 0.000 | ev 0.590 | lr 3.09e-05 | ent_coef 0.082
+>>> [PPO-Turbo] Upd 530 | Step 4341760/10000000 (43.4%) | Ret 2.89 | Win% 68.0 | Score0 979.8 | pg_loss -0.001 | v_loss 0.136 | ent 0.516 | kl 0.0002/0.0300 | clipfrac 0.000 | ev 0.510 | lr 3.05e-05 | ent_coef 0.081
+>>> [PPO-Turbo] Upd 540 | Step 4423680/10000000 (44.2%) | Ret 2.95 | Win% 57.0 | Score0 934.4 | pg_loss -0.000 | v_loss 0.107 | ent 0.532 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.545 | lr 3.01e-05 | ent_coef 0.080
+>>> [PPO-Turbo] Upd 550 | Step 4505600/10000000 (45.1%) | Ret 3.01 | Win% 62.5 | Score0 958.2 | pg_loss -0.001 | v_loss 0.098 | ent 0.530 | kl 0.0004/0.0300 | clipfrac 0.000 | ev 0.546 | lr 2.98e-05 | ent_coef 0.080
+>>> [PPO-Turbo] Upd 560 | Step 4587520/10000000 (45.9%) | Ret 3.05 | Win% 62.0 | Score0 1009.8 | pg_loss -0.000 | v_loss 0.098 | ent 0.537 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.564 | lr 2.94e-05 | ent_coef 0.079
+>>> [PPO-Turbo] Upd 570 | Step 4669440/10000000 (46.7%) | Ret 2.68 | Win% 56.5 | Score0 982.8 | pg_loss -0.000 | v_loss 0.095 | ent 0.515 | kl 0.0002/0.0300 | clipfrac 0.000 | ev 0.502 | lr 2.90e-05 | ent_coef 0.078
+>>> [PPO-Turbo] Upd 580 | Step 4751360/10000000 (47.5%) | Ret 3.02 | Win% 57.0 | Score0 908.0 | pg_loss -0.000 | v_loss 0.091 | ent 0.561 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.613 | lr 2.87e-05 | ent_coef 0.077
+>>> [PPO-Turbo] Upd 590 | Step 4833280/10000000 (48.3%) | Ret 2.57 | Win% 56.5 | Score0 872.4 | pg_loss -0.001 | v_loss 0.103 | ent 0.527 | kl 0.0003/0.0300 | clipfrac 0.000 | ev 0.462 | lr 2.83e-05 | ent_coef 0.077
+>>> [PPO-Turbo] Upd 600 | Step 4915200/10000000 (49.2%) | Ret 2.58 | Win% 53.5 | Score0 855.6 | pg_loss -0.000 | v_loss 0.116 | ent 0.541 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.494 | lr 2.79e-05 | ent_coef 0.076
+>>> [PPO-Turbo] Upd 610 | Step 4997120/10000000 (50.0%) | Ret 2.16 | Win% 51.0 | Score0 879.2 | pg_loss -0.000 | v_loss 0.085 | ent 0.551 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.586 | lr 2.75e-05 | ent_coef 0.075
+>>> [PPO-Turbo] Upd 620 | Step 5079040/10000000 (50.8%) | Ret 3.07 | Win% 63.0 | Score0 977.4 | pg_loss -0.000 | v_loss 0.102 | ent 0.528 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.522 | lr 2.72e-05 | ent_coef 0.074
+>>> [PPO-Turbo] Upd 630 | Step 5160960/10000000 (51.6%) | Ret 2.41 | Win% 56.0 | Score0 956.7 | pg_loss -0.000 | v_loss 0.106 | ent 0.540 | kl 0.0002/0.0300 | clipfrac 0.000 | ev 0.550 | lr 2.68e-05 | ent_coef 0.074
+>>> [PPO-Turbo] Upd 640 | Step 5242880/10000000 (52.4%) | Ret 2.55 | Win% 52.5 | Score0 803.1 | pg_loss -0.000 | v_loss 0.111 | ent 0.556 | kl 0.0002/0.0300 | clipfrac 0.000 | ev 0.566 | lr 2.64e-05 | ent_coef 0.073
+>>> [PPO-Turbo] Upd 650 | Step 5324800/10000000 (53.2%) | Ret 2.77 | Win% 55.5 | Score0 924.4 | pg_loss -0.000 | v_loss 0.083 | ent 0.536 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.543 | lr 2.61e-05 | ent_coef 0.072
+>>> [PPO-Turbo] Upd 660 | Step 5406720/10000000 (54.1%) | Ret 2.92 | Win% 60.0 | Score0 888.5 | pg_loss 0.000 | v_loss 0.097 | ent 0.538 | kl 0.0003/0.0300 | clipfrac 0.000 | ev 0.545 | lr 2.57e-05 | ent_coef 0.071
+>>> [PPO-Turbo] Upd 670 | Step 5488640/10000000 (54.9%) | Ret 2.93 | Win% 54.5 | Score0 847.9 | pg_loss -0.000 | v_loss 0.108 | ent 0.554 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.519 | lr 2.53e-05 | ent_coef 0.071
+>>> [PPO-Turbo] Upd 680 | Step 5570560/10000000 (55.7%) | Ret 2.81 | Win% 59.0 | Score0 956.7 | pg_loss -0.001 | v_loss 0.122 | ent 0.508 | kl 0.0004/0.0300 | clipfrac 0.000 | ev 0.378 | lr 2.50e-05 | ent_coef 0.070
+>>> [PPO-Turbo] Upd 690 | Step 5652480/10000000 (56.5%) | Ret 2.70 | Win% 58.0 | Score0 879.3 | pg_loss -0.000 | v_loss 0.098 | ent 0.527 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.532 | lr 2.46e-05 | ent_coef 0.069
+>>> [PPO-Turbo] Upd 700 | Step 5734400/10000000 (57.3%) | Ret 2.60 | Win% 57.0 | Score0 853.9 | pg_loss -0.000 | v_loss 0.096 | ent 0.512 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.526 | lr 2.42e-05 | ent_coef 0.068
+>>> [PPO-Turbo] Upd 710 | Step 5816320/10000000 (58.2%) | Ret 2.69 | Win% 59.5 | Score0 896.1 | pg_loss -0.000 | v_loss 0.105 | ent 0.516 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.405 | lr 2.39e-05 | ent_coef 0.068
+>>> [PPO-Turbo] Upd 720 | Step 5898240/10000000 (59.0%) | Ret 2.69 | Win% 63.5 | Score0 946.5 | pg_loss -0.000 | v_loss 0.089 | ent 0.562 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.626 | lr 2.35e-05 | ent_coef 0.067
+>>> [PPO-Turbo] Upd 730 | Step 5980160/10000000 (59.8%) | Ret 2.44 | Win% 53.0 | Score0 775.5 | pg_loss -0.000 | v_loss 0.101 | ent 0.517 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.441 | lr 2.31e-05 | ent_coef 0.066
+>>> [PPO-Turbo] Upd 740 | Step 6062080/10000000 (60.6%) | Ret 3.04 | Win% 55.0 | Score0 1013.9 | pg_loss -0.000 | v_loss 0.091 | ent 0.567 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.611 | lr 2.28e-05 | ent_coef 0.066
+>>> [PPO-Turbo] Upd 750 | Step 6144000/10000000 (61.4%) | Ret 2.64 | Win% 58.5 | Score0 916.6 | pg_loss -0.000 | v_loss 0.101 | ent 0.542 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.566 | lr 2.24e-05 | ent_coef 0.065
+>>> [PPO-Turbo] Upd 760 | Step 6225920/10000000 (62.3%) | Ret 2.67 | Win% 52.0 | Score0 858.7 | pg_loss -0.000 | v_loss 0.080 | ent 0.519 | kl 0.0002/0.0300 | clipfrac 0.000 | ev 0.604 | lr 2.20e-05 | ent_coef 0.064
+>>> [PPO-Turbo] Upd 770 | Step 6307840/10000000 (63.1%) | Ret 2.89 | Win% 57.5 | Score0 934.5 | pg_loss 0.000 | v_loss 0.099 | ent 0.539 | kl 0.0004/0.0300 | clipfrac 0.000 | ev 0.538 | lr 2.17e-05 | ent_coef 0.063
+>>> [PPO-Turbo] Upd 780 | Step 6389760/10000000 (63.9%) | Ret 2.72 | Win% 56.5 | Score0 949.8 | pg_loss -0.000 | v_loss 0.092 | ent 0.546 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.586 | lr 2.13e-05 | ent_coef 0.063
+>>> [PPO-Turbo] Upd 790 | Step 6471680/10000000 (64.7%) | Ret 2.82 | Win% 57.5 | Score0 784.1 | pg_loss -0.000 | v_loss 0.090 | ent 0.521 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.518 | lr 2.09e-05 | ent_coef 0.062
+>>> [PPO-Turbo] Upd 800 | Step 6553600/10000000 (65.5%) | Ret 2.63 | Win% 58.0 | Score0 918.6 | pg_loss -0.000 | v_loss 0.094 | ent 0.526 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.557 | lr 2.05e-05 | ent_coef 0.061
+>>> [PPO-Turbo] Upd 810 | Step 6635520/10000000 (66.4%) | Ret 2.65 | Win% 57.5 | Score0 972.1 | pg_loss -0.000 | v_loss 0.091 | ent 0.547 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.608 | lr 2.02e-05 | ent_coef 0.060
+>>> [PPO-Turbo] Upd 820 | Step 6717440/10000000 (67.2%) | Ret 2.59 | Win% 55.5 | Score0 901.0 | pg_loss -0.000 | v_loss 0.137 | ent 0.535 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.458 | lr 1.98e-05 | ent_coef 0.060
+>>> [PPO-Turbo] Upd 830 | Step 6799360/10000000 (68.0%) | Ret 2.07 | Win% 54.0 | Score0 769.2 | pg_loss -0.000 | v_loss 0.105 | ent 0.593 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.616 | lr 1.94e-05 | ent_coef 0.059
+>>> [PPO-Turbo] Upd 840 | Step 6881280/10000000 (68.8%) | Ret 2.80 | Win% 58.0 | Score0 894.0 | pg_loss -0.000 | v_loss 0.104 | ent 0.521 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.527 | lr 1.91e-05 | ent_coef 0.058
+>>> [PPO-Turbo] Upd 850 | Step 6963200/10000000 (69.6%) | Ret 1.97 | Win% 56.5 | Score0 854.2 | pg_loss -0.000 | v_loss 0.108 | ent 0.515 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.482 | lr 1.87e-05 | ent_coef 0.057
+>>> [PPO-Turbo] Upd 860 | Step 7045120/10000000 (70.5%) | Ret 3.04 | Win% 58.0 | Score0 987.0 | pg_loss -0.000 | v_loss 0.112 | ent 0.514 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.516 | lr 1.83e-05 | ent_coef 0.057
+>>> [PPO-Turbo] Upd 870 | Step 7127040/10000000 (71.3%) | Ret 2.90 | Win% 52.0 | Score0 878.8 | pg_loss -0.000 | v_loss 0.106 | ent 0.516 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.520 | lr 1.80e-05 | ent_coef 0.056
+>>> [PPO-Turbo] Upd 880 | Step 7208960/10000000 (72.1%) | Ret 2.63 | Win% 55.0 | Score0 846.7 | pg_loss -0.000 | v_loss 0.103 | ent 0.552 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.561 | lr 1.76e-05 | ent_coef 0.055
+>>> [PPO-Turbo] Upd 890 | Step 7290880/10000000 (72.9%) | Ret 3.04 | Win% 62.0 | Score0 1040.4 | pg_loss -0.000 | v_loss 0.099 | ent 0.502 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.557 | lr 1.72e-05 | ent_coef 0.054
+>>> [PPO-Turbo] Upd 900 | Step 7372800/10000000 (73.7%) | Ret 2.40 | Win% 50.0 | Score0 831.0 | pg_loss -0.000 | v_loss 0.101 | ent 0.533 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.563 | lr 1.69e-05 | ent_coef 0.054
+>>> [PPO-Turbo] Upd 910 | Step 7454720/10000000 (74.5%) | Ret 3.22 | Win% 60.5 | Score0 972.2 | pg_loss -0.000 | v_loss 0.108 | ent 0.499 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.534 | lr 1.65e-05 | ent_coef 0.053
+>>> [PPO-Turbo] Upd 920 | Step 7536640/10000000 (75.4%) | Ret 3.15 | Win% 59.5 | Score0 865.6 | pg_loss -0.000 | v_loss 0.088 | ent 0.498 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.571 | lr 1.61e-05 | ent_coef 0.052
+>>> [PPO-Turbo] Upd 930 | Step 7618560/10000000 (76.2%) | Ret 2.99 | Win% 57.5 | Score0 911.0 | pg_loss -0.000 | v_loss 0.092 | ent 0.520 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.593 | lr 1.58e-05 | ent_coef 0.052
+>>> [PPO-Turbo] Upd 940 | Step 7700480/10000000 (77.0%) | Ret 2.70 | Win% 53.5 | Score0 905.4 | pg_loss -0.000 | v_loss 0.108 | ent 0.508 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.520 | lr 1.54e-05 | ent_coef 0.051
+>>> [PPO-Turbo] Upd 950 | Step 7782400/10000000 (77.8%) | Ret 3.20 | Win% 60.0 | Score0 1017.6 | pg_loss -0.000 | v_loss 0.080 | ent 0.522 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.630 | lr 1.50e-05 | ent_coef 0.050
+>>> [PPO-Turbo] Upd 960 | Step 7864320/10000000 (78.6%) | Ret 3.19 | Win% 59.0 | Score0 964.6 | pg_loss -0.000 | v_loss 0.094 | ent 0.501 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.493 | lr 1.46e-05 | ent_coef 0.049
+>>> [PPO-Turbo] Upd 970 | Step 7946240/10000000 (79.5%) | Ret 3.09 | Win% 55.5 | Score0 984.3 | pg_loss -0.000 | v_loss 0.108 | ent 0.506 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.532 | lr 1.43e-05 | ent_coef 0.049
+>>> [PPO-Turbo] Upd 980 | Step 8028160/10000000 (80.3%) | Ret 2.22 | Win% 55.5 | Score0 860.0 | pg_loss -0.000 | v_loss 0.104 | ent 0.521 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.458 | lr 1.39e-05 | ent_coef 0.048
+>>> [PPO-Turbo] Upd 990 | Step 8110080/10000000 (81.1%) | Ret 2.82 | Win% 56.0 | Score0 1012.5 | pg_loss -0.000 | v_loss 0.122 | ent 0.516 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.576 | lr 1.35e-05 | ent_coef 0.047
+>>> [PPO-Turbo] Upd 1000 | Step 8192000/10000000 (81.9%) | Ret 2.25 | Win% 51.0 | Score0 816.6 | pg_loss -0.000 | v_loss 0.108 | ent 0.518 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.592 | lr 1.32e-05 | ent_coef 0.046
+>>> [PPO-Turbo] Upd 1010 | Step 8273920/10000000 (82.7%) | Ret 2.56 | Win% 52.0 | Score0 922.0 | pg_loss -0.000 | v_loss 0.114 | ent 0.534 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.541 | lr 1.28e-05 | ent_coef 0.046
+>>> [PPO-Turbo] Upd 1020 | Step 8355840/10000000 (83.6%) | Ret 3.26 | Win% 54.5 | Score0 1066.2 | pg_loss -0.000 | v_loss 0.118 | ent 0.499 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.508 | lr 1.24e-05 | ent_coef 0.045
+>>> [PPO-Turbo] Upd 1030 | Step 8437760/10000000 (84.4%) | Ret 3.15 | Win% 58.5 | Score0 1063.8 | pg_loss -0.000 | v_loss 0.111 | ent 0.504 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.532 | lr 1.21e-05 | ent_coef 0.044
+>>> [PPO-Turbo] Upd 1040 | Step 8519680/10000000 (85.2%) | Ret 2.62 | Win% 58.5 | Score0 904.4 | pg_loss -0.000 | v_loss 0.104 | ent 0.526 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.580 | lr 1.17e-05 | ent_coef 0.043
+>>> [PPO-Turbo] Upd 1050 | Step 8601600/10000000 (86.0%) | Ret 2.38 | Win% 49.5 | Score0 829.3 | pg_loss -0.000 | v_loss 0.092 | ent 0.500 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.527 | lr 1.13e-05 | ent_coef 0.043
+>>> [PPO-Turbo] Upd 1060 | Step 8683520/10000000 (86.8%) | Ret 2.87 | Win% 62.5 | Score0 931.0 | pg_loss -0.000 | v_loss 0.105 | ent 0.491 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.544 | lr 1.10e-05 | ent_coef 0.042
+>>> [PPO-Turbo] Upd 1070 | Step 8765440/10000000 (87.7%) | Ret 3.05 | Win% 55.5 | Score0 1047.2 | pg_loss -0.000 | v_loss 0.105 | ent 0.544 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.608 | lr 1.06e-05 | ent_coef 0.041
+>>> [PPO-Turbo] Upd 1080 | Step 8847360/10000000 (88.5%) | Ret 2.79 | Win% 53.5 | Score0 1066.3 | pg_loss -0.000 | v_loss 0.101 | ent 0.503 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.536 | lr 1.02e-05 | ent_coef 0.040
+>>> [PPO-Turbo] Upd 1090 | Step 8929280/10000000 (89.3%) | Ret 2.83 | Win% 57.0 | Score0 911.0 | pg_loss -0.000 | v_loss 0.122 | ent 0.530 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.555 | lr 9.86e-06 | ent_coef 0.040
+>>> [PPO-Turbo] Upd 1100 | Step 9011200/10000000 (90.1%) | Ret 3.16 | Win% 65.0 | Score0 907.9 | pg_loss -0.000 | v_loss 0.095 | ent 0.521 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.586 | lr 9.49e-06 | ent_coef 0.039
+>>> [PPO-Turbo] Upd 1110 | Step 9093120/10000000 (90.9%) | Ret 2.28 | Win% 55.5 | Score0 830.9 | pg_loss -0.000 | v_loss 0.106 | ent 0.508 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.558 | lr 9.12e-06 | ent_coef 0.038
+>>> [PPO-Turbo] Upd 1120 | Step 9175040/10000000 (91.8%) | Ret 3.04 | Win% 48.5 | Score0 956.1 | pg_loss -0.000 | v_loss 0.114 | ent 0.489 | kl 0.0001/0.0300 | clipfrac 0.000 | ev 0.482 | lr 8.75e-06 | ent_coef 0.037
+>>> [PPO-Turbo] Upd 1130 | Step 9256960/10000000 (92.6%) | Ret 2.92 | Win% 53.5 | Score0 977.4 | pg_loss -0.000 | v_loss 0.103 | ent 0.532 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.604 | lr 8.38e-06 | ent_coef 0.037
+>>> [PPO-Turbo] Upd 1140 | Step 9338880/10000000 (93.4%) | Ret 2.80 | Win% 58.0 | Score0 952.8 | pg_loss -0.000 | v_loss 0.093 | ent 0.514 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.593 | lr 8.01e-06 | ent_coef 0.036
+>>> [PPO-Turbo] Upd 1150 | Step 9420800/10000000 (94.2%) | Ret 3.36 | Win% 55.0 | Score0 1057.2 | pg_loss -0.000 | v_loss 0.102 | ent 0.503 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.594 | lr 7.64e-06 | ent_coef 0.035
+>>> [PPO-Turbo] Upd 1160 | Step 9502720/10000000 (95.0%) | Ret 3.25 | Win% 51.5 | Score0 940.3 | pg_loss -0.000 | v_loss 0.130 | ent 0.497 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.525 | lr 7.27e-06 | ent_coef 0.035
+>>> [PPO-Turbo] Upd 1170 | Step 9584640/10000000 (95.8%) | Ret 3.09 | Win% 52.5 | Score0 944.0 | pg_loss -0.000 | v_loss 0.105 | ent 0.499 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.523 | lr 6.91e-06 | ent_coef 0.034
+>>> [PPO-Turbo] Upd 1180 | Step 9666560/10000000 (96.7%) | Ret 3.23 | Win% 57.5 | Score0 1016.1 | pg_loss -0.000 | v_loss 0.112 | ent 0.471 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.519 | lr 6.54e-06 | ent_coef 0.033
+>>> [PPO-Turbo] Upd 1190 | Step 9748480/10000000 (97.5%) | Ret 3.16 | Win% 59.0 | Score0 1054.3 | pg_loss -0.000 | v_loss 0.106 | ent 0.486 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.526 | lr 6.17e-06 | ent_coef 0.032
+>>> [PPO-Turbo] Upd 1200 | Step 9830400/10000000 (98.3%) | Ret 3.05 | Win% 54.0 | Score0 954.1 | pg_loss -0.000 | v_loss 0.103 | ent 0.476 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.509 | lr 5.80e-06 | ent_coef 0.032
+>>> [PPO-Turbo] Upd 1210 | Step 9912320/10000000 (99.1%) | Ret 2.60 | Win% 59.0 | Score0 898.2 | pg_loss -0.000 | v_loss 0.123 | ent 0.514 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.588 | lr 5.43e-06 | ent_coef 0.031
+>>> [PPO-Turbo] Upd 1220 | Step 9994240/10000000 (99.9%) | Ret 2.63 | Win% 56.0 | Score0 959.8 | pg_loss -0.000 | v_loss 0.112 | ent 0.530 | kl 0.0000/0.0300 | clipfrac 0.000 | ev 0.564 | lr 5.06e-06 | ent_coef 0.030
+>>> [PPO-Turbo] Finished. Saved to agent/checkpoints/ppo_battle_best.final.pth
+>>> [PPO-Curriculum] Phase completed successfully.
+
+=== PPO Curriculum Completed ===
+Best Model: agent/checkpoints/ppo_battle_best.pth
+Final Snapshot: agent/checkpoints/ppo_battle_best.final.pth

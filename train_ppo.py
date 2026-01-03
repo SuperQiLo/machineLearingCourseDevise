@@ -1,6 +1,13 @@
 """train_ppo.py
 
-PPO training for BattleSnake.
+【中文说明】
+这是 BattleSnake 的 PPO 训练入口。
+
+- 使用 `gymnasium.vector.AsyncVectorEnv` 做多进程并行采样。
+- 默认会启用 AMP/TF32（GPU 上）以提升吞吐。
+- 支持 battle 自博弈：当 `num_snakes > 1` 且 `self_play_prob > 0` 时，会从 `SelfPlayManager`
+    的历史池中抽取对手模型参与对抗（并在训练过程中持续向池中写入快照）。
+
 V18.1: Turbo Performance Edition
 - Gymnasium AsyncVectorEnv (Parallel Processing)
 - Pinned Memory & Pre-allocated Buffers
@@ -38,10 +45,16 @@ from utils.self_play import SelfPlayManager
 
 
 def log(msg: str) -> None:
+    """统一日志输出（flush=True 便于训练时实时看到进度）。"""
     print(msg, flush=True)
 
 
 def _atomic_torch_save(state_dict, path: Path) -> None:
+    """原子方式保存权重文件。
+
+    中文：先写入临时文件，再用 `os.replace` 原子替换目标文件，
+    可避免训练中断导致 checkpoint 半写入/损坏。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(state_dict, tmp)
@@ -67,15 +80,37 @@ def train_ppo(
     minibatch_size: Optional[int] = None,
     seed: int = 0,
 ) -> None:
+    """训练 PPO。
+
+    参数说明（中文，挑关键项）：
+    - `num_envs`：并行环境数量（AsyncVectorEnv 的 worker 数），越大采样越快但更吃 CPU/RAM。
+    - `num_snakes`：环境中的蛇数量；1 表示单蛇导航，>1 表示对战。
+    - `total_timesteps`：总训练步数（跨所有环境累计）。
+    - `load_path`：可选加载已有权重（Phase 2 微调常用）。
+    - `checkpoint_path`：best 模型保存路径（会原子替换，防止中途写坏文件）。
+    - `pool_dir`：自博弈历史池目录（保存/抽取对手快照）。
+    - `self_play_prob`：对战时使用“模型对手”的概率；否则使用随机/规则对手（由 wrapper 决定）。
+    - `lr`/`target_kl`：基础学习率 / KL 目标阈值（过大可能导致策略崩）。
+    - `finetune_lr*`/`finetune_target_kl`：当 `load_path` 不为空时的微调超参（更稳）。
+    - `rollout_steps`/`update_epochs`/`minibatch_size`：PPO 更新计算量的主要来源；调大更稳但更慢。
+    - `seed`：随机种子（尽量可复现）。
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+    # 设备选择：优先 CUDA，否则 CPU。
+    # AMP/TF32 只在 CUDA 下启用。
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log(f">>> [PPO-Turbo] Device={device} | snakes={num_snakes} | envs={num_envs} | steps={total_timesteps}")
 
     obs_dtype = torch.float16 if device.type == 'cuda' else torch.float32
     use_amp = (device.type == 'cuda')
+
+    # 训练输出目录：
+    # - `agent/checkpoints/`：best / final
+    # - `pool_dir`：自博弈历史池（对手快照）
 
     Path("agent/checkpoints").mkdir(parents=True, exist_ok=True)
     sp_manager = SelfPlayManager(pool_dir)
@@ -111,6 +146,8 @@ def train_ppo(
         log(">>> [PPO-Turbo] torch.compile() skipped (not supported or Windows).")
 
     # Put an initial snapshot into the pool
+    # 中文：即使一开始没有“best”，也先把初始策略放进池，
+    # 这样 battle 自博弈时对手至少不是空池。
     sp_manager.add_model({k: v.detach().cpu() for k, v in original_model.state_dict().items()}, name="ppo_init")
 
     optimizer = optim.Adam(model.parameters(), lr=lr, eps=1e-5)
@@ -131,6 +168,9 @@ def train_ppo(
     ent_coef_weight = 0.01   # Policy entropy coefficient weight
     max_grad_norm = 0.5      # Gradient clipping
     norm_adv = True          # Advantage normalization
+
+    # 中文：fine-tune 模式（通常是 Phase2）
+    # - 只要传入 load_path，就视为微调：降低有效 LR、提高熵、放宽 KL，避免策略崩。
 
     # V29.0: Auto-tune for fine-tuning mode (--load)
     # Prevent Policy Collapse in Phase 2 by boosting entropy and relaxing KL
@@ -156,6 +196,12 @@ def train_ppo(
     use_model_opps = (num_snakes > 1 and float(self_play_prob) > 0.0)
     
     def env_creator():
+        """创建单个环境实例（用于 AsyncVectorEnv worker）。
+
+        中文：
+        - single：更偏导航 shaping（min_food 更高，击杀/胜负奖励不重要）
+        - battle：对齐 DQN battle 的 reward 设定，强调击杀/胜负与稳定存活
+        """
         # Configuration for battle or navigation
         reward_cfg = {}
         if num_snakes == 1:
@@ -218,6 +264,11 @@ def train_ppo(
     opp_model_paths: List[List[Optional[str]]] = [[None] * num_snakes for _ in range(num_envs)]
     
     def assign_opps(e_idx: int):
+        """为某个 env 的对手分配策略。
+
+        规则：对每个对手蛇（1..num_snakes-1），以 `self_play_prob` 概率从历史池采样模型；
+        否则为 None（表示随机对手）。
+        """
         if num_snakes <= 1: return
         for s_idx in range(1, num_snakes):
             if random.random() < self_play_prob:
@@ -234,6 +285,12 @@ def train_ppo(
     opp_model_cache: Dict[str, Tuple[float, nn.Module]] = {}
 
     def get_cached_model(path: str) -> Optional[nn.Module]:
+        """按文件 mtime 缓存对手模型，避免重复 load。
+
+        返回：
+        - nn.Module：可用的对手模型（eval 模式、requires_grad=False）
+        - None：文件不存在/损坏/加载失败
+        """
         try:
             mtime = os.stat(path).st_mtime
         except OSError:
@@ -281,7 +338,9 @@ def train_ppo(
 
     while global_step < total_timesteps:
         update += 1
-        # Annealing
+        # ====== 1) 退火（Annealing）======
+        # 中文：按 update 进度逐步降低学习率，并把 entropy 系数从 ent_start 退火到 ent_min。
+        # 这样前期探索更强，后期更稳定。
         frac = max(0.0, 1.0 - (update - 1) / (total_timesteps / (num_envs * num_steps)))
         lr_now = lr_init * (0.1 + 0.9 * frac)
         for pg in optimizer.param_groups: pg["lr"] = lr_now
@@ -291,8 +350,11 @@ def train_ppo(
         for step in range(num_steps):
             global_step += num_envs
             
-            # Map observations to tensors
-            # obs['grid'] is (num_envs, 5, 20, 20) uint8, obs['vector'] is (num_envs, 28) float32
+            # ====== 2) 采样（Rollout 收集）======
+            # obs 形状：
+            # - obs['grid']   : (num_envs, 5, 20, 20) uint8
+            # - obs['vector'] : (num_envs, 28) float32
+            # 中文：grid 保持 uint8 存 GPU，forward 前再 cast，可减少 CPU 侧转换开销。
             with torch.inference_mode():
                 cpu_grid = torch.from_numpy(obs['grid'])
                 cpu_vec = torch.from_numpy(obs['vector'])
@@ -308,7 +370,10 @@ def train_ppo(
                 b_logprobs[step].copy_(lp)
                 b_values[step].copy_(v.squeeze(-1))
 
-            # Handle Opponents (Grouped Inference - V30.0 High Speed Matrix mode)
+            # ====== 3) 对手动作生成（battle 模式）======
+            # - learner（蛇0）的动作来自 PPO policy。
+            # - 对手蛇：要么随机，要么从自博弈池抽模型推断。
+            # - 为加速：按“同一个模型文件路径”把对手索引分组，批量推断（减少 forward 次数）。
             all_actions = np.zeros((num_envs, num_snakes), dtype=np.int32)
             all_actions[:, 0] = a.cpu().numpy()
             
@@ -349,17 +414,10 @@ def train_ppo(
                         for s_idx in range(1, num_snakes):
                             all_actions[e_idx, s_idx] = random.randint(0, 3)
 
-            # Step Environments (Async)
-            # Note: We need to pass the multi-agent actions. 
-            # AsyncVectorEnv.step expects (num_envs, action_space)
-            # Our gymnasium wrapper expects [learner_action, *opp_actions]
-            # Since we provide ONLY snake 0 as action_space in wrapper,
-            # we use the set_opponent_actions trick or we can modify wrapper to take multi-actions.
-            # Here, let's use the simplest path: modify envs if they are in same process, 
-            # BUT they are in sub-processes. So we MUST pass ALL actions through the step call.
-            
-            # WORKAROUND: In our Gymnasium wrapper, if we pass an array to step, 
-            # it uses it for all snakes.
+            # ====== 4) 与环境交互（AsyncVectorEnv.step）======
+            # - AsyncVectorEnv 的每个 worker 都是子进程，因此不能通过“直接调用 wrapper 方法”传对手动作。
+            # - 本项目 wrapper 约定：如果 `step()` 收到的是 array/list，则按“全体蛇动作”解释。
+            #   所以这里直接把 `all_actions`（num_envs, num_snakes）传进去。
             next_obs, next_rewards, next_terminated, next_truncated, next_info = envs.step(all_actions)
             
             # Record rewards and dones for learner (snake 0)
@@ -367,6 +425,7 @@ def train_ppo(
             b_dones[step].copy_(torch.as_tensor(next_terminated, device=device))
             
             # Episode Tracking
+            # 中文：收集每个 env 的 episode return；battle 时额外统计 win-rate/score0。
             for e_idx in range(num_envs):
                 running_return[e_idx] += next_rewards[e_idx]
                 if next_terminated[e_idx] or next_truncated[e_idx]:
@@ -389,14 +448,17 @@ def train_ppo(
 
             obs, info = next_obs, next_info
 
-        # Bootstrap Value
+        # ====== 5) Bootstrap value（用于 GAE 的最后一项）======
         with torch.inference_mode(), autocast('cuda', enabled=use_amp):
             t_grid_u8 = torch.as_tensor(obs['grid'], dtype=torch.uint8, device=device)
             t_grid = t_grid_u8.to(dtype=obs_dtype)
             t_vec = torch.as_tensor(obs['vector'], dtype=obs_dtype, device=device)
             next_value = model.get_value(t_grid, t_vec).squeeze(-1)
 
-        # GAE
+        # ====== 6) GAE（Generalized Advantage Estimation）======
+        # 中文：优势函数用递推计算：
+        #   $\delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)$
+        #   $A_t = \delta_t + \gamma\lambda A_{t+1}$（遇到 terminal 则截断）
         advantages = torch.zeros_like(b_rewards)
         lastgaelam = 0
         for t in reversed(range(num_steps)):
@@ -413,7 +475,7 @@ def train_ppo(
             advantages[t] = lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
         returns = advantages + b_values
 
-        # Flatten Buffers
+        # ====== 7) 展平 batch（num_steps*num_envs）======
         flat_grid_u8 = b_obs_grid_u8.reshape(-1, 5, 20, 20)
         flat_vec = b_obs_vec.reshape(-1, 28)
         flat_actions = b_actions.reshape(-1)
@@ -422,10 +484,12 @@ def train_ppo(
         flat_returns = returns.reshape(-1)
         flat_values = b_values.reshape(-1)
 
-        # Norm advantages
+        # Advantage 归一化（可显著提升稳定性）
         flat_advantages = (flat_advantages - flat_advantages.mean()) / (flat_advantages.std() + 1e-8)
 
-        # Optimization
+        # ====== 8) PPO 优化（多 epoch、多 minibatch）======
+        # 中文：每个 minibatch 计算 policy loss / value loss / entropy bonus。
+        # KL 超过阈值时 early stop，避免策略更新过猛。
         model.train()
         inds = np.arange(batch_size)
         stop_early = False
@@ -486,7 +550,7 @@ def train_ppo(
             if stop_early:
                 break
 
-        # PPO diagnostics (per-update)
+        # ====== 9) 诊断指标（explained variance 等）======
         with torch.no_grad():
             v_y = flat_returns
             v_y_pred = flat_values
@@ -502,7 +566,9 @@ def train_ppo(
         kl_mean = approx_kl_sum / mb_denom
         clipfrac_mean = clipfrac_sum / mb_denom
 
-        # Logging
+        # ====== 10) 日志与 best 保存 ======
+        # battle：优先按 score0 提升保存，其次看 win_rate。
+        # single：按 avg return 提升保存。
         if update <= 10 or update % 10 == 0:
             avg_ret = np.mean(ep_returns[-100:]) if ep_returns else 0
             if num_snakes > 1:
@@ -516,7 +582,7 @@ def train_ppo(
                     f"| lr {lr_now:.2e} | ent_coef {ent_coef:.3f}" + (" | early_stop" if stop_early else "")
                 )
 
-                # Save best model for battle: prioritize Score0, then Win%.
+                # 保存 best（battle）：优先 Score0，其次 Win%
                 improved = False
                 if avg_score0 > best_score0 + 5.0:
                     improved = True
@@ -539,7 +605,7 @@ def train_ppo(
                     f"| lr {lr_now:.2e} | ent_coef {ent_coef:.3f}" + (" | early_stop" if stop_early else "")
                 )
 
-                # Save best model for single snake based on avg return.
+                # 保存 best（single）：按 avg return
                 improved = False
                 if avg_ret > best_ret + 0.5:
                     improved = True
@@ -551,12 +617,13 @@ def train_ppo(
                     _atomic_torch_save(cpu_state, best_path)
                     log(f">>> [PPO-Turbo][Best] Saved -> {best_path} | Ret {best_ret:.2f}")
 
-        # Periodic Saving & Pool Update
+        # ====== 11) 周期性写入自博弈池 ======
+        # 中文：不一定是 best，但能增加对手多样性（训练时作为历史对手采样）。
         if global_step >= 500_000 and global_step % 500_000 < num_envs * num_steps:
              cpu_state = {k: v.detach().cpu() for k, v in original_model.state_dict().items()}
              sp_manager.add_model(cpu_state, name=f"ppo_step_{global_step}")
 
-    # Ensure we have a best checkpoint written.
+    # ====== 12) 训练结束：确保 best 存在，并写 final 快照 ======
     if not best_path.exists():
         cpu_state = {k: v.detach().cpu() for k, v in original_model.state_dict().items()}
         _atomic_torch_save(cpu_state, best_path)

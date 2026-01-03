@@ -1,6 +1,16 @@
-"""
-Snake AI Battle GUI V3.
-Enhanced with HUD, Dash Support, and V3 Observations.
+"""gui_game.py
+
+本地可视化入口（PyQt6 GUI）。
+
+用途
+- 直观观察环境规则（得分/死亡掉落/Dash）是否符合预期
+- 加载训练出的模型进行对战演示或手动对战
+
+重要说明
+- 本 GUI 只负责“可视化 + 调 env.step()”，不参与训练。
+- 传入 `--model` 但加载失败时不会崩溃：会打印错误并让该蛇用默认动作（直走）。
+
+命令行参数见文件底部 argparse。
 """
 
 import sys
@@ -26,7 +36,9 @@ class GameWindow(QMainWindow):
         self.resize(1100, 750)
         self.setStyleSheet("background-color: #1e1e2e; color: #cdd6f4; font-family: 'Segoe UI', sans-serif;")
         
-        # 1. Setup Env (V11.0: 28D)
+        # 1) 创建环境（观测向量维度为 28，grid 为 (5,H,W)）
+        # - single: 1 条蛇
+        # - battle: 4 条蛇
         num_snakes = 1 if mode == "single" else 4
         if food_count is None: food_count = max(2, num_snakes)
             
@@ -86,7 +98,9 @@ class GameWindow(QMainWindow):
         hud_layout.addWidget(self.status_label)
         layout.addWidget(self.hud, stretch=1)
         
-        # 3. Agents
+        # 3) 加载智能体
+        # - human=True 时：P0 人控，其它为 AI
+        # - human=False 时：所有蛇均为 AI（如果提供 model_path）
         self.agents = [None] * num_snakes
         self.is_human = [False] * num_snakes
         if human: self.is_human[0] = True
@@ -114,6 +128,11 @@ class GameWindow(QMainWindow):
         self.status_label.setText("Restarted")
 
     def keyPressEvent(self, event):
+        """键盘控制（仅 human 模式下对 P0 生效）。
+
+        - 方向键：相对转向
+        - 空格：Dash
+        """
         key = event.key()
         if key == Qt.Key.Key_Space:
             self.human_target = "DASH"
@@ -126,17 +145,19 @@ class GameWindow(QMainWindow):
         if target is not None: self.human_target = target
 
     def get_human_action(self, agent_idx: int) -> int:
-         target = self.human_target
-         if target == "DASH":
-             self.human_target = None 
-             return 3 # Action.DASH
-         curr = self.env.directions[agent_idx]
-         if target is None or not isinstance(target, Direction) or target == curr: return 0
-         if (curr - 1) % 4 == target: return 1
-         if (curr + 1) % 4 == target: return 2
-         return 0
+        """把“目标方向”转换为相对动作（直行/左转/右转/Dash）。"""
+        target = self.human_target
+        if target == "DASH":
+            self.human_target = None
+            return 3 # Action.DASH
+        curr = self.env.directions[agent_idx]
+        if target is None or not isinstance(target, Direction) or target == curr: return 0
+        if (curr - 1) % 4 == target: return 1
+        if (curr + 1) % 4 == target: return 2
+        return 0
 
     def game_step(self):
+        """GUI 每帧推进一次环境，并刷新 HUD/棋盘。"""
         actions = []
         for i in range(self.env.config.num_snakes):
             if self.env.dead[i]: actions.append(0)

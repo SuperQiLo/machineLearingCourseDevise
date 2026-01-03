@@ -1,6 +1,16 @@
-"""
-Curriculum Training Script.
-Automates the 'Single Snake -> Battle Snake' curriculum.
+"""train_dqn_curriculum.py
+
+课程学习（Curriculum）调度器：自动跑两阶段
+
+- Phase 1：单蛇（`train_dqn_variants.py --single`）
+- Phase 2：多蛇对战（`train_dqn_variants.py --load <phase1.final>`）
+
+设计目的
+- 把“先学会吃/躲（单蛇）→ 再学会对抗（多蛇）”流程固化，减少手动操作。
+
+保存规则（非常关键）
+- 本脚本保存文件名的前缀使用你传入的 `--variant` 原始字符串（例如 `ddqn_per_dueling`），
+    即使训练器内部会把它归一化为 `dueling` 变体。
 """
 
 import subprocess
@@ -12,6 +22,7 @@ import shlex
 PYTHON_EXE = sys.executable
 
 def run_step(cmd, desc):
+    """以子进程方式运行某一阶段，并把输出原样打印到控制台。"""
     print(f"\n>>> [Curriculum] Starting Phase: {desc}")
     print(f">>> Command: {cmd}")
     try:
@@ -36,21 +47,22 @@ def main():
         choices=["dqn", "ddqn", "per", "dueling", "ddqn_per", "ddqn_per_dueling"],
         help="dqn, ddqn, per(=ddqn+per), dueling(=ddqn+per+dueling)",
     )
-    # User-Defined Training Steps (V16.0: 5M/3M to saturate 1024-width net)
+    # 训练步数（帧数）：越大训练越充分，但耗时越长。
+    # 默认值用于“比较充分”的训练；做流程验证可把它们改小。
     parser.add_argument("--steps1", type=int, default=5_000_000, help="Phase 1 frames")
     parser.add_argument("--steps2", type=int, default=3_000_000, help="Phase 2 frames")
     parser.add_argument("--force", action="store_true", help="Force restart from Phase 1")
 
-    # Optional save path overrides (avoid overwriting defaults)
+    # 可覆盖保存路径（建议做实验对比时使用，避免覆盖已有 best）
     parser.add_argument("--save1", type=str, default=None, help="Override Phase 1 save path (.pth)")
     parser.add_argument("--save2", type=str, default=None, help="Override Phase 2 save path (.pth)")
 
-    # Optional tuning knobs forwarded to train_dqn_variants.py
-    # Phase 1 (single)
+    # 以下参数会转发给 train_dqn_variants.py，用于覆盖默认超参。
+    # Phase 1（单蛇）
     parser.add_argument("--eps-start1", type=float, default=None, help="Override epsilon start for Phase 1 (single)")
     parser.add_argument("--eps-min1", type=float, default=None, help="Override epsilon min for Phase 1 (single)")
     parser.add_argument("--num-envs1", type=int, default=128, help="Phase 1 parallel envs (A6000 rec: 128)")
-    # Phase 2 (battle)
+    # Phase 2（对战）
     parser.add_argument("--eps-start2", type=float, default=None, help="Override epsilon start for Phase 2 (battle)")
     parser.add_argument("--eps-min2", type=float, default=None, help="Override epsilon min for Phase 2 (battle)")
     parser.add_argument("--num-envs2", type=int, default=32, help="Phase 2 parallel envs (A6000 rec: 32)")

@@ -1,6 +1,19 @@
-"""
-Gymnasium-compatible wrapper for BattleSnakeEnv.
-Enables AsyncVectorEnv for parallel environment execution.
+"""gymnasium_wrapper.py
+
+Gymnasium 兼容包装器：把多智能体 `BattleSnakeEnv` 适配到单智能体 Gymnasium 接口。
+
+核心约定
+- 学习者固定为 snake0；其它蛇作为对手。
+- `reset()` / `step()` 返回的 obs/reward/terminated 针对 snake0。
+- 但在 `info` 中会额外提供 `full_obs_*` / `scores` / `winner_idx` 等，方便训练器做自博弈与 KPI 统计。
+
+奖励（非常重要）
+- `env_reward0`：来自原始环境 `BattleSnakeEnv.step()` 的 reward（dense shaping + 终局奖惩）
+- `delta_score0`：本步 snake0 的游戏得分增量（score delta）
+- 最终返回给 RL 的 `reward`：
+    `reward = env_reward_coef * env_reward0 + (use_score_delta_reward ? score_reward_coef * delta_score0 : 0)`
+
+这样做的目的是：在不改变游戏胜负判定（score/MVP）的前提下，可控地把“得分信号”融入训练。
 """
 
 from __future__ import annotations
@@ -50,25 +63,25 @@ class BattleSnakeGymnasiumEnv(gym.Env):
         self.render_mode = render_mode
         self.return_full_obs = bool(return_full_obs)
 
-        # Training reward options (independent from game scoring UI)
+        # 训练奖励选项（与游戏 score/MVP 解耦）
         self.use_score_delta_reward = bool(use_score_delta_reward)
         self.score_reward_coef = float(score_reward_coef)
         self.env_reward_coef = float(env_reward_coef)
 
-        # Dash effectiveness shaping (learner only)
+        # Dash 效果整形（仅学习者）：在 dash_effect_window 窗口内若 score 增加则奖励，否则惩罚
         self.dash_effect_window = int(dash_effect_window)
         self.dash_success_bonus = float(dash_success_bonus)
         self.dash_fail_penalty = float(dash_fail_penalty)
         self._dash_pending_steps = 0
 
-        # Safety shaping (learner only): penalize actions that are clearly unsafe
-        # according to the existing danger features (no observation shape change).
+        # 安全整形（仅学习者）：利用观测 vector 里的危险特征惩罚明显不安全动作
+        # 目的：减少“撞墙/撞自己”的探索成本（不改变观测 shape）。
         self.unsafe_move_penalty = float(unsafe_move_penalty)
         self.unsafe_move2_penalty = float(unsafe_move2_penalty)
         self.unsafe_dash_penalty = float(unsafe_dash_penalty)
         self.invalid_dash_penalty = float(invalid_dash_penalty)
 
-        # Anti-loop shaping (learner only): discourage short cycles ("spinning").
+        # 反循环整形（仅学习者）：惩罚短周期回到最近头位置（防止原地打转）
         self.revisit_penalty = float(revisit_penalty)
         self.revisit_window = int(max(0, revisit_window))
         self._recent_pos0 = deque(maxlen=self.revisit_window) if self.revisit_window > 0 else None
@@ -126,6 +139,7 @@ class BattleSnakeGymnasiumEnv(gym.Env):
             # NOTE: Even in single-snake mode, downstream trainers expect these keys.
             all_grids = np.asarray([o["grid"] for o in obs_list], dtype=np.uint8)
             all_vecs = np.asarray([o["vector"] for o in obs_list])
+            # full_obs_*：把所有蛇的观测打包（训练器可用于给对手模型推理动作）
             info = {"full_obs_grids": all_grids, "full_obs_vecs": all_vecs, "raw_obs": obs_list}
         else:
             info = {}
@@ -154,7 +168,9 @@ class BattleSnakeGymnasiumEnv(gym.Env):
             except Exception:
                 pre_vec = None
 
-        # Build actions list for all snakes
+        # 构造所有蛇的动作列表：
+        # - 如果传入的是 list/ndarray：认为已经包含全部蛇动作
+        # - 否则：仅 learner 动作，其它蛇动作来自 set_opponent_actions 或随机
         if isinstance(action, (list, np.ndarray)):
             # If a list/array of actions is provided, use them directly
             actions = list(action)
@@ -176,21 +192,22 @@ class BattleSnakeGymnasiumEnv(gym.Env):
         
         obs_list, rewards, dones, info = self._env.step(actions)
         
-        # Return only the first snake's data
+        # 只返回 snake0 的 (obs, reward, terminated)，但会在 info 中保留全局信息
         obs = obs_list[0]
         env_reward = float(rewards[0])
 
-        # Delta-score reward (learner only)
+        # 游戏得分增量（learner only）：用于可选的 score-delta 奖励
         scores = info.get("scores", [])
         score0 = int(scores[0]) if scores else 0
         delta_score0 = score0 - int(self._last_score0)
         self._last_score0 = score0
 
+        # 最终训练 reward：环境 reward * 系数 + 可选 score-delta
         reward = (self.env_reward_coef * env_reward)
         if self.use_score_delta_reward:
             reward += self.score_reward_coef * float(delta_score0)
 
-        # Safety shaping (learner only): discourage obviously unsafe decisions.
+        # 安全整形（learner only）：根据 pre_vec 的危险特征，对明显危险动作加惩罚
         # Vector layout (28 dims):
         # [0:4]=food, [4:7]=danger_1(s,l,r), [7:10]=danger_2(s,l,r), ... , [24]=can_dash
         unsafe_move0 = 0
@@ -226,7 +243,7 @@ class BattleSnakeGymnasiumEnv(gym.Env):
                         reward += self.unsafe_dash_penalty
                         unsafe_dash0 = 1
 
-        # Anti-loop shaping: penalize revisiting recent head positions.
+        # 反循环整形：惩罚回到最近 head 位置
         revisit0 = 0
         if self._recent_pos0 is not None and self.revisit_penalty != 0.0:
             try:
@@ -239,7 +256,7 @@ class BattleSnakeGymnasiumEnv(gym.Env):
             except Exception:
                 pass
 
-        # Optional dash effectiveness shaping: if DASH leads to positive score soon, reward it.
+        # Dash 效果整形：若 Dash 后短窗口内 score 有提升则奖励，否则惩罚
         learner_action = int(actions[0]) if actions else 0
         if self.dash_effect_window > 0:
             # Start a new dash window
@@ -257,7 +274,9 @@ class BattleSnakeGymnasiumEnv(gym.Env):
         terminated = bool(info.get("game_over", all(dones)))
         truncated = False  # Gymnasium convention
         
-        # Pass through a few scalar fields for easier vector-env stacking/logging.
+        # 输出给训练器的 info（尽量保持“易于堆叠/统计”的标量字段）
+        # - scores / winner_idx：用于对战 KPI
+        # - score0 / delta_score0 / env_reward0：用于区分“训练 reward”与“游戏得分”
         winner_idx = info.get("winner_idx", info.get("mvp_idx", None))
         if winner_idx is None:
             winner_idx = -1

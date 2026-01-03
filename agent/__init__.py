@@ -1,3 +1,13 @@
+"""agent/__init__.py
+
+【中文说明】
+Agent 注册与工厂：自动发现 `agent/` 目录下以 `Agent` 结尾的类，并注册到 `AGENTS`。
+
+- `AGENTS`：`{算法名: AgentClass}`，例如 `dqn -> DQNAgent`。
+- `AGENT_ALIASES`：训练脚本里常见的别名映射（如 `per`、`dueling`）。
+- `get_agent()`：统一创建入口，供 GUI/网络客户端动态加载模型。
+"""
+
 import importlib
 import pkgutil
 import inspect
@@ -8,12 +18,12 @@ from pathlib import Path
 AGENTS = {}
 
 def _discover_agents():
-    """
-    Automatically search for Agent classes in the current package.
-    Convention:
-    1. File must be in agent/
-    2. Class name must end with 'Agent' (e.g. DQNAgent)
-    3. We register it as 'dqn' (derived from class name or filename)
+    """自动发现并注册 Agent 类。
+
+    约定：
+    1) 文件在 `agent/` 目录下（排除 `__init__.py`）
+    2) 类名以 `Agent` 结尾（例如 `DQNAgent`）
+    3) 注册 key 使用类名前缀的小写（例如 `DQNAgent -> dqn`）
     """
     current_dir = Path(__file__).parent
     
@@ -53,10 +63,12 @@ for alias, target in AGENT_ALIASES.items():
         AGENTS[alias] = AGENTS[target]
 
 def get_agent(name: str, input_dim: int, model_path: str = None, **kwargs):
-    """
-    Factory to create agent instance.
-    Args:
-        name: Algorithm name (e.g. 'dqn') or Class Name (e.g. 'DQNAgent')
+    """创建 agent 实例（工厂方法）。
+
+    参数：
+    - `name`：算法名（如 `dqn`/`per`/`dueling`）或类名（如 `DQNAgent`）。
+    - `input_dim`：vector 维度（本项目默认 28）。
+    - `model_path`：可选模型权重路径（`.pth`）。
     """
     key = name.lower().replace("agent", "") # normalize 'DQNAgent' -> 'dqn'
     

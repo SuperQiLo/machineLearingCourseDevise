@@ -1,14 +1,19 @@
-"""
-Unified Game Renderer (PyQt6).
-Provides a reusable widget for rendering the Snake Game state.
-Used by both local GUI and network clients.
+"""utils/renderer.py
+
+【中文说明】
+统一的 PyQt6 渲染组件：把环境/服务器同步来的“蛇/食物/死亡状态”绘制成棋盘。
+
+- 被 `gui_game.py`（本地 GUI）与 `net/game_client.py`（网络客户端）复用。
+- 本组件只负责渲染，不负责环境逻辑；输入是“状态快照”。
+
+历史说明：本文件早期包含英文模块介绍，已统一为中文说明。
 """
 
 from PyQt6.QtWidgets import QWidget
 from PyQt6.QtCore import Qt, QPoint, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QRadialGradient, QMouseEvent
 
-# Define Colors centrally
+# 颜色常量集中定义
 COLOR_BG = QColor(25, 30, 45)
 COLOR_GRID = QColor(40, 45, 60)
 COLOR_FOOD = QColor(255, 0, 85)
@@ -21,14 +26,12 @@ COLORS_SNAKE = [
 ]
 
 class GameRenderer(QWidget):
-    """
-    Reusable Widget that accepts game state and paints it.
-    Input state structure:
-    {
-        "snakes": [[(x,y), ...], ...],
-        "food": [(x,y), ...],
-        "dead": [bool, ...],
-    }
+    """可复用的渲染控件（接收状态并绘制）。
+
+    输入状态结构（约定）：
+    - `snakes`：`List[List[(x,y)]]`，每条蛇从头到尾的坐标序列
+    - `food`：`List[(x,y)]`
+    - `dead`：`List[bool]`
     """
     clicked = pyqtSignal() # V7.6: Signal for screen clicks
     def __init__(self, parent=None, grid_size=20):
@@ -48,6 +51,7 @@ class GameRenderer(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         
     def update_state(self, snakes, foods, dead, player_id=-1):
+        """更新渲染状态并触发重绘。"""
         self.snakes = snakes
         # ... (normalize food logic same)
         self.food = [tuple(f) for f in foods] if foods else []
@@ -56,6 +60,7 @@ class GameRenderer(QWidget):
         self.update() 
 
     def paintEvent(self, event):
+        """Qt 绘制入口：背景网格、食物、蛇身/蛇头、倒计时与结果 overlay。"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
@@ -137,6 +142,7 @@ class GameRenderer(QWidget):
             self.draw_result(painter)
 
     def draw_result(self, painter: QPainter):
+        """绘制赛果 overlay（胜者/MVP 或平局）。"""
         # Semi-transparent overlay
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(0, 0, 0, 180))
@@ -185,6 +191,7 @@ class GameRenderer(QWidget):
             painter.drawText(self.rect().adjusted(0, 150, 0, 0), Qt.AlignmentFlag.AlignCenter, "[ CLICK ANYWHERE TO CONTINUE ]")
 
     def mousePressEvent(self, event: QMouseEvent):
+        """结果界面点击：发射 `clicked` 信号（客户端/GUI 用于回到大厅或继续）。"""
         if self.server_state == "RESULT":
             self.clicked.emit()
         super().mousePressEvent(event)

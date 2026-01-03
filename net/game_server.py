@@ -1,6 +1,13 @@
-"""
-Snake Game LAN Server.
-Hosts the BattleSnake environment and handles client connections.
+"""net/game_server.py
+
+【中文说明】
+局域网对战服务器：负责维护 `BattleSnakeEnv` 环境、接收客户端输入、广播同步状态。
+
+- 客户端通过 TCP 发送 JSON 行协议（每条消息以 `\n` 结尾）。
+- 服务器广播 `SYNC`（包含蛇坐标、食物、死亡、分数、倒计时、胜者等）。
+- 为了支持“动态人数”，当所有已连接玩家 READY 后，会按 READY 列表重建环境并重新映射 pid。
+
+历史说明：本文件早期包含英文模块介绍，已统一为中文说明。
 """
 
 import json
@@ -11,7 +18,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
-# Add project root to path
+# 将项目根目录加入 sys.path，便于直接运行该文件
 sys.path.append(str(Path(__file__).parent.parent))
 
 from env.battle_snake_env import BattleSnakeEnv, BattleSnakeConfig
@@ -30,6 +37,7 @@ class GameState(Enum):
 
 class GameServer:
     def __init__(self):
+        """初始化 TCP 服务器与环境，并进入 WAITING 状态。"""
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.bind((HOST, PORT))
         self.server.listen(MAX_PLAYERS + 10)
@@ -52,6 +60,7 @@ class GameServer:
         self.lock = threading.Lock()
         
     def broadcast(self, data: dict):
+        """向所有已连接客户端广播一条 JSON 消息（失败连接会被移除）。"""
         msg = json.dumps(data) + "\n"
         to_remove = []
         for conn in self.clients:
@@ -64,6 +73,7 @@ class GameServer:
             self.remove_client(conn)
             
     def remove_client(self, conn):
+        """移除断开的客户端连接并清理 READY 状态。"""
         if conn in self.clients:
             pid = self.clients[conn]
             print(f"Client disconnected: Player {pid}")
@@ -74,6 +84,7 @@ class GameServer:
             conn.close()
 
     def handle_client(self, conn, addr):
+        """处理单个客户端连接：接收 READY/ACTION/RESET/JOIN 消息并更新服务器状态。"""
         print(f"New connection from {addr}")
         player_id = -1
         with self.lock:
@@ -119,6 +130,7 @@ class GameServer:
         self.remove_client(conn)
 
     def run(self):
+        """主循环：处理 WAITING/COUNTDOWN/PLAYING/RESULT 状态机，并周期性广播 SYNC。"""
         threading.Thread(target=self.accept_loop, daemon=True).start()
         print("Game loop started (V7.2 Formalized)")
         
@@ -223,6 +235,7 @@ class GameServer:
             self.countdown = 0
 
     def accept_loop(self):
+        """接受新连接并为每个客户端启动线程。"""
         while True:
             conn, addr = self.server.accept()
             threading.Thread(target=self.handle_client, args=(conn, addr), daemon=True).start()

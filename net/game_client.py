@@ -1,6 +1,13 @@
-"""
-Snake Game PyQt6 Client.
-Refactored to use shared Renderer and Agents.
+"""net/game_client.py
+
+【中文说明】
+PyQt6 网络客户端：连接 `net/game_server.py`，渲染服务器广播的状态，并发送玩家输入。
+
+- 支持三种模式：Human / AI / Spectator。
+- AI 模式下会通过 `agent.get_agent()` 动态加载模型，并定时发送 ACTION。
+- 协议：JSON 行协议（每条消息以 `\n` 结尾）。
+
+历史说明：本文件早期包含英文模块介绍，已统一为中文说明。
 """
 
 import sys
@@ -16,13 +23,13 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QComboBox, QFileDialog, QMessageBox, QFrame)
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread
 
-# Import Refactored Modules
+# 引入项目模块（把项目根目录加入 sys.path）
 sys.path.append(str(Path(__file__).parent.parent))
 from env.battle_snake_env import BattleSnakeEnv, BattleSnakeConfig, Direction
 from utils.renderer import GameRenderer
 from agent import AGENTS, get_agent
 
-# Config
+# 默认连接配置
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5555
 
@@ -31,6 +38,7 @@ class NetworkThread(QThread):
     disconnected = pyqtSignal()
     
     def __init__(self, host, port):
+        """网络收发线程（避免阻塞 UI 线程）。"""
         super().__init__()
         self.host = host
         self.port = port
@@ -39,6 +47,7 @@ class NetworkThread(QThread):
         self.connected = False
         
     def run(self):
+        """连接服务器并持续接收消息；每收到一条 JSON 行就发射 `msg_received`。"""
         try:
             self.sock.connect((self.host, self.port))
             self.connected = True
@@ -69,6 +78,7 @@ class NetworkThread(QThread):
         self.sock.close()
 
     def send(self, data: dict):
+        """发送一条 JSON 消息给服务器。"""
         if self.connected:
             try:
                 msg = json.dumps(data) + "\n"
@@ -77,11 +87,13 @@ class NetworkThread(QThread):
                 self.running = False
 
     def stop(self):
+        """请求线程停止并关闭 socket。"""
         self.running = False
         self.sock.close()
 
 class MainWindow(QMainWindow):
     def __init__(self):
+        """客户端主窗口：左侧配置面板 + 右侧棋盘渲染。"""
         super().__init__()
         self.setWindowTitle("Snake AI Battle - Neon Client")
         self.resize(1000, 700)

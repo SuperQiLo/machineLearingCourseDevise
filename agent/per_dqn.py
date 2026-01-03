@@ -1,6 +1,12 @@
-"""
-DDQN + PER (Prioritized Experience Replay) Agent V5.
-Focus: Importance sampling to focus on harder-to-learn experiences.
+"""agent/per_dqn.py
+
+【中文说明】
+DDQN + PER（Prioritized Experience Replay）推理侧实现。
+
+注意：PER 的重点在训练侧（按 TD-error 抽样与重要性采样权重修正）。
+本文件主要用于：加载训练好的权重并在环境中做动作推断。
+
+历史说明：本文件早期包含英文模块介绍，已统一为中文说明。
 """
 
 import torch
@@ -10,7 +16,7 @@ from pathlib import Path
 from typing import Optional, Dict, Tuple
 
 class SumTree:
-    """Efficient SumTree for Prioritized Experience Replay."""
+    """PER 的 SumTree 结构（本项目训练脚本当前未必使用该实现）。"""
     def __init__(self, capacity: int):
         self.capacity = capacity
         self.tree = np.zeros(2 * capacity - 1)
@@ -51,7 +57,7 @@ class SumTree:
         return self.tree[0]
 
 class PERDQNNet(nn.Module):
-    """Hybrid CNN-MLP Architecture for Snake AI (PER Compatible)"""
+    """Hybrid CNN-MLP 网络（PER 兼容）。"""
     def __init__(self, vector_dim: int = 28, grid_shape: tuple = (5, 20, 20), action_dim: int = 4):
         super().__init__()
         self.conv = nn.Sequential(
@@ -88,7 +94,7 @@ class PERDQNNet(nn.Module):
         return self.fc(combined)
 
 class PERDQNAgent:
-    """Helper class for DDQN + PER inference"""
+    """PER-DQN 推理封装（加载权重 + greedy 动作）。"""
     def __init__(self, input_dim: int = 28, model_path: Optional[str] = None):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.net = PERDQNNet(vector_dim=input_dim).to(self.device)
@@ -96,6 +102,7 @@ class PERDQNAgent:
         if model_path: self.load(model_path)
             
     def load(self, path: str):
+        """加载模型权重（`.pth` 的 state_dict）。"""
         path = Path(path)
         if path.exists():
             state_dict = torch.load(path, map_location=self.device, weights_only=True)
@@ -104,6 +111,7 @@ class PERDQNAgent:
             print(f"Warning: PER-DQN model not found at {path}")
 
     def act(self, obs: Dict[str, np.ndarray]) -> int:
+        """根据观测选择动作（贪心 argmax）。"""
         with torch.no_grad():
             t_grid = torch.as_tensor(obs['grid'], dtype=torch.float32, device=self.device).unsqueeze(0)
             t_vec = torch.as_tensor(obs['vector'], dtype=torch.float32, device=self.device).unsqueeze(0)

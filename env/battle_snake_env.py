@@ -1,6 +1,17 @@
-"""
-Multi-Agent Battle Snake Environment V5.0.
-Supports Dash with Cooldown, Hybrid Obs (CNN+MLP), and Death Drops.
+"""battle_snake_env.py
+
+多智能体 Battle Snake 环境（课程设计使用）。
+
+核心要点（请务必区分）
+- 训练奖励（reward）：`step()` 返回的 `rewards`，用于 RL 优化，包含 dense shaping。
+- 游戏得分（score）：`self.scores`/`info['scores']`，用于 MVP/胜负评估，与训练 reward **解耦**。
+
+机制
+- Dash（冲刺）：动作 3；满足条件时会连续移动两次并消耗长度。
+- 死亡掉落：蛇死亡时整条身体会转为食物。
+- 观测：Hybrid（CNN + MLP）
+    - `grid`: (5, H, W) 的 5 通道全局网格
+    - `vector`: (28,) 的全局特征向量（含危险、方向、对手、Dash、领先状态、剩余时间等）
 """
 
 from __future__ import annotations
@@ -30,19 +41,26 @@ class ObservationDict(TypedDict):
 
 @dataclass
 class BattleSnakeConfig:
+    # 地图尺寸（默认 20x20）
     width: int = 20
     height: int = 20
+
+    # 蛇数量：single=1，battle>=2（课程设计默认 battle 常用 4）
     num_snakes: int = 2
+
+    # 场上至少保留的食物数量（不足会自动补齐）
     min_food: int = 2
+
+    # 最大步数：到达后强制结束（用于时间管理特征 + 防止无限局）
     max_steps: int = 1000
     
-    # Mechanics
+    # ========== 机制参数（Mechanics） ==========
     # 冲刺持续时间（步数）
     dash_duration_steps: int = 5
     
-    # Rewards
-    # NOTE: These are TRAINING rewards returned by env.step().
-    # Game scoring/MVP uses `scores` and the *_score_mult fields below.
+    # ========== 训练奖励（Rewards） ==========
+    # NOTE：这些 reward 仅用于训练（env.step() 返回）。
+    # MVP/胜负评估使用 `scores`（见下方 *_score_mult），二者刻意解耦。
     food_reward: float = 1.2
     death_penalty: float = -3.0
     kill_reward: float = 2.0
@@ -53,7 +71,9 @@ class BattleSnakeConfig:
     win_reward: float = 5.0
     loss_penalty: float = -2.0
 
-    # Game scoring (NOT training reward)
+    # ========== 游戏得分（Game scoring，不是训练 reward） ==========
+    # score 的设计用于“对战评估/排行榜/MVP”，它更接近人类观感。
+    # 具体得分来源：吃食、击杀、生存（battle 模式）。
     food_score_mult: int = 10
     kill_score_mult: int = 50
     survive_score_mult: int = 100
@@ -132,6 +152,17 @@ class BattleSnakeEnv:
         return self._get_observations()
 
     def step(self, actions: List[int]) -> Tuple[List[ObservationDict], List[float], List[bool], Dict]:
+        """推进一帧（可能包含 Dash 导致的 2 次子步）。
+
+        Args:
+            actions: 每条蛇一个动作（0=直行，1=左转，2=右转，3=Dash）。
+
+        Returns:
+            obs_list: 每条蛇的观测（grid+vector）
+            rewards: 训练奖励（dense shaping + 终局奖惩）
+            dones: 每条蛇 done（game_over 时全 True）
+            info: 评估与调试信息（scores/winner_idx/alive_count 等）
+        """
         # Snapshot lengths at the moment right before this step executes.
         # Used for winner selection when the game ends with everyone dead.
         # IMPORTANT: only count snakes that are alive at this moment.
@@ -142,18 +173,22 @@ class BattleSnakeEnv:
             for i in range(self.config.num_snakes)
         ]
 
+        # 默认给每条蛇一个 step_penalty（训练 shaping）
         rewards = [self.config.step_penalty] * self.config.num_snakes
         dones = [False] * self.config.num_snakes
         self.steps += 1
         
-        # 0. Process Dash & Cooldown
+        # 0) Dash 处理
+        # - Dash 触发条件：当前不在冲刺中 且 长度 > 3
+        # - 触发后：该步会“移动两次”，并消耗 1 格身体长度
+        # - 冲刺期间：每个 step 都会再次移动两次，直到 dash_durations 归零
         move_repeats = [1] * self.config.num_snakes
         for i in range(self.config.num_snakes):
             if self.dead[i]:
                 rewards[i] = 0.0
                 continue
             
-            # Update Duration
+            # 冲刺持续时间递减；冲刺中每帧走两次
             if self.dash_durations[i] > 0:
                 self.dash_durations[i] -= 1
                 move_repeats[i] = 2 # 处于冲刺状态，移动两次
@@ -169,7 +204,7 @@ class BattleSnakeEnv:
                     # 无法触发 DASH 时，强制转为 STRAIGHT
                     actions[i] = Action.STRAIGHT
 
-        # Run moves
+        # 1) 执行移动：最多 2 个子步（Dash 时为 2，否则为 1）
         for sub_step in range(2):
             # Compute planned next heads once.
             next_heads: List[Optional[Tuple[int, int]]] = [None] * self.config.num_snakes
@@ -212,7 +247,7 @@ class BattleSnakeEnv:
 
             dying_now = set()
 
-            # 1) Wall + body collisions
+            # 1) 撞墙/撞身体：直接判死
             for i in alive_indices:
                 nh = next_heads[i]
                 if nh is None:
@@ -235,7 +270,9 @@ class BattleSnakeEnv:
                             killer_len = len(self.snakes[owner]) if (owner < len(self.snakes) and self.snakes[owner]) else 0
                             self.scores[owner] += int(killer_len) * int(self.config.kill_score_mult)
 
-            # 2) Head-on collisions: group by next head position
+            # 2) 对头碰撞：同一格多个头
+            # - 若只有 1 条蛇最长：短者死亡，长者存活并获得击杀得分
+            # - 若并列最长：全部死亡（等价于旧的 pairwise <= 规则）
             head_groups: Dict[Tuple[int, int], List[int]] = {}
             for i in alive_indices:
                 nh = next_heads[i]
@@ -264,7 +301,7 @@ class BattleSnakeEnv:
                         dying_now.add(i)
                         rewards[i] += self.config.death_penalty
 
-            # 3) Apply state updates
+            # 3) 应用状态：死亡掉落 / 吃食得分 / 正常移动
             for i in alive_indices:
                 if i in dying_now:
                     self._handle_death(i)
@@ -278,7 +315,7 @@ class BattleSnakeEnv:
                 self.snakes[i].insert(0, nh)
                 if nh in self.foods:
                     rewards[i] += self.config.food_reward
-                    # Game scoring: single-player only scores via food; battle also scores via food
+                    # 游戏得分：吃到食物按“吃到前长度”计分（长度越长，吃到食物得分越高）
                     self.scores[i] += int(pre_len) * int(self.config.food_score_mult)
                     self.foods.remove(nh)
                 else:
@@ -304,9 +341,12 @@ class BattleSnakeEnv:
         else:
             game_over = alive_count <= 1 or self.steps >= self.config.max_steps
 
-        # Winner/MVP selection:
-        # - MVP is the highest score.
-        # - Tie-break: alive at end > longer (alive uses current len, else uses pre_terminal_lengths) > lower idx.
+        # 2) MVP（winner）判定：只在 game_over 时计算
+        # - MVP = 得分（scores）最高者
+        # - 平分 tie-break：
+        #   1) 结束时仍存活的优先
+        #   2) 再比长度：存活用当前长度；全灭时用 pre_terminal_lengths（结束前一时刻长度快照）
+        #   3) 再比 idx（更小 idx 优先）
         mvp_idx: Optional[int] = None
         winner_len: int = 0
         winner_is_all_dead: bool = False
@@ -358,6 +398,7 @@ class BattleSnakeEnv:
         return self._get_observations(), rewards, dones, info
 
     def _handle_death(self, idx: int):
+        """死亡处理：标记死亡，并把整条身体掉落为食物。"""
         self.dead[idx] = True
         # Game rule: convert the whole body into food (deterministic)
         if idx < len(self.snakes) and self.snakes[idx]:
@@ -370,7 +411,12 @@ class BattleSnakeEnv:
         return [self._get_agent_obs_cached(i, cache) for i in range(self.config.num_snakes)]
 
     def _build_obs_cache(self):
-        """Build reusable O(1) lookup tables for observation construction."""
+        """构建观测所需的缓存结构（O(1) 查询）。
+
+        - occupied_all：所有存活蛇身体占用格集合
+        - head_map：每个蛇头位置 -> 蛇 idx
+        - food_set：食物位置集合
+        """
         occupied_all = set()
         head_map: Dict[Tuple[int, int], int] = {}
         for i in range(self.config.num_snakes):
@@ -398,7 +444,19 @@ class BattleSnakeEnv:
         head = self.snakes[agent_idx][0]
         direction = self.directions[agent_idx]
         
-        # 1. Vector Features
+        # 1) vector 特征（28 维）
+        # 维度布局（从拼接顺序理解）：
+        # 0-3: 最近食物的相对方向强度（up/down/left/right）
+        # 4-6: 1 步危险（直/左/右）
+        # 7-9: 2 步危险（直/左/右）
+        # 10-12: 雷达（沿直/左/右方向到障碍的倒数距离）
+        # 13-16: 当前朝向 one-hot（UP/DOWN/LEFT/RIGHT）
+        # 17-20: 最近敌方蛇头相对位置（上/下/左/右）
+        # 21-22: 尾巴相对位置（dx, dy 归一化）
+        # 23: 自身长度占地图比例
+        # 24: can_dash（是否可以触发 Dash）
+        # 25-26: 领先状态（is_leader, rel_score）
+        # 27: 剩余步数比例（time awareness）
         food_up, food_down, food_left, food_right = 0.0, 0.0, 0.0, 0.0
         if self.foods:
             # Deterministic tie-break: when two foods are equidistant, always pick the same one
@@ -448,7 +506,7 @@ class BattleSnakeEnv:
         tail_rel = [(tail[0] - head[0]) / self.width, (tail[1] - head[1]) / self.height]
         len_pct = [len(self.snakes[agent_idx]) / (self.width * self.height)]
         
-        # Updated Vector features: Remaining Dash steps vs Can Dash
+        # Dash 可用性：只有不在冲刺中且长度 > 3 才允许触发
         can_dash_val = [1.0 if (self.dash_durations[agent_idx] == 0 and len(self.snakes[agent_idx]) > 3) else 0.0]
         
         # V10.0: Relative Standing Features (Crucial for rule awareness)
@@ -491,12 +549,12 @@ class BattleSnakeEnv:
         if len(vector) > 28: vector = vector[:28]
         elif len(vector) < 28: vector = np.pad(vector, (0, 28 - len(vector)))
 
-        # 2. Grid (Full Map Encoding - 5 channels)
-        # Channel 0: Food
-        # Channel 1: Self Body
-        # Channel 2: Enemy Heads
-        # Channel 3: Enemy Bodies
-        # Channel 4: Obstacles (Walls are implicit by grid boundaries, here we mark them as 1 if outside)
+        # 2) grid（5 通道，全局编码）
+        # Channel 0：食物
+        # Channel 1：自身身体（含头）
+        # Channel 2：敌方头
+        # Channel 3：敌方身体（不含头）
+        # Channel 4：预留通道（目前未显式写墙；边界由坐标范围隐式表示）
         grid = np.zeros((5, self.height, self.width), dtype=np.uint8)
 
         # Food (vectorized)

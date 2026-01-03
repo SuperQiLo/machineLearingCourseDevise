@@ -1,6 +1,16 @@
-"""
-PPO Curriculum Training Script.
-Automates Phase 1 (Single Snake) -> Phase 2 (Battle Snake).
+"""train_ppo_curriculum.py
+
+PPO 课程学习（Curriculum）调度器：自动跑两阶段
+
+- Phase 1：单蛇（`train_ppo.py --single`）
+- Phase 2：对战（`train_ppo.py --load <phase1.final>`，并可开启 self-play）
+
+为什么要分两阶段
+- 单蛇阶段更像“打基础”（吃食、避障、稳定存活）
+- 对战阶段学习“对手互动”（抢食、卡位、击杀、Dash 时机）
+
+重要提示
+- Phase 2 默认会进入 fine-tune 模式（因为使用了 `--load`），建议显式指定 `--finetune-lr2`。
 """
 
 import subprocess
@@ -11,6 +21,7 @@ from pathlib import Path
 PYTHON_EXE = sys.executable
 
 def run_step(cmd, desc):
+    """以子进程方式运行某一阶段，并把输出原样打印到控制台。"""
     print(f"\n>>> [PPO-Curriculum] Starting Phase: {desc}")
     print(f">>> Command: {cmd}")
     try:
@@ -26,14 +37,15 @@ def run_step(cmd, desc):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    # Recommended A6000 defaults (throughput + stability)
+    # 训练步数：越大训练越充分，但耗时越长。
     parser.add_argument("--steps1", type=int, default=10_000_000, help="Phase 1 frames")
     parser.add_argument("--steps2", type=int, default=10_000_000, help="Phase 2 frames")
+    # 并行环境数：越大吞吐越高，但 CPU/内存压力越大。
     parser.add_argument("--envs1", type=int, default=64, help="Phase 1 num envs (A6000 rec: 64)")
     parser.add_argument("--envs2", type=int, default=64, help="Phase 2 num envs (A6000 rec: 64)")
     parser.add_argument("--rollout-steps1", type=int, default=256, help="Phase 1 rollout steps per env (A6000 rec: 256)")
     parser.add_argument("--rollout-steps2", type=int, default=128, help="Phase 2 rollout steps per env (A6000 rec: 128)")
-    # Performance-oriented defaults (higher FPS; still stable for this project)
+    # PPO 更新相关参数：影响收敛速度、稳定性和资源占用。
     parser.add_argument("--update-epochs1", type=int, default=2, help="Phase 1 PPO update epochs (default: 2)")
     parser.add_argument("--update-epochs2", type=int, default=2, help="Phase 2 PPO update epochs (default: 2)")
     parser.add_argument("--minibatch-size1", type=int, default=4096, help="Phase 1 PPO minibatch size (default: 4096)")
@@ -42,8 +54,8 @@ def main():
     parser.add_argument("--lr2", type=float, default=1.5e-4, help="Phase 2 base LR (used with --load)")
     parser.add_argument("--target-kl1", type=float, default=0.015, help="Phase 1 target KL")
     parser.add_argument("--target-kl2", type=float, default=0.015, help="Phase 2 target KL")
-    # NOTE: train_ppo.py applies finetune_lr_mult when --load is used.
-    # To make the effective fine-tune LR explicit, set finetune_lr2 by default.
+    # NOTE：Phase 2 使用 --load 时，train_ppo.py 会进入 fine-tune 模式。
+    # 为避免“倍率缩放后有效 LR 不清楚”，这里默认直接提供 finetune-lr2。
     parser.add_argument("--finetune-lr2", type=float, default=5.0e-5, help="Phase 2 fine-tune LR (effective LR when --load)")
     parser.add_argument("--finetune-lr-mult2", type=float, default=None, help="Phase 2 fine-tune LR multiplier (ignored if --finetune-lr2 is set)")
     parser.add_argument("--finetune-target-kl2", type=float, default=0.030, help="Phase 2 fine-tune target KL (only used with --load)")
