@@ -362,7 +362,7 @@ class DQNVariantTrainer:
         num_snakes = cfg.num_snakes
         if cfg.single_snake:
             # Phase 1: High Exploration & Robust Learning
-            default_eps_start, default_eps_min = 1.0, 0.05
+            default_eps_start, default_eps_min = 1.0, 0.02
             self.batch_size = 1024 # V21.1: Increased for GPU saturation
             if v == "dqn":
                 self.lr, self.tau = 1.5e-4, 0.002
@@ -370,9 +370,21 @@ class DQNVariantTrainer:
                 self.lr, self.tau = 2.0e-4, 0.005
         else:
             # Phase 2: High Stability & Combat Precision
-            default_eps_start, default_eps_min = 0.5, 0.10
+            default_eps_start, default_eps_min = 0.6, 0.05
+            if v in ("per", "dueling"):
+                # PER/Dueling are more brittle in battle; reduce exploration noise to avoid policy degradation.
+                default_eps_start, default_eps_min = 0.40, 0.02
             self.batch_size = 1024 # V21.1: Increased
             if v == "dqn":
+                self.lr, self.tau = 1.0e-4, 0.002
+            elif v == "ddqn":
+                # DDQN benefits from the same conservative target updates as DQN in noisy battle.
+                self.lr, self.tau = 1.0e-4, 0.002
+            elif v == "per":
+                # PER is stable with conservative tau; keep LR aligned to DQN.
+                self.lr, self.tau = 1.0e-4, 0.002
+            elif v == "dueling":
+                # Dueling is more sensitive in battle; keep target updates conservative.
                 self.lr, self.tau = 1.0e-4, 0.002
             else:
                 self.lr, self.tau = 8.0e-5, 0.005
@@ -396,8 +408,15 @@ class DQNVariantTrainer:
         self.grad_clip = 0.5 
         
         # Override algorithm-specific if needed
-        if cfg.variant == "per" or cfg.variant == "dueling":
-            # V11.0: Lower Alpha (0.4) for Phase 2 to handle high-noise battle environments
+        if cfg.variant == "per":
+            # PER tuning:
+            # - Phase 1: keep higher alpha for fast learning.
+            # - Phase 2: slightly higher alpha than before to learn faster, and higher beta_start
+            #   to reduce sampling bias earlier.
+            self.per_alpha = 0.6 if cfg.single_snake else 0.5
+            self.per_beta_start = 0.4 if cfg.single_snake else 0.6
+        elif cfg.variant == "dueling":
+            # Keep dueling PER more conservative by default.
             self.per_alpha = 0.6 if cfg.single_snake else 0.4
             self.per_beta_start = 0.4
         
@@ -415,28 +434,40 @@ class DQNVariantTrainer:
         env_cfg = BattleSnakeConfig(width=20, height=20, num_snakes=cfg.num_snakes)
         if cfg.num_snakes == 1:
             # Phase 1: High focus on navigation (V18.3 Turbo Sync)
-            env_cfg.closer_reward = 0.15
-            env_cfg.farther_penalty = -0.12
-            env_cfg.food_reward = 50.0 # Match PPO V18.3
-            env_cfg.death_penalty = -50.0
-            env_cfg.step_penalty = -0.05
-            env_cfg.self_collision_penalty = -60.0
-            env_cfg.min_food = 5 # Add min_food to env_cfg
+            env_cfg.closer_reward = 0.05
+            env_cfg.farther_penalty = -0.04
+            env_cfg.food_reward = 1.0
+            env_cfg.death_penalty = -3.0
+            env_cfg.step_penalty = -0.01
+            env_cfg.self_collision_penalty = -4.0
+            env_cfg.min_food = 5
             log(f">>> [V18.3 Turbo] PHASE 1 (Single) | FoodDensity: {env_cfg.min_food} | FoodRew: {env_cfg.food_reward}")
         else:
             # Phase 2: V9.0 Combat (High Aggression)
-            env_cfg.closer_reward = 0.15 
-            env_cfg.farther_penalty = -0.10  
-            env_cfg.step_penalty = -0.05      
-            env_cfg.death_penalty = -100.0    
-            env_cfg.kill_reward = 150.0      
-            env_cfg.food_reward = 80.0       
-            env_cfg.self_collision_penalty = -150.0 
+            env_cfg.closer_reward = 0.05
+            env_cfg.farther_penalty = -0.04
+            env_cfg.step_penalty = -0.01
+            env_cfg.death_penalty = -3.0
+            env_cfg.kill_reward = 2.0
+            env_cfg.food_reward = 1.2
+            env_cfg.self_collision_penalty = -4.0
+            env_cfg.win_reward = 5.0
+            env_cfg.loss_penalty = -2.0
             env_cfg.min_food = 2
             log(f">>> [V9.0 Battle] PHASE 2 | Kill: {env_cfg.kill_reward} | FoodDensity: {env_cfg.min_food}")
         
         log(f">>> [V18.3 Turbo] Initializing {cfg.num_envs} Parallel Environments...")
         def env_fn():
+             extra_shaping = {}
+             unsafe_move_pen = -0.10
+             if cfg.variant in ("per", "dueling") and (not cfg.single_snake):
+                 # Stronger safety + anti-loop shaping for brittle variants in battle mode.
+                 unsafe_move_pen = -0.12
+                 extra_shaping = {
+                     "unsafe_move2_penalty": -0.04,
+                     "revisit_penalty": -0.01,
+                     "revisit_window": 24,
+                 }
              # Convert BattleSnakeConfig to gymnasium wrapper keywords
              return make_gymnasium_env(
                  num_snakes=cfg.num_snakes, 
@@ -452,6 +483,19 @@ class DQNVariantTrainer:
                  kill_reward=getattr(env_cfg, 'kill_reward', 150.0),
                  win_reward=getattr(env_cfg, 'win_reward', 800.0),
                  loss_penalty=getattr(env_cfg, 'loss_penalty', -200.0),
+                 # Learn game rules via score delta (length-scaled scoring), with a bit of dense shaping retained.
+                 use_score_delta_reward=True,
+                 score_reward_coef=0.001,
+                 env_reward_coef=0.2,
+                 # Encourage purposeful dash (score gain soon after dash) instead of spamming.
+                 dash_effect_window=6,
+                 dash_success_bonus=0.2,
+                 dash_fail_penalty=-0.2,
+                 # Safety shaping: penalize obviously unsafe moves (wall/body) and risky/invalid dash.
+                 unsafe_move_penalty=unsafe_move_pen,
+                 unsafe_dash_penalty=-0.10,
+                 invalid_dash_penalty=-0.02,
+                 **extra_shaping,
                  return_full_obs=self.use_model_opps,
              )
         self.envs = gym.vector.AsyncVectorEnv([env_fn for _ in range(cfg.num_envs)])
@@ -528,7 +572,10 @@ class DQNVariantTrainer:
         self._prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
         self._prefetch_thread.start()
         
+        # Best-checkpoint tracking (battle uses S0/Win%, single uses avg reward)
         self.best_reward = -float('inf')
+        self.best_s0 = -float('inf')
+        self.best_win = -float('inf')
         
         # V39.0: Unified Gamma (Dueling was 0.995 -> unstable)
         # All variants now use 0.99 for stable value estimation
@@ -639,6 +686,8 @@ class DQNVariantTrainer:
         obs_dict, info = self.envs.reset()
         ep_rewards = [0.0] * self.cfg.num_envs
         recent_rewards = []
+        recent_wins = []
+        recent_score0 = []
         last_log_time = time.time()
         
         total_frames = max(1, int(self.cfg.total_frames))
@@ -757,6 +806,22 @@ class DQNVariantTrainer:
                     if len(recent_rewards) > 100: recent_rewards.pop(0)
                     ep_rewards[e_idx] = 0.0
 
+                    # Extra diagnostics for battle mode
+                    if (not self.cfg.single_snake) and num_snakes > 1 and isinstance(next_info, dict):
+                        try:
+                            winner = int(next_info.get("winner_idx", [-1])[e_idx])
+                        except Exception:
+                            winner = -1
+                        recent_wins.append(1 if winner == 0 else 0)
+                        if len(recent_wins) > 200:
+                            recent_wins.pop(0)
+                        try:
+                            recent_score0.append(int(next_info.get("score0", [0])[e_idx]))
+                        except Exception:
+                            recent_score0.append(0)
+                        if len(recent_score0) > 200:
+                            recent_score0.pop(0)
+
                     # Two-stage self-play probability schedule: early higher, later lower.
                     if not self.cfg.single_snake and num_snakes > 1:
                         prog = self.steps / float(total_frames)
@@ -822,6 +887,8 @@ class DQNVariantTrainer:
                 tau_eff = self.tau * 0.5
             if self.cfg.variant == "per" and self.steps >= late_half:
                 tau_eff = self.tau * 0.5
+            if self.cfg.variant == "dueling" and self.steps >= late_half:
+                tau_eff = self.tau * 0.5
                 
             with torch.no_grad():
                 for target_param, policy_param in zip(self.target_net.parameters(), self.policy_net.parameters()):
@@ -832,7 +899,40 @@ class DQNVariantTrainer:
                 elapsed = time.time() - last_log_time
                 fps = (1024) / (elapsed + 1e-6)
                 avg_r = np.mean(recent_rewards) if recent_rewards else 0
-                log(f"Step: {self.steps} | EPS: {eps:.2f} | Rew: {avg_r:.2f} | FPS: {fps:.1f} | Var: {self.cfg.variant}")
+                if (not self.cfg.single_snake) and num_snakes > 1:
+                    win_rate = (np.mean(recent_wins) if recent_wins else 0.0) * 100.0
+                    avg_s0 = np.mean(recent_score0) if recent_score0 else 0.0
+                    log(
+                        f"Step: {self.steps} | EPS: {eps:.2f} | Rew: {avg_r:.2f} | Win%: {win_rate:.1f} | S0: {avg_s0:.1f} | FPS: {fps:.1f} | Var: {self.cfg.variant}"
+                    )
+
+                    # Save best model for battle: prioritize S0, then Win%.
+                    # Use small thresholds to avoid overly frequent disk writes.
+                    improved = False
+                    if avg_s0 > self.best_s0 + 5.0:
+                        improved = True
+                    elif abs(avg_s0 - self.best_s0) <= 5.0 and win_rate > self.best_win + 1.0:
+                        improved = True
+                    elif self.best_s0 == -float('inf') and (recent_score0 or recent_wins):
+                        improved = True
+                    if improved:
+                        self.best_s0 = float(avg_s0)
+                        self.best_win = float(win_rate)
+                        self.save_model(self.cfg.save_path)
+                        log(f">>> [Best] Saved -> {self.cfg.save_path} | Win% {self.best_win:.1f} | S0 {self.best_s0:.1f}")
+                else:
+                    log(f"Step: {self.steps} | EPS: {eps:.2f} | Rew: {avg_r:.2f} | FPS: {fps:.1f} | Var: {self.cfg.variant}")
+
+                    # Save best model for single snake based on avg episode reward.
+                    improved = False
+                    if avg_r > self.best_reward + 0.5:
+                        improved = True
+                    elif self.best_reward == -float('inf') and recent_rewards:
+                        improved = True
+                    if improved:
+                        self.best_reward = float(avg_r)
+                        self.save_model(self.cfg.save_path)
+                        log(f">>> [Best] Saved -> {self.cfg.save_path} | Rew {self.best_reward:.2f}")
                 last_log_time = time.time()
                 
                 # Simplified Saving (User requested ONLY final model or periodic snapshot)
@@ -843,10 +943,15 @@ class DQNVariantTrainer:
                     sd_cpu = {k: v.detach().cpu() for k, v in raw_net.state_dict().items()}
                     self.sp_manager.add_model(sd_cpu, f"{self.cfg.variant}_step_{self.steps}")
             
-        # Final Save (Only at the end of total_steps)
-        self.save_model(self.cfg.save_path)
-        final_path = str(Path(self.cfg.save_path).with_suffix(".final.pth"))
+        # Final Save: keep `save_path` as BEST; write a separate `.final.pth` snapshot.
+        best_path = Path(self.cfg.save_path)
+        if not best_path.exists():
+            self.save_model(self.cfg.save_path)
+            log(f">>> [Best] (fallback) Saved -> {self.cfg.save_path}")
+
+        final_path = str(best_path.with_suffix(".final.pth"))
         self.save_model(final_path)
+        log(f">>> [Final] Saved -> {final_path}")
 
     def _rebuild_opp_groups(self):
         # V34.0: Pre-compute Tensors to avoid CPU-GPU sync during推断

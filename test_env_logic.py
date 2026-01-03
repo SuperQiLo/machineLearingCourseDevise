@@ -19,7 +19,15 @@ def test_gymnasium_wrapper_full_obs_single_snake():
     if not _HAS_GYMNASIUM:
         print("[SKIP] gymnasium 未安装，跳过 gymnasium_wrapper 测试")
         return
-    env = make_gymnasium_env(num_snakes=1, grid_size=20, return_full_obs=True)
+    env = make_gymnasium_env(
+        num_snakes=1,
+        grid_size=20,
+        return_full_obs=True,
+        use_score_delta_reward=True,
+        score_reward_coef=0.001,
+        env_reward_coef=0.2,
+        dash_effect_window=6,
+    )
     obs, info = env.reset()
     assert "full_obs_grids" in info and "full_obs_vecs" in info, "单蛇 reset 必须返回 full_obs_*"
     assert info["full_obs_grids"].shape == (1, 5, 20, 20), "full_obs_grids 形状应为 (1,5,20,20)"
@@ -29,13 +37,22 @@ def test_gymnasium_wrapper_full_obs_single_snake():
     assert "full_obs_grids" in info2 and "full_obs_vecs" in info2, "单蛇 step 必须返回 full_obs_*"
     assert info2["full_obs_grids"].shape == (1, 5, 20, 20)
     assert info2["full_obs_vecs"].shape[0] == 1
+    assert "delta_score0" in info2 and "env_reward0" in info2, "wrapper step 应返回 delta_score0/env_reward0"
 
 
 def test_gymnasium_wrapper_full_obs_multi_snake():
     if not _HAS_GYMNASIUM:
         print("[SKIP] gymnasium 未安装，跳过 gymnasium_wrapper 测试")
         return
-    env = make_gymnasium_env(num_snakes=2, grid_size=20, return_full_obs=True)
+    env = make_gymnasium_env(
+        num_snakes=2,
+        grid_size=20,
+        return_full_obs=True,
+        use_score_delta_reward=True,
+        score_reward_coef=0.001,
+        env_reward_coef=0.2,
+        dash_effect_window=6,
+    )
     obs, info = env.reset()
     assert "full_obs_grids" in info and "full_obs_vecs" in info
     assert info["full_obs_grids"].shape == (2, 5, 20, 20)
@@ -69,6 +86,16 @@ def test_logic():
     obs, rewards, dones, info = env.step([Action.DASH, Action.STRAIGHT])
     # 冲刺期间再次动作不应重叠或报错，且 duration 继续减少
     print(f"冲刺中再次尝试 DASH，剩余持续时间: {env.dash_durations[0]}")
+
+    # 3.5 验证死亡掉落：整条身体全部变食物
+    print("验证死亡掉落：整条身体全部变食物...")
+    env = BattleSnakeEnv(config)
+    env.reset()
+    env.foods = []
+    env.dead[0] = False
+    env.snakes[0] = [(5, 5), (5, 6), (5, 7), (5, 8)]
+    env._handle_death(0)
+    assert all(seg in env.foods for seg in [(5, 5), (5, 6), (5, 7), (5, 8)]), "死亡后整条身体应全部转化为食物"
     
     # 4. 验证全灭判定
     print("模拟蛇全灭...")
@@ -106,7 +133,7 @@ def test_logic():
     obs, rewards, dones, info = env.step([Action.STRAIGHT, Action.STRAIGHT, Action.STRAIGHT])
     assert all(dones), "全员死亡后游戏应结束！"
     assert bool(info.get("winner_all_dead", False)) is True, "全员死亡应标记 winner_all_dead"
-    assert info.get("winner_idx") in (1, 2), "赢家应来自结束前仍存活的蛇（P1/P2）"
+    assert info.get("winner_idx") in (1, 2), "MVP(最高分/平分按存活与长度)应来自结束前仍存活的蛇（P1/P2）"
     
     print("--- 逻辑测试通过！ ---")
 

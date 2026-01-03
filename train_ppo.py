@@ -80,6 +80,11 @@ def train_ppo(
     Path("agent/checkpoints").mkdir(parents=True, exist_ok=True)
     sp_manager = SelfPlayManager(pool_dir)
 
+    best_path = Path(checkpoint_path)
+    best_score0 = -float('inf')
+    best_win = -float('inf')
+    best_ret = -float('inf')
+
     # V18.0: Base Model
     model = ActorCritic(vector_dim=28, grid_shape=(5, 20, 20), action_dim=4).to(device)
     
@@ -156,27 +161,27 @@ def train_ppo(
         if num_snakes == 1:
             reward_cfg = {
                 "width": 20, "height": 20, "num_snakes": 1,
-                "min_food": 5, # V18.3: Increased density for better signal
-                "closer_reward": 0.15, # V18.3: Stronger guidance
-                "farther_penalty": -0.12,
-                "food_reward": 50.0, # V18.3: Stronger positive reinforcement
-                "death_penalty": -50.0,
-                "step_penalty": -0.05, # V18.3: Discourage idling/looping
-                "self_collision_penalty": -60.0,
+                "min_food": 5,
+                "closer_reward": 0.05,
+                "farther_penalty": -0.04,
+                "food_reward": 1.0,
+                "death_penalty": -3.0,
+                "step_penalty": -0.01,
+                "self_collision_penalty": -4.0,
             }
         else:
             # Align with DQN battle preset (train_dqn_variants.py PHASE 2)
             reward_cfg = {
-                "closer_reward": 0.15,
-                "farther_penalty": -0.10,
-                "step_penalty": -0.05,
+                "closer_reward": 0.05,
+                "farther_penalty": -0.04,
+                "step_penalty": -0.01,
                 "min_food": 2,
-                "death_penalty": -100.0,
-                "kill_reward": 150.0,
-                "food_reward": 80.0,
-                "self_collision_penalty": -150.0,
-                "win_reward": 500.0,
-                "loss_penalty": -200.0,
+                "death_penalty": -3.0,
+                "kill_reward": 2.0,
+                "food_reward": 1.2,
+                "self_collision_penalty": -4.0,
+                "win_reward": 5.0,
+                "loss_penalty": -2.0,
             }
         # Unpack reward_cfg to avoid conflicts with make_gymnasium_env defaults
         mfn = reward_cfg.pop("min_food", 2)
@@ -187,6 +192,18 @@ def train_ppo(
             grid_size=gs,
             min_food=mfn,
             return_full_obs=use_model_opps,
+            # Learn game rules via score delta (length-scaled scoring), with a bit of dense shaping retained.
+            use_score_delta_reward=True,
+            score_reward_coef=0.001,
+            env_reward_coef=0.2,
+            # Encourage purposeful dash (score gain soon after dash) instead of spamming.
+            dash_effect_window=6,
+            dash_success_bonus=0.2,
+            dash_fail_penalty=-0.2,
+            # Safety shaping: penalize obviously unsafe moves (wall/body) and risky/invalid dash.
+            unsafe_move_penalty=-0.10,
+            unsafe_dash_penalty=-0.10,
+            invalid_dash_penalty=-0.02,
             **reward_cfg,
         )
 
@@ -235,8 +252,9 @@ def train_ppo(
         except: return None
 
     # V18.0: Pre-allocate Rollout Buffers (directly on device)
-    # Use fp16 on CUDA to cut transfer bandwidth + memory.
-    b_obs_grid = torch.zeros((num_steps, num_envs, 5, 20, 20), dtype=obs_dtype, device=device)
+    # PERF: Keep grid as uint8 on GPU to avoid CPU-side uint8->fp16 conversion on every step.
+    # Cast to fp16 on GPU via a reusable temp buffer right before model forward.
+    b_obs_grid_u8 = torch.zeros((num_steps, num_envs, 5, 20, 20), dtype=torch.uint8, device=device)
     b_obs_vec = torch.zeros((num_steps, num_envs, 28), dtype=obs_dtype, device=device)
     b_actions = torch.zeros((num_steps, num_envs), dtype=torch.long, device=device)
     b_logprobs = torch.zeros((num_steps, num_envs), device=device)
@@ -244,13 +262,19 @@ def train_ppo(
     b_dones = torch.zeros((num_steps, num_envs), device=device)
     b_values = torch.zeros((num_steps, num_envs), device=device)
 
+    # Reusable cast buffer for grid (avoid per-step allocations)
+    tmp_grid = torch.empty((num_envs, 5, 20, 20), dtype=obs_dtype, device=device)
+
     # Rolling Return Tracking
     ep_returns: List[float] = []
     running_return = np.zeros(num_envs, dtype=np.float32)
 
+    # Battle diagnostics (win-rate / score) for Phase 2
+    ep_wins: List[int] = []
+    ep_end_scores: List[int] = []
+
     global_step = 0
     update = 0
-    start_time = time.time()
     total_snakes = num_envs * num_snakes
 
     log(">>> [PPO-Turbo] Setup finished. Starting training loop...")
@@ -267,17 +291,19 @@ def train_ppo(
         for step in range(num_steps):
             global_step += num_envs
             
-            # Map observations to tensors (Optimized with pre-allocated buffer)
-            # obs['grid'] is (num_envs, 5, 20, 20), obs['vector'] is (num_envs, 28)
-            with torch.inference_mode(), autocast('cuda', enabled=use_amp):
-                t_grid = torch.as_tensor(obs['grid'], dtype=obs_dtype, device=device)
-                t_vec = torch.as_tensor(obs['vector'], dtype=obs_dtype, device=device)
-                
-                b_obs_grid[step].copy_(t_grid)
-                b_obs_vec[step].copy_(t_vec)
-                
+            # Map observations to tensors
+            # obs['grid'] is (num_envs, 5, 20, 20) uint8, obs['vector'] is (num_envs, 28) float32
+            with torch.inference_mode():
+                cpu_grid = torch.from_numpy(obs['grid'])
+                cpu_vec = torch.from_numpy(obs['vector'])
+                # Avoid CPU-side dtype conversion for grid: copy as uint8, cast on GPU.
+                b_obs_grid_u8[step].copy_(cpu_grid)
+                b_obs_vec[step].copy_(cpu_vec)
+
                 # Get Actions for Learner
-                a, lp, _, v = model.get_action_and_value(t_grid, t_vec)
+                with autocast('cuda', enabled=use_amp):
+                    tmp_grid.copy_(b_obs_grid_u8[step])
+                    a, lp, _, v = model.get_action_and_value(tmp_grid, b_obs_vec[step])
                 b_actions[step].copy_(a)
                 b_logprobs[step].copy_(lp)
                 b_values[step].copy_(v.squeeze(-1))
@@ -346,6 +372,18 @@ def train_ppo(
                 if next_terminated[e_idx] or next_truncated[e_idx]:
                     ep_returns.append(float(running_return[e_idx]))
                     running_return[e_idx] = 0.0
+
+                    # Extra diagnostics for battle mode (meaningful across policies)
+                    if num_snakes > 1 and isinstance(next_info, dict):
+                        try:
+                            winner = int(next_info.get("winner_idx", [-1])[e_idx])
+                        except Exception:
+                            winner = -1
+                        ep_wins.append(1 if winner == 0 else 0)
+                        try:
+                            ep_end_scores.append(int(next_info.get("score0", [0])[e_idx]))
+                        except Exception:
+                            ep_end_scores.append(0)
                     if use_model_opps:
                         assign_opps(e_idx) # Re-assign for next episode
 
@@ -353,7 +391,8 @@ def train_ppo(
 
         # Bootstrap Value
         with torch.inference_mode(), autocast('cuda', enabled=use_amp):
-            t_grid = torch.as_tensor(obs['grid'], dtype=obs_dtype, device=device)
+            t_grid_u8 = torch.as_tensor(obs['grid'], dtype=torch.uint8, device=device)
+            t_grid = t_grid_u8.to(dtype=obs_dtype)
             t_vec = torch.as_tensor(obs['vector'], dtype=obs_dtype, device=device)
             next_value = model.get_value(t_grid, t_vec).squeeze(-1)
 
@@ -375,7 +414,7 @@ def train_ppo(
         returns = advantages + b_values
 
         # Flatten Buffers
-        flat_grid = b_obs_grid.reshape(-1, 5, 20, 20)
+        flat_grid_u8 = b_obs_grid_u8.reshape(-1, 5, 20, 20)
         flat_vec = b_obs_vec.reshape(-1, 28)
         flat_actions = b_actions.reshape(-1)
         flat_logprobs = b_logprobs.reshape(-1)
@@ -390,14 +429,21 @@ def train_ppo(
         model.train()
         inds = np.arange(batch_size)
         stop_early = False
+        pg_loss_sum = 0.0
+        v_loss_sum = 0.0
+        ent_sum = 0.0
+        approx_kl_sum = 0.0
+        clipfrac_sum = 0.0
+        n_minibatches = 0
         for epoch in range(update_epochs):
             np.random.shuffle(inds)
             for start in range(0, batch_size, minibatch_size):
                 mb = inds[start : start + minibatch_size]
                 
                 with autocast('cuda', enabled=(device.type == 'cuda')):
+                    mb_grid = flat_grid_u8[mb].to(dtype=obs_dtype)
                     _, newlogprob, entropy, newvalue = model.get_action_and_value(
-                        flat_grid[mb], flat_vec[mb], flat_actions[mb]
+                        mb_grid, flat_vec[mb], flat_actions[mb]
                     )
                     newvalue = newvalue.squeeze(-1)
                     logratio = newlogprob - flat_logprobs[mb]
@@ -425,26 +471,99 @@ def train_ppo(
 
                 with torch.no_grad():
                     approx_kl = ((ratio - 1) - logratio).mean()
+                    clipfrac = ((ratio - 1.0).abs() > clip_coef).float().mean()
+
+                    pg_loss_sum += float(pg_loss.detach().item())
+                    v_loss_sum += float(v_loss.detach().item())
+                    ent_sum += float(ent_loss.detach().item())
+                    approx_kl_sum += float(approx_kl.detach().item())
+                    clipfrac_sum += float(clipfrac.detach().item())
+                    n_minibatches += 1
+
                     if approx_kl > target_kl:
                         stop_early = True
                         break
             if stop_early:
                 break
 
+        # PPO diagnostics (per-update)
+        with torch.no_grad():
+            v_y = flat_returns
+            v_y_pred = flat_values
+            var_y = torch.var(v_y, unbiased=False)
+            explained_var = torch.tensor(0.0, device=device)
+            if float(var_y.item()) > 1e-8:
+                explained_var = 1.0 - torch.var(v_y - v_y_pred, unbiased=False) / (var_y + 1e-8)
+
+        mb_denom = max(1, int(n_minibatches))
+        pg_loss_mean = pg_loss_sum / mb_denom
+        v_loss_mean = v_loss_sum / mb_denom
+        ent_mean = ent_sum / mb_denom
+        kl_mean = approx_kl_sum / mb_denom
+        clipfrac_mean = clipfrac_sum / mb_denom
+
         # Logging
         if update <= 10 or update % 10 == 0:
-            dt = time.time() - start_time
-            fps = (update * num_envs * num_steps) / dt
             avg_ret = np.mean(ep_returns[-100:]) if ep_returns else 0
-            log(f">>> [PPO-Turbo] Upd {update} | Step {global_step}/{total_timesteps} ({global_step/total_timesteps:.1%}) | FPS {fps:.0f} | Ret {avg_ret:.2f}")
+            if num_snakes > 1:
+                win_rate = (np.mean(ep_wins[-200:]) if ep_wins else 0.0) * 100.0
+                avg_score0 = np.mean(ep_end_scores[-200:]) if ep_end_scores else 0.0
+                log(
+                    f">>> [PPO-Turbo] Upd {update} | Step {global_step}/{total_timesteps} ({global_step/total_timesteps:.1%}) "
+                    f"| Ret {avg_ret:.2f} | Win% {win_rate:.1f} | Score0 {avg_score0:.1f} "
+                    f"| pg_loss {pg_loss_mean:.3f} | v_loss {v_loss_mean:.3f} | ent {ent_mean:.3f} "
+                    f"| kl {kl_mean:.4f}/{target_kl:.4f} | clipfrac {clipfrac_mean:.3f} | ev {float(explained_var.item()):.3f} "
+                    f"| lr {lr_now:.2e} | ent_coef {ent_coef:.3f}" + (" | early_stop" if stop_early else "")
+                )
+
+                # Save best model for battle: prioritize Score0, then Win%.
+                improved = False
+                if avg_score0 > best_score0 + 5.0:
+                    improved = True
+                elif abs(avg_score0 - best_score0) <= 5.0 and win_rate > best_win + 1.0:
+                    improved = True
+                elif best_score0 == -float('inf') and (ep_end_scores or ep_wins):
+                    improved = True
+                if improved:
+                    best_score0 = float(avg_score0)
+                    best_win = float(win_rate)
+                    cpu_state = {k: v.detach().cpu() for k, v in original_model.state_dict().items()}
+                    _atomic_torch_save(cpu_state, best_path)
+                    log(f">>> [PPO-Turbo][Best] Saved -> {best_path} | Win% {best_win:.1f} | Score0 {best_score0:.1f}")
+            else:
+                log(
+                    f">>> [PPO-Turbo] Upd {update} | Step {global_step}/{total_timesteps} ({global_step/total_timesteps:.1%}) "
+                    f"| Ret {avg_ret:.2f} "
+                    f"| pg_loss {pg_loss_mean:.3f} | v_loss {v_loss_mean:.3f} | ent {ent_mean:.3f} "
+                    f"| kl {kl_mean:.4f}/{target_kl:.4f} | clipfrac {clipfrac_mean:.3f} | ev {float(explained_var.item()):.3f} "
+                    f"| lr {lr_now:.2e} | ent_coef {ent_coef:.3f}" + (" | early_stop" if stop_early else "")
+                )
+
+                # Save best model for single snake based on avg return.
+                improved = False
+                if avg_ret > best_ret + 0.5:
+                    improved = True
+                elif best_ret == -float('inf') and ep_returns:
+                    improved = True
+                if improved:
+                    best_ret = float(avg_ret)
+                    cpu_state = {k: v.detach().cpu() for k, v in original_model.state_dict().items()}
+                    _atomic_torch_save(cpu_state, best_path)
+                    log(f">>> [PPO-Turbo][Best] Saved -> {best_path} | Ret {best_ret:.2f}")
 
         # Periodic Saving & Pool Update
         if global_step >= 500_000 and global_step % 500_000 < num_envs * num_steps:
              cpu_state = {k: v.detach().cpu() for k, v in original_model.state_dict().items()}
              sp_manager.add_model(cpu_state, name=f"ppo_step_{global_step}")
 
+    # Ensure we have a best checkpoint written.
+    if not best_path.exists():
+        cpu_state = {k: v.detach().cpu() for k, v in original_model.state_dict().items()}
+        _atomic_torch_save(cpu_state, best_path)
+        log(f">>> [PPO-Turbo][Best] (fallback) Saved -> {best_path}")
+
     # Final Save
-    final_path = Path(checkpoint_path).with_suffix(".final.pth")
+    final_path = best_path.with_suffix(".final.pth")
     cpu_state = {k: v.detach().cpu() for k, v in original_model.state_dict().items()}
     _atomic_torch_save(cpu_state, final_path)
     log(f">>> [PPO-Turbo] Finished. Saved to {final_path}")

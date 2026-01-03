@@ -41,15 +41,22 @@ class BattleSnakeConfig:
     dash_duration_steps: int = 5
     
     # Rewards
-    food_reward: float = 20.0
-    death_penalty: float = -15.0 
-    kill_reward: float = 15.0
-    closer_reward: float = 0.3
-    farther_penalty: float = -0.2
-    step_penalty: float = -0.05
-    self_collision_penalty: float = -15.0  # V43.0: Reduced from -25 (Prevent timidity)
-    win_reward: float = 500.0   # V11.0: Huge jackpot for winners
-    loss_penalty: float = -200.0 # V11.0: Severe penalty for losing
+    # NOTE: These are TRAINING rewards returned by env.step().
+    # Game scoring/MVP uses `scores` and the *_score_mult fields below.
+    food_reward: float = 1.2
+    death_penalty: float = -3.0
+    kill_reward: float = 2.0
+    closer_reward: float = 0.05
+    farther_penalty: float = -0.04
+    step_penalty: float = -0.01
+    self_collision_penalty: float = -4.0
+    win_reward: float = 5.0
+    loss_penalty: float = -2.0
+
+    # Game scoring (NOT training reward)
+    food_score_mult: int = 10
+    kill_score_mult: int = 50
+    survive_score_mult: int = 100
 
 class BattleSnakeEnv:
     """Multi-Agent Snake Environment with Multiple Foods."""
@@ -223,6 +230,10 @@ class BattleSnakeEnv:
                     else:
                         rewards[i] += self.config.death_penalty
                         rewards[owner] += self.config.kill_reward
+                        # Game scoring: killer gets points based on current length
+                        if self.config.num_snakes > 1:
+                            killer_len = len(self.snakes[owner]) if (owner < len(self.snakes) and self.snakes[owner]) else 0
+                            self.scores[owner] += int(killer_len) * int(self.config.kill_score_mult)
 
             # 2) Head-on collisions: group by next head position
             head_groups: Dict[Tuple[int, int], List[int]] = {}
@@ -243,6 +254,10 @@ class BattleSnakeEnv:
                         if i != winner:
                             dying_now.add(i)
                             rewards[i] += self.config.death_penalty
+                            # Game scoring: winner gets a kill
+                            if self.config.num_snakes > 1:
+                                winner_len = len(self.snakes[winner]) if (winner < len(self.snakes) and self.snakes[winner]) else 0
+                                self.scores[winner] += int(winner_len) * int(self.config.kill_score_mult)
                 else:
                     # all tied -> all die (pairwise rule with <= would kill both)
                     for i in idxs:
@@ -259,10 +274,12 @@ class BattleSnakeEnv:
                 nh = next_heads[i]
                 if nh is None:
                     continue
+                pre_len = len(self.snakes[i]) if (i < len(self.snakes) and self.snakes[i]) else 0
                 self.snakes[i].insert(0, nh)
                 if nh in self.foods:
                     rewards[i] += self.config.food_reward
-                    self.scores[i] += 1
+                    # Game scoring: single-player only scores via food; battle also scores via food
+                    self.scores[i] += int(pre_len) * int(self.config.food_score_mult)
                     self.foods.remove(nh)
                 else:
                     self.snakes[i].pop()
@@ -287,49 +304,50 @@ class BattleSnakeEnv:
         else:
             game_over = alive_count <= 1 or self.steps >= self.config.max_steps
 
-        winner_idx: Optional[int] = None
+        # Winner/MVP selection:
+        # - MVP is the highest score.
+        # - Tie-break: alive at end > longer (alive uses current len, else uses pre_terminal_lengths) > lower idx.
+        mvp_idx: Optional[int] = None
         winner_len: int = 0
         winner_is_all_dead: bool = False
 
-        if self.config.num_snakes <= 1:
-            if _is_alive(0):
-                winner_idx = 0
-                winner_len = len(self.snakes[0]) if (self.snakes and self.snakes[0]) else 0
-        else:
-            if alive_idxs:
-                # Winner = longest alive at game end (tie-break: score, then lower idx)
-                def _alive_key(i: int):
-                    cur_len = len(self.snakes[i]) if (i < len(self.snakes) and self.snakes[i]) else 0
-                    score = self.scores[i] if i < len(self.scores) else 0
-                    return (cur_len, score, -i)
+        if game_over:
+            if self.config.num_snakes > 1:
+                # Survival score only in battle mode
+                for i in range(self.config.num_snakes):
+                    if _is_alive(i):
+                        cur_len = len(self.snakes[i]) if (i < len(self.snakes) and self.snakes[i]) else 0
+                        self.scores[i] += int(cur_len) * int(self.config.survive_score_mult)
 
-                winner_idx = max(alive_idxs, key=_alive_key)
-                winner_len = len(self.snakes[winner_idx]) if (winner_idx < len(self.snakes) and self.snakes[winner_idx]) else 0
-            else:
-                # All dead: winner = longest among those alive at the moment right before game over.
-                winner_is_all_dead = True
+            def _mvp_key(i: int):
+                score = int(self.scores[i]) if i < len(self.scores) else 0
+                alive_flag = 1 if _is_alive(i) else 0
+                length_like = (len(self.snakes[i]) if (i < len(self.snakes) and self.snakes[i]) else 0) if alive_flag else (
+                    int(self.pre_terminal_lengths[i]) if i < len(self.pre_terminal_lengths) else 0
+                )
+                return (score, alive_flag, int(length_like), -i)
 
-                def _dead_key(i: int):
-                    pre_len = self.pre_terminal_lengths[i] if i < len(self.pre_terminal_lengths) else 0
-                    score = self.scores[i] if i < len(self.scores) else 0
-                    return (pre_len, score, -i)
-
-                winner_idx = max(range(self.config.num_snakes), key=_dead_key)
-                winner_len = self.pre_terminal_lengths[winner_idx] if winner_idx < len(self.pre_terminal_lengths) else 0
+            mvp_idx = max(range(self.config.num_snakes), key=_mvp_key) if self.config.num_snakes > 0 else None
+            if self.config.num_snakes > 1:
+                winner_is_all_dead = (len(alive_idxs) == 0)
+            if mvp_idx is not None:
+                winner_len = len(self.snakes[mvp_idx]) if (mvp_idx < len(self.snakes) and self.snakes[mvp_idx]) else 0
 
         if game_over:
             for i in range(self.config.num_snakes): dones[i] = True
             
             # 终局奖励：多人模式给赢家 win_reward，其余给 loss_penalty
-            if self.config.num_snakes > 1 and winner_idx is not None:
+            if self.config.num_snakes > 1 and mvp_idx is not None:
                 for i in range(self.config.num_snakes):
-                    rewards[i] += self.config.win_reward if i == winner_idx else self.config.loss_penalty
+                    rewards[i] += self.config.win_reward if i == mvp_idx else self.config.loss_penalty
         
         info = {
             "scores": self.scores,
             "game_over": game_over,
             "alive_count": alive_count,
-            "winner_idx": winner_idx,
+            # Backward-compat: winner == MVP (highest score)
+            "winner_idx": mvp_idx,
+            "mvp_idx": mvp_idx,
             "winner_len": winner_len,
             "winner_all_dead": winner_is_all_dead,
             "pre_terminal_lengths": self.pre_terminal_lengths,
@@ -341,9 +359,11 @@ class BattleSnakeEnv:
 
     def _handle_death(self, idx: int):
         self.dead[idx] = True
-        for segment in self.snakes[idx][1:]:
-            if random.random() < 0.5 and segment not in self.foods:
-                self.foods.append(segment)
+        # Game rule: convert the whole body into food (deterministic)
+        if idx < len(self.snakes) and self.snakes[idx]:
+            for segment in self.snakes[idx]:
+                if segment not in self.foods:
+                    self.foods.append(segment)
 
     def _get_observations(self) -> List[ObservationDict]:
         cache = self._build_obs_cache()
@@ -402,12 +422,12 @@ class BattleSnakeEnv:
         danger_1, danger_2, radar = [], [], []
         for d in dirs:
             p1 = self._get_next_pos(head, d)
-            danger_1.append(float(self._is_danger_cached(p1, occupied_all)))
+            danger_1.append(float(self._is_danger_cached(p1, occupied_all, self.width, self.height)))
             p2 = self._get_next_pos(p1, d)
-            danger_2.append(float(self._is_danger_cached(p2, occupied_all)))
+            danger_2.append(float(self._is_danger_cached(p2, occupied_all, self.width, self.height)))
             dist, cur = 1, p1
             while 0 <= cur[0] < self.width and 0 <= cur[1] < self.height:
-                if self._is_danger_cached(cur, occupied_all):
+                if self._is_danger_cached(cur, occupied_all, self.width, self.height):
                     break
                 dist += 1; cur = self._get_next_pos(cur, d)
             radar.append(1.0 / dist)
@@ -432,17 +452,26 @@ class BattleSnakeEnv:
         can_dash_val = [1.0 if (self.dash_durations[agent_idx] == 0 and len(self.snakes[agent_idx]) > 3) else 0.0]
         
         # V10.0: Relative Standing Features (Crucial for rule awareness)
+        # NOTE: With score-based MVP rules, standing should be based on game score (not length).
         is_leader = 0.0
-        rel_len = 1.0
+        rel_score = 1.0
         if self.config.num_snakes > 1:
-            lengths = [len(s) for s in self.snakes]
-            max_other = max([lengths[j] for j in range(self.config.num_snakes) if j != agent_idx] + [0])
-            my_len = lengths[agent_idx]
-            is_leader = 1.0 if my_len >= max_other and my_len > 0 else 0.0
-            if max_other > 0:
-                rel_len = my_len / max_other
+            scores = list(self.scores) if isinstance(self.scores, list) else []
+            # Defensive: keep shape stable even if scores are missing/misaligned.
+            if len(scores) < self.config.num_snakes:
+                scores = scores + [0] * (self.config.num_snakes - len(scores))
+
+            my_score = float(scores[agent_idx])
+            max_other = max([float(scores[j]) for j in range(self.config.num_snakes) if j != agent_idx] + [0.0])
+
+            # Avoid the trivial all-zero start state marking everyone as leader.
+            if (my_score > 0.0) or (max_other > 0.0):
+                is_leader = 1.0 if my_score >= max_other else 0.0
+
+            if max_other > 0.0:
+                rel_score = my_score / max_other
             else:
-                rel_len = 2.0 # Way ahead
+                rel_score = 2.0 if my_score > 0.0 else 1.0
         
         # V11.0: Time Management Feature (Crucial for tournament strategy)
         steps_left = [(self.config.max_steps - self.steps) / self.config.max_steps]
@@ -455,7 +484,7 @@ class BattleSnakeEnv:
             tail_rel,
             len_pct,
             can_dash_val,
-            [is_leader, rel_len],
+            [is_leader, rel_score],
             steps_left
         ]).astype(np.float32)
         # V11.0: Maintain full 28-dimensional vector
@@ -496,7 +525,10 @@ class BattleSnakeEnv:
         return {"vector": vector, "grid": grid}
 
     @staticmethod
-    def _is_danger_cached(pos: Tuple[int, int], occupied_all: set) -> bool:
+    def _is_danger_cached(pos: Tuple[int, int], occupied_all: set, width: int, height: int) -> bool:
+        x, y = pos
+        if not (0 <= x < width and 0 <= y < height):
+            return True
         return pos in occupied_all
 
     def _is_danger(self, agent_idx: int, pos: Tuple[int, int]) -> bool:
